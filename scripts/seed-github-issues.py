@@ -36,8 +36,8 @@ def main():
     parser.add_argument("--repo", default=f"{OWNER}/ForgeFleet")
     args = parser.parse_args()
     items = list(parse_issues())
-    if len(items) != 26:
-        raise SystemExit(f"Expected 26 backlog entries, found {len(items)}")
+    if len(items) != 29:
+        raise SystemExit(f"Expected 29 backlog entries, found {len(items)}")
     existing_titles = []
     if args.apply:
         gh("auth", "status")

@@ -53,4 +53,4 @@ This repository contains original planning documents, not a copy of the Papercli
 
 ## Populate initial GitHub engineering backlog (optional)
 
-After the repository exists and `gh` is authenticated, preview the 26 planned issues with `python3 scripts/seed-github-issues.py`. To create missing issues, run `python3 scripts/seed-github-issues.py --apply --repo Abraham12611/ForgeFleet`. The script skips issues whose stable `FF-###` IDs already occur in issue titles; it does not create labels, milestones, or assignments automatically.
+After the repository exists and `gh` is authenticated, preview the 29 planned issues with `python3 scripts/seed-github-issues.py`. To create missing issues, run `python3 scripts/seed-github-issues.py --apply --repo Abraham12611/ForgeFleet`. The script skips issues whose stable `FF-###` IDs already occur in issue titles; it does not create labels, milestones, or assignments automatically.

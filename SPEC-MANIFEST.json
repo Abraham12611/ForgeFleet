@@ -10,7 +10,7 @@
     ".gitignore": "7ae702dae9553da79c76bdca6972e08152a5cacc23593221e4432daef144c87c",
     "AGENTS.md": "cd196e4f1e63093e63afccd1b8ce1308bf34ad68bdd95a468c427a6cedc46ec6",
     "CONTRIBUTING.md": "f0025713e59bfa566e63b6263f25df619dc187b61c0e7767851ffad71c9c581a",
-    "README.md": "d165a65ce218cc34327efab040eb062028f5f8ba6f5b7567957fa44e1ee3127b",
+    "README.md": "6a68c1d02c5c621668e7bb9a37632563da28669d9b01e270ae6897bca6fc3fb1",
     "docs/00-foundation/glossary.md": "ea49f62002dc4cb40793571ab6ead5a8b1a5b8c3630ff1e69d8ce5dfb65af0dd",
     "docs/00-foundation/governance.md": "7c7e533699a9c3a86f32741e713bc94fc678911bfdf237703ac28994819e59e7",
     "docs/00-foundation/open-questions.md": "0022f078d7cc9bdc6f4295b040e4400aae64828e3e017e93685438b562669520",
@@ -75,7 +75,7 @@
     "docs/06-delivery/quality-and-test-plan.md": "ebf7d5415c344dc7c74a1f1034c2eacf03d054e2687a6b9f7d10785db4355ce9",
     "docs/06-delivery/release-checklist.md": "75373d7d5663ec1508138086452182855eb787f9c9ed091c4514dc795cafc50b",
     "docs/06-delivery/roadmap.md": "88143fc6ec8ddb867b53a4116ceec26918538d1190cf32f0f5d883cd3b9df231",
-    "docs/06-delivery/work-breakdown.md": "bb362a1d253b00a03bbd1e13e346ee99685fcf0c1fbeb8c806fc2d4adc17af87",
+    "docs/06-delivery/work-breakdown.md": "a3b4f72fabd87e92e99884ba0c31ae010e57b56ee068cb34cae48894abee6032",
     "docs/07-research/compatibility-and-spikes.md": "4a318fd29721e49fbf80845d7bae5a59805ac21c439142dd7a58c6c26927bce7",
     "docs/07-research/sources-and-licenses.md": "b85127c0646bec9d80b93e8dc522820ccfe7595cc86a01bb126fb8e1410afd3b",
     "docs/07-research/version-pins.md": "e66325f0ef1e9fbb5b83bace769887aa339222d9f4c915d24e54a0d5f8e78216",
@@ -96,6 +96,6 @@
     "infra/example-orca-bridge.service": "8c7951fb5243674e5baf9cc5399fd56cd22824da0cba876cd782df099e67df5d",
     "scripts/check-specs.py": "150ace23860df15d7d1294395aa10bf18b7d8e825ebbc356ffda30c46594c158",
     "scripts/publish-to-github.sh": "2035ae7518a9360de0545c287b7a4de6ae8b916c323721532019447908dfc2ec",
-    "scripts/seed-github-issues.py": "a7d66ef2ade9a564095c9071e1d2d502154c3170fe45993953ae3776b891442f"
+    "scripts/seed-github-issues.py": "66c008c47a95543039aec9907e5a442a9b1e4dc9eb88a099d1bf97e737435b57"
   }
 }

@@ -25,10 +25,13 @@ All items should be created as **GitHub issues** after repository creation, atta
 | FF-019 | v0.3 | E20 | Responsive mobile workflow PWA | Complete 360px acceptance walkthrough |
 | FF-020 | v0.4 | E18 | Cost, health, stale-state and event metrics | Real vs estimated labels, audit trail |
 | FF-021 | v0.4 | E15 | Recovery/failure-injection suite | Pass all documented crash scenarios |
-| FF-022 | v1.0 | E17 | Private deploy, backups and rollback rehearsal | Reproducible restore + no open bridge |
+| FF-022 | v1.0 | E17 | Secure Vercel/Vultr release and rollback rehearsal | Reproducible restore, authenticated split web/API, no open bridge |
 | FF-023 | v1.0 | E07 | Security regression and audit gate | No privilege escalation on malicious inputs |
 | FF-024 | v1.0 | E01 | End-to-end private release signoff | Goal → merged PR → owner digest with evidence |
-| FF-025 | v1.1 | E20 | Capacitor Android internal build | Signed test build + notification behavior |
+| FF-025 | v1.1 | E20 | Capacitor Android AAB and on-device tests | Signed AAB, auth/deep-links/notifications tested on real device |
 | FF-026 | v1.1 | E09 | Host registry and distributed admission | Resource-aware safe worker scaling |
+| FF-027 | v0.0 | E01 | Paperclip standalone Vite UI / Vercel feasibility spike | Independent Vite build, auth/stream compatibility matrix and fallback documented |
+| FF-028 | v0.2 | E17 | Secure Vercel preview to Vultr API ingress | Authenticated preview, no exposed bridge, reconnect and upload tests pass |
+| FF-029 | v1.1 | E20 | Google Play internal testing publication | AAB accepted in internal track, Play policy checklist complete and real-device smoke evidence |
 
 `FF-*` identifiers are planning IDs, **not existing GitHub issue numbers**. Do not hardcode them as GitHub issue references until issues exist. Split implementation issues further when they exceed one small PR and re-run dependency review.
