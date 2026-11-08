@@ -1,0 +1,16 @@
+{
+  "name": "@forgefleet/messaging",
+  "version": "0.1.0",
+  "description": "Threaded agent messaging, peer routing and owner escalation for ForgeFleet (FF-014). Pure logic, zero dependencies.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --test src/*.test.ts",
+    "typecheck": "tsc --noEmit --strict --allowImportingTsExtensions --module nodenext --target es2022 src/*.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
