@@ -1,0 +1,22 @@
+name: Integration Spike
+description: Verify upstream behavior on pinned versions without risking running agents
+title: '[SPIKE] '
+body:
+  - type: textarea
+    id: hypothesis
+    attributes:
+      label: Hypothesis / unknown to verify
+    validations:
+      required: true
+  - type: textarea
+    id: experiment
+    attributes:
+      label: Non-destructive experiment and rollback
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Required sanitized evidence and pass criteria
+    validations:
+      required: true

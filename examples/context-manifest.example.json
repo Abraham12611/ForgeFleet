@@ -1,0 +1,23 @@
+{
+  "disclaimer": "Illustrative only; no files actually uploaded.",
+  "projectId": "example-project",
+  "revision": "context-v1",
+  "sources": [
+    {
+      "sourceId": "prd-01",
+      "name": "product-requirements.md",
+      "sha256": "<sha256>",
+      "visibility": "project",
+      "storageUri": "private://example/prd"
+    }
+  ],
+  "taskBindings": [
+    {
+      "taskKey": "auth-ui",
+      "sourceIds": [
+        "prd-01"
+      ],
+      "goalRevision": "goal-v1"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "disclaimer": "Illustrative project DAG; no tasks have been created on GitHub or Paperclip.",
+  "goal": "Ship a login flow",
+  "planRevision": 1,
+  "tasks": [
+    {
+      "key": "auth-api",
+      "title": "Implement backend auth",
+      "dependsOn": [],
+      "acceptance": [
+        "Unit tests pass",
+        "API contract documented"
+      ]
+    },
+    {
+      "key": "auth-ui",
+      "title": "Build login UI",
+      "dependsOn": [],
+      "acceptance": [
+        "Accessible mobile form",
+        "Mock contract tests pass"
+      ]
+    },
+    {
+      "key": "auth-e2e",
+      "title": "Integrate login end-to-end",
+      "dependsOn": [
+        "auth-api",
+        "auth-ui"
+      ],
+      "acceptance": [
+        "E2E pass against disposable service"
+      ]
+    }
+  ]
+}

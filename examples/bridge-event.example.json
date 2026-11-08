@@ -1,0 +1,21 @@
+{
+  "disclaimer": "Illustrative event only. Not real Orca output.",
+  "eventId": "example-001",
+  "schemaVersion": "0.1",
+  "eventType": "attempt.started",
+  "occurredAt": "2026-11-08T12:00:00Z",
+  "receivedAt": "2026-11-08T12:00:01Z",
+  "source": "orca-bridge",
+  "projectId": "example-project",
+  "taskId": "example-task",
+  "attemptId": "00000000-0000-4000-8000-000000000001",
+  "correlationId": "example-trace",
+  "fencingEpoch": 1,
+  "actor": {
+    "type": "service",
+    "id": "orca-bridge"
+  },
+  "data": {
+    "externalDispatchId": "example-orca-dispatch"
+  }
+}

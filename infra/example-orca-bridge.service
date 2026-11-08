@@ -1,0 +1,19 @@
+# EXAMPLE ONLY — do not install unchanged; executable paths, user and auth must be verified.
+[Unit]
+Description=ForgeFleet Orca Bridge (user service)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node /opt/forgefleet/services/orca-bridge/dist/index.js
+WorkingDirectory=/opt/forgefleet
+EnvironmentFile=%h/.config/forgefleet/bridge.env
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,21 @@
+# Glossary
+
+- **Goal:** top-level human outcome, e.g. build a functioning authenticated onboarding flow.
+- **Project:** a bounded product/repository context containing goals, documents, permissions and policies.
+- **Coordinator:** AI agent responsible for planning, dispatch recommendations, exceptions, integration and progress summaries.
+- **Team lead:** intermediate agent managing a functional workstream.
+- **Worker:** execution agent such as Muse or Devin handling one or more scoped tasks.
+- **Task:** durable work item with acceptance criteria, prerequisites, owner, status and output evidence.
+- **Attempt:** one concrete dispatch of a task to a runtime worker. Attempts may fail/retry; tasks persist.
+- **Dispatch ID:** Orca's identifier for a supervised worker launch; persist the mapping.
+- **Heartbeat:** liveness/trigger signal, not proof of task completion.
+- **Worktree:** isolated checkout used by a coding agent; never reuse writable worktrees concurrently.
+- **Decision:** question requiring owner/coordinator approval, with policy class, deadline, and answer.
+- **Gate:** machine-enforced prerequisite before an action (e.g. merge, production migration).
+- **Lease:** time-limited exclusive claim on a task or writable workspace, with fencing token.
+- **Reconciliation:** compare desired state with Paperclip, bridge DB, Orca, GitHub and restore consistency.
+- **Dead-letter queue:** durable store for irrecoverable events requiring operator investigation.
+- **Sleep mode:** availability preference that queues human questions but does not authorize risky actions.
+- **Control plane:** Paperclip/project/task/coordinator/governance services.
+- **Execution plane:** Orca workers, managed coding sessions, and optional future runtimes.
+- **Bridge:** narrowly authorized daemon mediating execution commands and runtime events.

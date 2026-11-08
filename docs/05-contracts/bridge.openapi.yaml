@@ -1,0 +1,231 @@
+openapi: 3.1.0
+info:
+  title: ForgeFleet Orca Bridge API (proposed)
+  version: 0.1.0-draft
+  description: >
+    Specification of ForgeFleet-owned internal bridge API, NOT an existing Orca endpoint.
+    Pending version-specific Orca command verification and external Paperclip adapter implementation.
+servers:
+  - url: http://127.0.0.1:4387
+    description: Loopback-only behind authenticated backend proxy
+security:
+  - serviceToken: []
+tags:
+  - name: Runtime
+  - name: Attempts
+  - name: Messages
+paths:
+  /v1/health/live:
+    get:
+      tags: [Runtime]
+      operationId: liveness
+      security: []
+      responses:
+        '200':
+          description: Process alive (not dependency readiness)
+  /v1/runtime/capabilities:
+    get:
+      tags: [Runtime]
+      operationId: getCapabilities
+      responses:
+        '200':
+          description: Read-only runtime probe
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeCapabilities'
+  /v1/runtime/sessions:
+    get:
+      tags: [Runtime]
+      operationId: listSessions
+      parameters:
+        - name: projectId
+          in: query
+          schema: {type: string}
+      responses:
+        '200':
+          description: Read-only inventory, including unmanaged sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sessions]
+                properties:
+                  sessions:
+                    type: array
+                    items: {$ref: '#/components/schemas/RuntimeSession'}
+  /v1/attempts:
+    post:
+      tags: [Attempts]
+      operationId: createAttempt
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 8, maxLength: 160}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateAttemptRequest'}
+      responses:
+        '202':
+          description: Accepted; not necessarily running
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttemptReceipt'}
+        '409': {description: Conflicting idempotency key/request or active lease}
+        '422': {description: Capability/policy rejected}
+        '429': {description: Backpressure or quota exhausted}
+  /v1/attempts/{attemptId}:
+    get:
+      tags: [Attempts]
+      operationId: getAttempt
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: Observed attempt status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AttemptReceipt'}
+        '404': {description: Unknown attempt}
+  /v1/attempts/{attemptId}/cancel:
+    post:
+      tags: [Attempts]
+      operationId: cancelAttempt
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason, approvedBy]
+              properties:
+                reason: {type: string}
+                approvedBy: {type: string, description: Validated actor ID with cancel privilege}
+      responses:
+        '202': {description: Cancellation requested; runtime confirmation pending}
+        '403': {description: Operation not permitted}
+  /v1/attempts/{attemptId}/messages:
+    post:
+      tags: [Messages]
+      operationId: sendAttemptMessage
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SendMessageRequest'}
+      responses:
+        '202': {description: Queued for authorized delivery}
+        '403': {description: Not authorized}
+        '409': {description: Attempt not messageable}
+  /v1/events:
+    get:
+      tags: [Runtime]
+      operationId: streamEvents
+      description: Private SSE stream for authorized normalized runtime events; `Last-Event-ID` for resume.
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          schema: {type: string}
+      responses:
+        '200':
+          description: Server-sent events (also durably delivered via outbox)
+          content:
+            text/event-stream:
+              schema: {type: string}
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      description: Short-lived service identity; backend only, never browser-exposed.
+  parameters:
+    AttemptId:
+      name: attemptId
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+  schemas:
+    RuntimeCapabilities:
+      type: object
+      required: [reachable, checkedAt, providers]
+      properties:
+        reachable: {type: boolean}
+        checkedAt: {type: string, format: date-time}
+        cliVersion: {type: [string, 'null']}
+        commandPath: {type: [string, 'null'], description: Sanitized executable path}
+        providers:
+          type: array
+          items:
+            type: object
+            required: [name, status]
+            properties:
+              name: {type: string, example: muse}
+              status: {enum: [verified, unsupported, unknown, unavailable]}
+              notes: {type: string}
+    RuntimeSession:
+      type: object
+      required: [externalId, state, managed]
+      properties:
+        externalId: {type: string}
+        provider: {type: [string, 'null']}
+        state: {enum: [running, waiting, stopped, failed, unknown]}
+        managed: {type: boolean}
+        taskId: {type: [string, 'null']}
+        worktreeId: {type: [string, 'null']}
+        lastObservedAt: {type: [string, 'null'], format: date-time}
+    CreateAttemptRequest:
+      type: object
+      additionalProperties: false
+      required: [projectId, paperclipTaskId, paperclipRunId, workerKind, contextManifestId, lease]
+      properties:
+        projectId: {type: string}
+        paperclipTaskId: {type: string}
+        paperclipRunId: {type: string}
+        workerKind: {type: string, example: muse}
+        taskTitle: {type: string}
+        instruction: {type: string, description: Scoped task prompt, no secrets}
+        contextManifestId: {type: string}
+        repositoryId: {type: string}
+        lease:
+          type: object
+          required: [fencingEpoch, leaseToken]
+          properties:
+            fencingEpoch: {type: integer, minimum: 1}
+            leaseToken: {type: string}
+    AttemptReceipt:
+      type: object
+      required: [attemptId, projectId, state, observedAt]
+      properties:
+        attemptId: {type: string, format: uuid}
+        projectId: {type: string}
+        state: {enum: [accepted, dispatching, running, waiting, unknown, finished, failed, cancelled]}
+        observedAt: {type: string, format: date-time}
+        orcaRunId: {type: [string, 'null']}
+        orcaTaskId: {type: [string, 'null']}
+        orcaDispatchId: {type: [string, 'null']}
+        worktreeId: {type: [string, 'null']}
+        errorCode: {type: [string, 'null']}
+    SendMessageRequest:
+      type: object
+      required: [projectId, threadId, actorId, body]
+      properties:
+        projectId: {type: string}
+        threadId: {type: string}
+        actorId: {type: string}
+        body: {type: string, maxLength: 20000}
+        kind: {enum: [question, answer, update, unblock, instruction]}
