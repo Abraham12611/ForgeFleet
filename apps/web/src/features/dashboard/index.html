@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ForgeFleet Command Center (FF-015 fixture spike)</title>
+<link rel="stylesheet" href="./dashboard.css">
+</head>
+<body>
+<main class="ff-dashboard" id="app">
+  <div class="ff-header">
+    <div>
+      <span class="ff-fixture-badge">Fixture — not live runtime status</span>
+      <h1>Command Center</h1>
+      <p id="meta">Deterministic fixtures · checked 2026-11-08T12:00:00.000Z</p>
+    </div>
+    <label>State
+      <select id="statePicker" aria-label="Preview screen state">
+        <option value="ready">ready</option>
+        <option value="loading">loading</option>
+        <option value="empty">empty</option>
+        <option value="recoverable-error">recoverable-error</option>
+        <option value="permission-denied">permission-denied</option>
+        <option value="offline">offline</option>
+        <option value="stale">stale</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="ff-state" id="stateBanner" role="status" data-tone="neutral"></div>
+
+  <div class="ff-grid" id="grid">
+    <section class="ff-card" aria-label="Project health">
+      <h2>Project health (2 fixture projects)</h2>
+      <dl class="ff-stat-row">
+        <div class="ff-stat"><dt>Verified completed</dt><dd>5</dd></div>
+        <div class="ff-stat"><dt>Active workers</dt><dd>8</dd></div>
+        <div class="ff-stat"><dt>Ready tasks</dt><dd>8</dd></div>
+        <div class="ff-stat"><dt>Blocked decisions</dt><dd>4</dd></div>
+        <div class="ff-stat"><dt>Failing checks</dt><dd>1</dd></div>
+        <div class="ff-stat"><dt>Unknown workers</dt><dd>4</dd></div>
+      </dl>
+    </section>
+    <section class="ff-card" aria-label="Project overview">
+      <h2>Project overview — Atlas sample repo</h2>
+      <p>Milestones: Login API (verified) · Login UI (running) · Login E2E (ready)</p>
+      <p>Alerts: 1 failing check on fixture-pr-001 · 2 decisions need the owner</p>
+      <p>Run fixture-run-001 · plan rev 1 · reconciled 2026-11-08T12:00:00.000Z</p>
+    </section>
+    <section class="ff-card" aria-label="Decisions and cost">
+      <h2>Decisions &amp; cost (estimates labelled)</h2>
+      <p>4 inbox items need the owner · sleep mode off · spent $12.40 of $100 (estimated).</p>
+      <p>Provider: workers waiting for provider capacity will resume automatically within limits.</p>
+    </section>
+  </div>
+
+  <nav class="ff-bottom-tabs" aria-label="Primary">
+    <a href="#" aria-current="page">Home</a>
+    <a href="#">Projects</a>
+    <a href="#">Inbox</a>
+    <a href="#">Fleet</a>
+    <a href="#">More</a>
+  </nav>
+
+  <p><small>Responsive sign-off widths: 360 · 412 · 768 · 1280 · 1440. Narrow screens use the bottom tabs above; ≥768px hides them in favour of the header. Open this file directly in a browser (no build step).</small></p>
+</main>
+<script>
+(function () {
+  var copies = {
+    'ready': ['neutral', 'Ready. Fixture summary cards above; not live runtime status.'],
+    'loading': ['neutral', 'Loading command center…'],
+    'empty': ['neutral', 'No active projects. Start with a goal and a repository.'],
+    'recoverable-error': ['bad', 'Fixture error: failed to load command center. Retry is safe; no side effects.'],
+    'permission-denied': ['bad', 'You do not have access to this project.'],
+    'offline': ['warn', 'Offline. Showing last reconciled data; actions are read-only.'],
+    'stale': ['warn', 'Data may be stale. Last reconciled at 2026-11-08T12:00:00.000Z.']
+  };
+  var picker = document.getElementById('statePicker');
+  var banner = document.getElementById('stateBanner');
+  var grid = document.getElementById('grid');
+  function render() {
+    var item = copies[picker.value] || copies.ready;
+    banner.dataset.tone = item[0];
+    banner.textContent = item[1];
+    grid.style.display = (picker.value === 'loading' || picker.value === 'empty') ? 'none' : '';
+  }
+  picker.addEventListener('change', render);
+  render();
+})();
+</script>
+</body>
+</html>
