@@ -18,7 +18,9 @@ def _load_gate():
     return module
 
 
-evaluate = _load_gate().evaluate
+_gate_module = _load_gate()
+evaluate = _gate_module.evaluate
+render_digest = _gate_module.render_digest
 
 
 def _gate(evidence="seen live", observation="real", status="pass", issue=None):
@@ -43,6 +45,7 @@ def _passing_gates(**overrides):
         "acceptance.mobile_progress": _gate("phone walkthrough done"),
         "acceptance.sleep_mode": _gate("sleep queues, work continues"),
         "acceptance.explicit_approval": _gate("owner approved release"),
+        "signoff.g8_live_verified": _gate("trusted-system refs verified"),
     }
     gates.update(overrides)
     return gates
@@ -169,6 +172,24 @@ class ReleaseSignoffTest(unittest.TestCase):
         for bad in (None, [], "PASS"):
             result = evaluate(bad)
             self.assertEqual(result["decision"], "FAIL")
+
+    def test_missing_g8_gate_fails(self):
+        """Live signoff G8 stays open: a bundle without it cannot pass."""
+        gates = _passing_gates()
+        del gates["signoff.g8_live_verified"]
+        result = evaluate(_bundle(gates=gates))
+        self.assertEqual(result["decision"], "FAIL")
+        self.assertTrue(any("g8" in r for r in result["reasons"]))
+
+    def test_result_and_digest_disclaim_production_authority(self):
+        """The tool must never present itself as production release
+        authority: machine result carries offline-precheck, digest says so."""
+        bundle = _bundle()
+        result = evaluate(bundle)
+        self.assertEqual(result.get("authority"), "offline-precheck")
+        digest = render_digest(bundle, result)
+        self.assertIn("not a production release authority", digest)
+        self.assertIn("G8", digest)
 
 
 if __name__ == "__main__":

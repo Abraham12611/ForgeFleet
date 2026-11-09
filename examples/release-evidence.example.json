@@ -32,7 +32,8 @@
     "safety.resource_limits": {"status": "pass", "evidence": "REPLACE with budget/admission ref", "observation": "fixture"},
     "acceptance.mobile_progress": {"status": "pass", "evidence": "REPLACE with phone walkthrough ref", "observation": "fixture"},
     "acceptance.sleep_mode": {"status": "pass", "evidence": "REPLACE with sleep behavior ref", "observation": "fixture"},
-    "acceptance.explicit_approval": {"status": "pass", "evidence": "REPLACE with owner approval ref", "observation": "fixture"}
+    "acceptance.explicit_approval": {"status": "pass", "evidence": "REPLACE with owner approval ref", "observation": "fixture"},
+    "signoff.g8_live_verified": {"status": "conditional", "evidence": "G8 open: live checks/SHA/artifacts not yet independently verified", "observation": "fixture", "issue": "#24"}
   },
   "known_gaps": [],
   "secrets_scan_clean": true

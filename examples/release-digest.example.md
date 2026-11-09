@@ -1,5 +1,7 @@
 # Owner release digest — v1.0 (CONDITIONAL)
 
+**Offline pre-check only — not a production release authority.** Evidence below is caller-supplied. Live signoff (G8) stays open until GitHub checks, head SHA, deploy artifacts, security signoff and the owner decision are fetched and independently verified from trusted systems (blocked on #59 real CI, #60 Paperclip-Orca integration, FF-018 merge gate). Do not deploy or close the release issue on the strength of this digest.
+
 Goal `GOAL-private-release-signoff` built from commit `TBD-built-from-commit`.
 
 Decision: **CONDITIONAL**. Do not mark shipped until PASS.
@@ -21,6 +23,7 @@ Decision: **CONDITIONAL**. Do not mark shipped until PASS.
 | acceptance.mobile_progress | pass (fixture) | REPLACE with phone walkthrough ref |
 | acceptance.sleep_mode | pass (fixture) | REPLACE with sleep behavior ref |
 | acceptance.explicit_approval | pass (fixture) | REPLACE with owner approval ref |
+| signoff.g8_live_verified | conditional (fixture) | G8 open: live checks/SHA/artifacts not yet independently verified |
 
 ## Merged PRs
 
@@ -33,6 +36,7 @@ None recorded.
 ## Conditionals
 
 - fixture-only observation: rehearsal, not release proof
+- gate signoff.g8_live_verified: conditional (#24)
 
 ## Safety notes
 

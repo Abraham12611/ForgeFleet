@@ -40,6 +40,20 @@ from `examples/release-evidence.example.json` is a format example until every
 gate cites a live observation ref. Do not mark v1.0 shipped until the gate
 reports PASS on real evidence with owner approval recorded.
 
+## Coordinator review (PR #50): offline scope
+
+Per coordinator review, this tool is an **offline, caller-supplied
+evidence-bundle validator** with authority `offline-precheck`. It fetches
+nothing from trusted systems, so it must not act as production release
+authority: every digest and JSON result carries that disclaimer. The hard
+integration gate G8 (`signoff.g8_live_verified`) is a required gate the tool
+records but cannot verify; actual live signoff stays open until GitHub
+checks, head SHA, deploy artifacts, security signoff and the owner decision
+are independently verified. Integration is sequenced after #59 (real CI),
+#60 (Paperclip-Orca integration) and the FF-018 merge gate fixes. A fixture
+PASS is not owner acceptance: do not deploy and do not close issue #24 on
+the strength of this tool.
+
 ## Residual risk
 
 - Gate inputs (authN, head SHA freshness, check results) must come from

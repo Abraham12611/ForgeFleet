@@ -4,8 +4,14 @@
 Validates a release evidence bundle shaped as Goal -> merged PR -> owner
 digest, against the v1.0 gates in
 ``docs/06-delivery/release-checklist.md`` (functional / safety / user
-acceptance), plus the merge-policy rules from the contract test catalog
-(exact head SHA, independent review, owner-only ``main``).
+acceptance), the hard integration gate G8, plus the merge-policy rules
+from the contract test catalog (exact head SHA, independent review,
+owner-only ``main``).
+
+This is an offline pre-check over caller-supplied evidence: it records and
+consistency-checks what the caller claims, but fetches nothing from trusted
+systems. Its authority is ``offline-precheck``; it is never production
+release authority.
 
 Usage::
 
@@ -72,6 +78,21 @@ ACCEPTANCE_GATES = (
 )
 
 REQUIRED_GATES = FUNCTIONAL_GATES + SAFETY_GATES + ACCEPTANCE_GATES
+
+# Hard integration gate G8 (security, backup/restore, performance and
+# acceptance signoff). This offline tool can record G8 evidence cited by the
+# caller, but it cannot fetch or independently verify anything: a PASS here
+# is a pre-check, never production release authority. Live G8 signoff stays
+# open until checks, head SHA, deploy artifacts, security signoff and owner
+# decision are verified against trusted systems (blocked on #59 real CI,
+# #60 Paperclip-Orca integration, FF-018 merge gate).
+LIVE_GATES = (
+    "signoff.g8_live_verified",
+)
+
+ALL_REQUIRED_GATES = REQUIRED_GATES + LIVE_GATES
+
+AUTHORITY = "offline-precheck"
 
 SECRET_PATTERNS = (
     re.compile(r"ghp_[A-Za-z0-9]{8,}"),
@@ -167,6 +188,7 @@ def evaluate(bundle: object) -> dict:
     """Evaluate an evidence bundle. Never raises on bad input: fails closed."""
     if not isinstance(bundle, dict):
         result = _fail("evidence bundle must be a JSON object")
+        result["authority"] = AUTHORITY
         result["fixture_only"] = False
         return result
     reasons: list[str] = []
@@ -198,7 +220,7 @@ def evaluate(bundle: object) -> dict:
     if not isinstance(gates, dict):
         reasons.append("missing gates object")
     else:
-        for name in REQUIRED_GATES:
+        for name in ALL_REQUIRED_GATES:
             if name not in gates:
                 reasons.append(f"gate {name}: missing")
                 continue
@@ -209,7 +231,7 @@ def evaluate(bundle: object) -> dict:
             elif outcome == "conditional":
                 conditionals.append(reason)
         for name in gates:
-            if name not in REQUIRED_GATES:
+            if name not in ALL_REQUIRED_GATES:
                 reasons.append(f"gate {name}: unknown gate (closed world)")
 
     gaps = bundle.get("known_gaps", [])
@@ -226,24 +248,35 @@ def evaluate(bundle: object) -> dict:
         reasons.append(hit)
 
     if reasons:
-        return {"decision": "FAIL", "reasons": reasons,
-                "conditionals": conditionals, "fixture_only": fixture_only}
+        return {"decision": "FAIL", "authority": AUTHORITY,
+                "reasons": reasons, "conditionals": conditionals,
+                "fixture_only": fixture_only}
     # Fixture-only evidence can never ship: cap at CONDITIONAL even if every
     # gate claims pass. Fixtures are rehearsal, not release proof.
     if fixture_only:
         conditionals.insert(0, "fixture-only observation: rehearsal, not release proof")
-        return {"decision": "CONDITIONAL", "reasons": [],
-                "conditionals": conditionals, "fixture_only": True}
+        return {"decision": "CONDITIONAL", "authority": AUTHORITY,
+                "reasons": [], "conditionals": conditionals,
+                "fixture_only": True}
     if conditionals:
-        return {"decision": "CONDITIONAL", "reasons": [],
-                "conditionals": conditionals, "fixture_only": False}
-    return {"decision": "PASS", "reasons": [], "conditionals": [],
-            "fixture_only": False}
+        return {"decision": "CONDITIONAL", "authority": AUTHORITY,
+                "reasons": [], "conditionals": conditionals,
+                "fixture_only": False}
+    return {"decision": "PASS", "authority": AUTHORITY, "reasons": [],
+            "conditionals": [], "fixture_only": False}
 
 
 def render_digest(bundle: dict, result: dict) -> str:
     lines = [
         f"# Owner release digest — {bundle.get('version', 'v1.0')} ({result['decision']})",
+        "",
+        "**Offline pre-check only — not a production release authority.** "
+        "Evidence below is caller-supplied. Live signoff (G8) stays open "
+        "until GitHub checks, head SHA, deploy artifacts, security signoff "
+        "and the owner decision are fetched and independently verified from "
+        "trusted systems (blocked on #59 real CI, #60 Paperclip-Orca "
+        "integration, FF-018 merge gate). Do not deploy or close the release "
+        "issue on the strength of this digest.",
         "",
         f"Goal `{bundle.get('goal_id', '?')}` built from commit "
         f"`{bundle.get('commit', '?')}`.",
@@ -256,7 +289,7 @@ def render_digest(bundle: dict, result: dict) -> str:
         "| --- | --- | --- |",
     ]
     gates = bundle.get("gates", {}) if isinstance(bundle.get("gates"), dict) else {}
-    for name in REQUIRED_GATES:
+    for name in ALL_REQUIRED_GATES:
         entry = gates.get(name, {})
         status = entry.get("status", "missing") if isinstance(entry, dict) else "invalid"
         obs = ""
@@ -322,7 +355,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     result = evaluate(bundle)
-    payload = {"decision": result["decision"], "reasons": result["reasons"],
+    payload = {"decision": result["decision"],
+               "authority": result.get("authority", AUTHORITY),
+               "reasons": result["reasons"],
                "conditionals": result["conditionals"],
                "fixture_only": result["fixture_only"],
                "goal_id": bundle.get("goal_id") if isinstance(bundle, dict) else None,
