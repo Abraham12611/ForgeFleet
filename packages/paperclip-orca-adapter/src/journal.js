@@ -12,7 +12,7 @@
 //   journal/pending/<p>_<t>_<r>.json      in-flight first-wake intent
 //   journal/quarantine/<p>_<t>_<r>.json   ambiguous session awaiting owner
 // Writes are atomic (tmp file + rename). Quarantine records are never
-// auto-cleared: only an explicit quarantineResolution input resolves them.
+// auto-cleared: only an explicit recoveryDecision resolves them.
 //
 // Durability caveat: the default stateRoot lives under the OS temp dir and
 // survives process crashes, not host reboots or disk loss. Production
@@ -66,6 +66,21 @@ export function createJournal(stateRoot) {
     writeQuarantine: (key, record) =>
       atomicWrite(join(quarantineDir, `${key}.json`), { version: JOURNAL_VERSION, ...record }),
     clearQuarantine: (key) => rmSync(join(quarantineDir, `${key}.json`), { force: true }),
+    // Append-only audit of recovery resolutions (who authorized what, when,
+    // on which proof). Best-effort: audit failure never blocks a wake.
+    writeAudit: (key, record) => {
+      try {
+        const auditDir = join(stateRoot, 'journal', 'audit');
+        mkdirSync(auditDir, { recursive: true });
+        atomicWrite(join(auditDir, `${key}-e${record?.schedulerEpoch ?? 'x'}.json`), {
+          version: JOURNAL_VERSION,
+          resolvedAt: new Date().toISOString(),
+          ...record,
+        });
+      } catch {
+        // intentional no-op: audit is evidence, not a gate
+      }
+    },
     get stateRoot() {
       return stateRoot;
     },

@@ -73,12 +73,19 @@ heartbeat.
    stay gated; pre-existing local files are never deleted. `finished` maps to
    `submitted` with `exitCode: 0`: runtime completion is review input, not
    verification.
-5. **Ambiguous fate** (bridge 404 on reconcile, corrupt journal): the session
-   is QUARANTINED (`status: unknown`, `exitCode: null`), never silently
-   cleared — a fresh session could duplicate a still-live worker. Only an
-   explicit `context.quarantineResolution` releases it: `'fence-and-relaunch'`
-   (new attempt at epoch+1 under a new idempotency key) or
-   `'adopt-attempt:<uuid>'` (validated via GET, never spawns).
+5. **Ambiguous fate** (bridge 404 on reconcile, corrupt journal, changed
+   input after a crash): the key is QUARANTINED (`status: unknown`,
+   `exitCode: null`), never silently cleared — a fresh session could
+   duplicate a still-live worker. The Paperclip task context is UNTRUSTED
+   for recovery, so bare strings authorize nothing. Release requires a
+   structured `context.recoveryDecision`
+   `{action, decidedBy, schedulerEpoch, schedulerToken?, proof:{kind, detail}}`
+   plus bridge-verified old-worker fate: relaunch is refused while the
+   original is live, needs a strictly fresh scheduler epoch + token, and a
+   404 pairs only with `lease-fenced`/`operator-attested` proof; adoption
+   re-attaches a GET-verified attempt and never spawns. Every resolution is
+   written to the audit journal and the new session cursor. Journal re-posts
+   always send the exact original bytes and refuse on any input drift.
 6. Operational failures use the pinned `errorMessage` result channel; only
    malformed execution contexts throw (`invalid_context`). `cancel` requires
    `context.cancel.{reason, approvedBy}`; `sendMessage` requires a stable
@@ -104,10 +111,12 @@ Engine: `node >= 24.11.0`. Zero runtime dependencies (stdlib only).
 
 ## Evidence status (fixture vs live)
 
-- **Fixture (this PR):** 37 `node:test` assertions pass against the
+- **Fixture (this PR):** 44 `node:test` assertions pass against the
   in-process fake bridge — pinned-shape conformance, round trip, crash-after-
   accept reconcile (one dispatch, staging intact), 409 conflict, dedupe/
-  fencing, quarantine + fenced relaunch + adopt, finalize gate with cwd
+  fencing, quarantine + verified recovery decisions (malicious-string hold,
+  old-worker-running refusal, stale-epoch/proof/token holds, verified
+  relaunch + adopt, intent-change and tamper refusal), finalize gate with cwd
   intact, fail-closed capability, cancel/message auth, E05 schema validation,
   and the no-push static check.
 - **Live (explicitly NOT claimed):** no Vultr host, Orca service, or

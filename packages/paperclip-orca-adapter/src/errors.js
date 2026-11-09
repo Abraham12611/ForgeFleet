@@ -68,7 +68,7 @@ export class WorkspaceFinalizeError extends AdapterError {
 // Stored session references an attempt the bridge no longer knows (HTTP 404).
 // The session is QUARANTINED, not cleared: a fresh session could launch a
 // duplicate worker while the original is still alive. Only an explicit
-// quarantineResolution (owner/coordinator decision) releases it.
+// recoveryDecision (owner/coordinator decision, fate-verified) releases it.
 export class UnknownSessionError extends AdapterError {
   constructor(sessionId) {
     super(

@@ -79,7 +79,7 @@ describe('crash recovery, quarantine, safe finalization', () => {
     assert.equal(first.sessionParams.status, 'dispatched');
   });
 
-  it('vanished attempt quarantines; fence-and-relaunch fences the epoch', async () => {
+  it('vanished attempt quarantines; only a verified decision releases it', async () => {
     const first = (await wake()).res;
     fake.attempts.delete(first.sessionParams.attemptId);
     const { res: held, logs } = await wake({}, nextRuntime(first));
@@ -89,50 +89,69 @@ describe('crash recovery, quarantine, safe finalization', () => {
     assert.ok(logs.join('\n').includes('quarantined'));
     assert.equal(fake.dispatchCount, 1, 'no duplicate launched while ambiguous');
 
-    // Still quarantined on the next wake without a resolution.
+    // Still quarantined on the next wake without a decision.
     const again = (await wake({}, nextRuntime(held))).res;
     assert.equal(again.sessionParams.quarantined, true);
     assert.equal(fake.dispatchCount, 1);
 
-    // Explicit owner/coordinator decision: fence and relaunch at epoch+1.
-    const relaunched = (
+    // Bare strings authorize nothing (untrusted context).
+    const stringy = (
       await wake({ context: { quarantineResolution: 'fence-and-relaunch' } }, nextRuntime(held))
+    ).res;
+    assert.equal(stringy.sessionParams.quarantined, true);
+    assert.equal(fake.dispatchCount, 1);
+
+    // Explicit verified decision: fresh granted epoch + token + proof.
+    const relaunched = (
+      await wake(
+        {
+          context: {
+            recoveryDecision: {
+              action: 'fence-and-relaunch',
+              decidedBy: 'owner:alice',
+              schedulerEpoch: 2,
+              schedulerToken: 'sched-tok-2',
+              proof: { kind: 'operator-attested', detail: 'host console shows no live worker' },
+            },
+          },
+        },
+        nextRuntime(held),
+      )
     ).res;
     assert.equal(relaunched.sessionParams.quarantined, false);
     assert.equal(relaunched.sessionParams.fencingEpoch, 2);
+    assert.equal(relaunched.sessionParams.leaseProvenance, 'scheduler');
     assert.equal(fake.dispatchCount, 2);
   });
 
-  it('adopt-attempt resumes a found attempt, holds on a missing one', async () => {
+  it('adopt-attempt via decision resumes a found attempt, holds on a missing one', async () => {
     const first = (await wake()).res;
     const original = first.sessionParams.attemptId;
+    const receipt = fake.attempts.get(original);
     fake.attempts.delete(original);
     const held = (await wake({}, nextRuntime(first))).res;
     assert.equal(held.sessionParams.quarantined, true);
 
+    const decide = (recoveryDecision) => wake({ context: { recoveryDecision } }, nextRuntime(held));
     const missing = (
-      await wake(
-        { context: { quarantineResolution: 'adopt-attempt:00000000-0000-4000-8000-000000000099' } },
-        nextRuntime(held),
-      )
+      await decide({
+        action: 'adopt-attempt',
+        attemptId: '00000000-0000-4000-8000-000000000099',
+        decidedBy: 'owner:alice',
+        proof: { kind: 'lease-fenced', detail: 'scheduler confirms generation' },
+      })
     ).res;
     assert.equal(missing.sessionParams.quarantined, true, 'quarantine holds when target is gone');
 
     // The "original" reappears (external discovery); adopt it explicitly.
-    fake.attempts.set(original, {
-      attemptId: original,
-      projectId: 'p9',
-      paperclipTaskId: 'T-9',
-      state: 'running',
-      observedAt: new Date().toISOString(),
-      orcaRunId: 'fake-run-1',
-      orcaTaskId: 'fake-task-1',
-      orcaDispatchId: 'fake-dispatch-1',
-      worktreeId: 'fake-worktree-1',
-      errorCode: null,
-    });
+    fake.attempts.set(original, { ...receipt, state: 'running' });
     const adopted = (
-      await wake({ context: { quarantineResolution: `adopt-attempt:${original}` } }, nextRuntime(held))
+      await decide({
+        action: 'adopt-attempt',
+        attemptId: original,
+        decidedBy: 'owner:alice',
+        proof: { kind: 'lease-fenced', detail: 'scheduler confirms generation' },
+      })
     ).res;
     assert.equal(adopted.sessionParams.quarantined, false);
     assert.equal(adopted.sessionParams.attemptId, original);

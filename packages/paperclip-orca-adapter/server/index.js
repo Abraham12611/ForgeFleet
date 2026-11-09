@@ -23,8 +23,9 @@
 //                  (sync-back failure returns workspace_finalize=failed and
 //                  reports NO completion, gating dependent work)
 //   ambiguous   -> QUARANTINE (never silent clearSession): the fate of the
-//                  original dispatch is unknown, so only an explicit
-//                  quarantineResolution may fence-and-relaunch or adopt.
+//                  original dispatch is unknown, so only an explicit,
+//                  fate-verified recoveryDecision may fence-and-relaunch
+//                  or adopt. Bare strings authorize nothing.
 //
 // Crash-after-acceptance: dispatch intent (idempotency key + exact payload)
 // is journaled atomically BEFORE POSTing. On POST failure the staging dir
@@ -273,6 +274,9 @@ export function createServerAdapter(options = {}) {
   }
 
   // ---- quarantine ----------------------------------------------------------
+  const NIL_ATTEMPT = '00000000-0000-4000-8000-000000000000';
+  const PROOF_KINDS = new Set(['attempt-terminal', 'lease-fenced', 'operator-attested']);
+
   async function quarantineSession(t, session, { reason, detail }) {
     const key = journalKeyFor(t.projectId, t.taskId, t.runId);
     journal.writeQuarantine(key, {
@@ -303,40 +307,172 @@ export function createServerAdapter(options = {}) {
     await log(
       t,
       `quarantined: ${detail}. Ambiguous worker fate; no duplicate launched. ` +
-        `Resolve with context.quarantineResolution 'fence-and-relaunch' or 'adopt-attempt:<uuid>'.`,
+        `Release requires a structured context.recoveryDecision ` +
+        `{action, decidedBy, schedulerEpoch, schedulerToken?, proof:{kind, detail}} ` +
+        `with verified old-worker fate; bare strings authorize nothing.`,
     );
     return toResult(quarantined, { exitCode: null });
   }
 
-  async function resolveQuarantine(t, session) {
-    const key = journalKeyFor(t.projectId, t.taskId, t.runId);
-    const record = journal.readQuarantine(key);
-    if (!record) {
-      await log(t, 'quarantineResolution supplied but no quarantine record exists; ignoring');
-      return resumeWake(t, { ...session, quarantined: false });
+  // Session-less quarantine notice: no cursor exists to resume, so there is
+  // nothing to return except the hold itself. Paperclip must wake again with
+  // a recoveryDecision to proceed.
+  async function holdWithoutSession(t, qrec) {
+    await log(
+      t,
+      `quarantined (${qrec?.reason ?? 'unknown'}): ${qrec?.detail ?? 'ambiguous worker fate'}. ` +
+        `No dispatch will occur until a structured context.recoveryDecision resolves this key.`,
+    );
+    return {
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      sessionParams: null,
+      quarantined: true,
+      quarantineReason: qrec?.reason ?? 'unknown',
+      provider: 'muse',
+    };
+  }
+
+  // Synthesize a session cursor from a quarantine record so a session-less
+  // wake carrying a recoveryDecision can be resolved against durable state.
+  function recordSessionFromQuarantine(t, qrec) {
+    const fencingEpoch =
+      Number.isInteger(qrec?.fencingEpoch) && qrec.fencingEpoch >= 1 ? qrec.fencingEpoch : 1;
+    return {
+      version: SESSION_VERSION,
+      sessionId: `orca-${t.taskId}-${t.runId}`.slice(0, 128),
+      attemptId: typeof qrec?.attemptId === 'string' && qrec.attemptId ? qrec.attemptId : NIL_ATTEMPT,
+      idempotencyKey: idempotencyKeyFor({
+        projectId: t.projectId,
+        taskId: t.taskId,
+        runId: t.runId,
+        fencingEpoch,
+      }),
+      fencingEpoch,
+      leaseToken: 'unknown',
+      leaseProvenance: 'adapter-initial',
+      runCount: 0,
+      projectId: t.projectId,
+      taskId: t.taskId,
+      paperclipRunId: t.runId,
+      worktreeId: null,
+      lastEventId: null,
+      status: 'unknown',
+      done: false,
+      quarantined: true,
+      questionCount: 0,
+    };
+  }
+
+  // Release a quarantined key. The Paperclip task context is UNTRUSTED for
+  // recovery, so a bare string can never authorize this path: `decision`
+  // must be a structured recoveryDecision, and the old worker's fate is
+  // verified against the bridge before any new dispatch.
+  //
+  // Signature note: cryptographic authorization of recovery decisions is
+  // enforced by the coordinator/policy layer (E07), not by this adapter —
+  // there is no key material here. The adapter enforces the structural gate
+  // (fresh scheduler epoch + token for relaunch, decidedBy + proof always),
+  // refuses to run a second worker beside a live one, and records every
+  // resolution in the audit journal and the new session cursor.
+  async function resolveRecovery(t, session, qrec, key) {
+    const d = t.recoveryDecision;
+    const hold = async (why) => {
+      await log(t, `recovery refused (${why}); quarantine holds, no worker launched`);
+      return toResult({ ...session, runCount: session.runCount + 1 }, { exitCode: null });
+    };
+    if (!d || typeof d !== 'object') return hold('missing recoveryDecision');
+    if (d.action !== 'fence-and-relaunch' && d.action !== 'adopt-attempt') {
+      return hold(`unknown action '${d?.action ?? ''}'`);
     }
-    const resolution = t.quarantineResolution;
-    if (resolution === 'fence-and-relaunch') {
-      // Fence the prior generation: the new attempt runs at epoch+1 and
-      // stale events from the old generation stay ignored.
-      const fencingEpoch = session.fencingEpoch + 1;
-      journal.clearQuarantine(key);
-      await log(t, `fencing prior generation ${session.fencingEpoch}; relaunching at epoch ${fencingEpoch}`);
-      return dispatchAttempt({ ...t, lease: { ...t.lease, fencingEpoch } }, { fencingEpoch, journalKey: key });
+    if (typeof d.decidedBy !== 'string' || d.decidedBy.length === 0) {
+      return hold('decidedBy actor required');
     }
-    const adopt = resolution?.startsWith('adopt-attempt:') ? resolution.slice('adopt-attempt:'.length) : null;
-    if (adopt && UUID_RE.test(adopt)) {
-      const receipt = await bridge.getAttempt(adopt);
-      if (receipt === null) {
-        await log(t, `adopt-attempt target ${adopt} still unknown; quarantine holds`);
-        return toResult({ ...session, runCount: session.runCount + 1 }, { exitCode: null });
+    if (
+      !d.proof ||
+      typeof d.proof !== 'object' ||
+      !PROOF_KINDS.has(d.proof.kind) ||
+      typeof d.proof.detail !== 'string' ||
+      d.proof.detail.length === 0
+    ) {
+      return hold('proof {kind, detail} required');
+    }
+    const auditBase = {
+      action: d.action,
+      decidedBy: d.decidedBy,
+      decidedAt: typeof d.decidedAt === 'string' ? d.decidedAt : null,
+      proof: { kind: d.proof.kind, detail: d.proof.detail },
+    };
+
+    if (d.action === 'adopt-attempt') {
+      const target = d.attemptId;
+      if (typeof target !== 'string' || !UUID_RE.test(target)) {
+        return hold('adopt-attempt requires an attemptId UUID');
       }
+      let receipt;
+      try {
+        receipt = await bridge.getAttempt(target);
+      } catch {
+        return hold('adopt fate check failed; holding');
+      }
+      if (receipt === null) return hold(`adopt target ${target} unknown; holding`);
       journal.clearQuarantine(key);
-      await log(t, `adopted attempt ${adopt} after explicit resolution`);
-      return resumeWake(t, { ...session, quarantined: false, attemptId: adopt });
+      journal.writeAudit(key, { ...auditBase, attemptId: target, schedulerEpoch: session.fencingEpoch });
+      await log(t, `adopted attempt ${target} after explicit decision by ${d.decidedBy}`);
+      const adopted = {
+        ...session,
+        quarantined: false,
+        attemptId: target,
+        recovery: { ...auditBase, resolvedAt: new Date().toISOString() },
+      };
+      return resumeWake(t, adopted);
     }
-    await log(t, `unknown quarantineResolution '${resolution ?? ''}'; quarantine holds`);
-    return toResult({ ...session, runCount: session.runCount + 1 }, { exitCode: null });
+
+    // fence-and-relaunch: needs a FRESH granted epoch (strictly above the
+    // fenced generation — the scheduler's monotonic lease is the fencing
+    // proof) plus its token. Anything stale authorizes nothing.
+    const epoch = d.schedulerEpoch;
+    if (!Number.isInteger(epoch) || epoch <= session.fencingEpoch) {
+      return hold('fresh schedulerEpoch above the fenced generation required');
+    }
+    if (typeof d.schedulerToken !== 'string' || d.schedulerToken.length === 0) {
+      return hold('schedulerToken for the new generation required');
+    }
+    // Fate check on the ORIGINAL attempt before any new dispatch.
+    const originalId = session.attemptId;
+    if (originalId && originalId !== NIL_ATTEMPT) {
+      let receipt;
+      try {
+        receipt = await bridge.getAttempt(originalId);
+      } catch {
+        return hold('original fate check failed; holding');
+      }
+      if (receipt !== null && !isTerminalAttemptState(receipt.state)) {
+        return hold(`original attempt ${originalId} is ${receipt.state}; refusing a second worker`);
+      }
+      if (receipt === null && d.proof.kind === 'attempt-terminal') {
+        return hold('proof claims terminal but the bridge has no record; contradiction holds');
+      }
+      // receipt terminal, or 404 + lease-fenced/operator-attested: proceed.
+    }
+    const relaunched = await dispatchAttempt(
+      { ...t, lease: { fencingEpoch: epoch, leaseToken: d.schedulerToken, provenance: 'scheduler' } },
+      { fencingEpoch: epoch, journalKey: key },
+    );
+    // Only a confirmed receipt releases the quarantine.
+    journal.clearQuarantine(key);
+    const recovery = { ...auditBase, schedulerEpoch: epoch };
+    journal.writeAudit(key, { ...recovery, attemptId: relaunched.sessionParams.attemptId });
+    await log(
+      t,
+      `fenced generation ${session.fencingEpoch}; relaunched at epoch ${epoch} ` +
+        `by ${d.decidedBy} (attempt ${relaunched.sessionParams.attemptId})`,
+    );
+    return {
+      ...relaunched,
+      sessionParams: { ...relaunched.sessionParams, recovery: { ...recovery, resolvedAt: new Date().toISOString() } },
+    };
   }
 
   // ---- module ---------------------------------------------------------------
@@ -355,34 +491,98 @@ export function createServerAdapter(options = {}) {
       const t = readExecutionContext(ctx);
       if (!t.workerKind) t.workerKind = workerKindDefault;
       const incoming = ctx.runtime?.sessionParams ?? null;
+      const key = journalKeyFor(t.projectId, t.taskId, t.runId);
 
       // Unknown/stale session: force a fresh session on next wake.
       if (incoming && incoming.stale === true) {
         return { exitCode: null, signal: null, timedOut: false, sessionParams: null, clearSession: true };
       }
       if (incoming === null || incoming === undefined) {
-        const key = journalKeyFor(t.projectId, t.taskId, t.runId);
+        const qrec = journal.readQuarantine(key);
+        if (qrec && qrec.reason !== 'intent-changed') {
+          // A live ambiguity (unknown attempt, corrupt journal) blocks ALL
+          // fresh wakes: only an explicit recoveryDecision may proceed.
+          if (t.recoveryDecision) {
+            try {
+              return await resolveRecovery(t, recordSessionFromQuarantine(t, qrec), qrec, key);
+            } catch (err) {
+              return toOperationalError(t, err, null);
+            }
+          }
+          return holdWithoutSession(t, qrec);
+        }
         // Crash-after-acceptance reconcile: a pending intent from a previous
         // wake re-issues the IDENTICAL payload; the bridge replays the
         // original receipt (no duplicate worker).
         const pending = journal.readPending(key);
         if (pending !== null) {
-          if (!isValidJournalPending(pending)) {
+          if (!isValidJournalPending(pending) || stableStringify(pending.payload) !== pending.payloadHash) {
             return quarantineSession(t, null, {
               reason: 'journal-corrupt',
               detail: 'pending dispatch journal failed integrity check',
             });
           }
+          // Refuse-if-changed: recompute from CURRENT input. Any drift
+          // (instruction, lease, ...) quarantines instead of dispatching
+          // either the stale or the edited version.
+          if (t.lease.fencingEpoch !== pending.fencingEpoch) {
+            return quarantineSession(t, null, {
+              reason: 'intent-changed',
+              detail: `input lease epoch ${t.lease.fencingEpoch} differs from journaled ${pending.fencingEpoch}`,
+            });
+          }
+          const fresh = buildCreateAttemptRequest(t, pending.idempotencyKey, {
+            fencingEpoch: pending.fencingEpoch,
+            leaseToken: t.lease.leaseToken,
+          });
+          if (stableStringify(fresh) !== stableStringify(pending.payload)) {
+            return quarantineSession(t, null, {
+              reason: 'intent-changed',
+              detail: 'task input changed after the journaled dispatch; refusing both versions',
+            });
+          }
           await log(t, `reconciling pending dispatch ${pending.idempotencyKey} (no new worker)`);
           try {
-            return await dispatchAttempt(t, {
+            const result = await dispatchAttempt(t, {
               fencingEpoch: pending.fencingEpoch,
               journalKey: key,
               reconciling: pending,
             });
+            if (qrec && qrec.reason === 'intent-changed') {
+              // The drift that caused the quarantine is gone: the retry
+              // carries the original intent byte-for-byte, so the ambiguity
+              // is resolved by adopting the original — never a new worker.
+              journal.clearQuarantine(key);
+              journal.writeAudit(key, {
+                action: 'reconcile-identical-retry',
+                decidedBy: 'adapter:intent-match',
+                schedulerEpoch: pending.fencingEpoch,
+                attemptId: result.sessionParams.attemptId,
+                proof: { kind: 'lease-fenced', detail: 'retry matches journaled intent exactly' },
+              });
+              await log(t, 'identical retry resolved the intent drift; quarantine cleared');
+            }
+            return result;
           } catch (err) {
             return toOperationalError(t, err, null);
           }
+        }
+        if (journal.readQuarantine(key)) {
+          // Intent-drift quarantine without pending intent (or any other
+          // leftover): fail closed, decision required.
+          if (t.recoveryDecision) {
+            try {
+              return await resolveRecovery(
+                t,
+                recordSessionFromQuarantine(t, journal.readQuarantine(key)),
+                journal.readQuarantine(key),
+                key,
+              );
+            } catch (err) {
+              return toOperationalError(t, err, null);
+            }
+          }
+          return holdWithoutSession(t, journal.readQuarantine(key));
         }
         try {
           return await dispatchAttempt(t, { fencingEpoch: t.lease.fencingEpoch, journalKey: key });
@@ -404,16 +604,25 @@ export function createServerAdapter(options = {}) {
         return { exitCode: null, signal: null, timedOut: false, sessionParams: null, clearSession: true };
       }
       if (session.quarantined) {
-        if (t.quarantineResolution) return resolveQuarantine(t, session);
-        const key = journalKeyFor(t.projectId, t.taskId, t.runId);
+        if (t.recoveryDecision) {
+          try {
+            return await resolveRecovery(t, session, journal.readQuarantine(key), key);
+          } catch (err) {
+            return toOperationalError(t, err, session);
+          }
+        }
         const record = journal.readQuarantine(key);
         await log(
           t,
-          `session quarantined (${record?.reason ?? 'unknown'}); awaiting explicit quarantineResolution`,
+          `session quarantined (${record?.reason ?? 'unknown'}); awaiting structured recoveryDecision`,
         );
         return toResult({ ...session, runCount: session.runCount + 1 }, { exitCode: null });
       }
       try {
+        const pending = journal.readPending(key);
+        if (pending !== null) {
+          await log(t, 'stale pending intent superseded by a live session; leaving it untouched');
+        }
         return await resumeWake(t, session);
       } catch (err) {
         return toOperationalError(t, err, session);
