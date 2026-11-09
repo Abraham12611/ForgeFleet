@@ -72,11 +72,20 @@ different action/resource/SHA.
 The engine validates shape, never identity or provenance. The boundary
 that calls it MUST:
 
-1. **Mint `authProof` only after real owner authentication.** Never accept
-   a client- or agent-supplied proof value; bind it to the authenticated
-   session server-side. Policy treats the field as opaque presence, so a
-   forged-but-wellformed value passes the engine — true verification is
-   the boundary's job.
+1. **Mint `authProof` only after real owner authentication — a nonempty
+   string in JSON alone must never grant privileges.** The engine's
+   `OWNER_APPROVAL_UNAUTHENTICATED` check is presence-only by design: it
+   rejects objects that do not even claim boundary attestation, but it
+   cannot distinguish a server-minted proof from a well-formed forgery.
+   Therefore the boundary MUST: verify the owner session itself (auth
+   token/session, plus re-auth where required); generate the proof value
+   server-side (unpredictable, single-use or short-lived, bound to the
+   exact approval: action + resource ID + target SHA + expiry); never
+   accept, forward, or echo a client- or agent-supplied proof value; and
+   reject any privileged call whose proof it did not mint. Any consumer
+   that treats the JSON field as proof without this verification violates
+   the threat model (T4b) and MUST be treated as a security defect, not a
+   policy-engine gap.
 2. **Source `merge.develop` inputs from trusted GitHub state.** `headSha`
    must be the exact PR head from verified webhook/check APIs, and
    `checksPass` must reflect required check runs at that SHA — never
