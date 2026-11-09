@@ -1,0 +1,3 @@
+# CODEOWNERS: coordinator-only QC. Every path requires the repository owner,
+# so no engineering PR can merge on green CI alone.
+* @Abraham12611

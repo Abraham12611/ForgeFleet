@@ -40,8 +40,15 @@ jobs:
         run: python3 scripts/ci/check_manifest.py
       - name: Contract consistency (fixtures, dup schemas, $refs)
         run: python3 scripts/ci/check_contracts.py
+      - name: v0.1 contract generator freeze check (E05)
+        run: python3 packages/bridge-contracts/scripts/generate.py --check
       - name: Secret / credential hygiene
         run: python3 scripts/ci/check_hygiene.py
+      - name: CODEOWNERS coverage (owner-gated review)
+        run: |
+          test -f .github/CODEOWNERS
+          grep -Eq '^\* @Abraham12611([[:space:]]|$)' .github/CODEOWNERS
+          echo "OK: all paths require @Abraham12611 review"
       - name: Fail-closed proof (canaries must fail the gates)
         run: python3 scripts/ci/inventory.py --prove-fail-closed
 
@@ -70,7 +77,18 @@ jobs:
           if [ -f apps/web/package.json ]; then
             cd apps/web && npm ci && npm run build && npm test
           else
-            echo "apps/web absent: Vite suite uncovered (recorded in ci-report.md)"
+            echo "no apps/web/package.json: web node:test covered by inventory; Vite build uncovered (recorded in ci-report.md)"
+          fi
+      - name: Play readiness negative gate (placeholder must exit blocked)
+        run: |
+          rm -rf /tmp/play-bundle && mkdir -p /tmp/play-bundle
+          cp apps/android/play-internal/fixtures/placeholder-manifest.json /tmp/play-bundle/manifest.json
+          if python3 apps/android/play-internal/check_play_internal_readiness.py --bundle /tmp/play-bundle > /tmp/play-gate.json 2>&1; then
+            echo "FAIL: placeholder bundle unexpectedly passed"; cat /tmp/play-gate.json; exit 1
+          else
+            code=$?
+            test "$code" -eq 1 || { echo "FAIL: expected exit 1, got $code"; exit 1; }
+            echo "OK: placeholder bundle blocked (exit 1) as designed"
           fi
       # actions/upload-artifact v4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
