@@ -1,0 +1,32 @@
+{
+  "signing": {
+    "scheme": "Google Play App Signing (upload key signs the AAB; Play manages the distribution key)",
+    "credentialEnvNames": [
+      "ANDROID_KEYSTORE_PATH",
+      "ANDROID_KEYSTORE_PASSWORD_REF",
+      "ANDROID_KEY_ALIAS",
+      "ANDROID_KEY_PASSWORD_REF"
+    ],
+    "rule": "Only credential NAMES are recorded here and in CI. Values and keystore files live in the owner's secret manager / protected CI store and are never committed, printed to logs, or sent to worker contexts."
+  },
+  "build": {
+    "webBundle": "Build the shared apps/web source first (E12/E14 prerequisite), then sync into the Capacitor shell",
+    "commands": [
+      "npm --prefix apps/web run build",
+      "npx cap sync android",
+      "cd apps/android/android && ./gradlew bundleRelease"
+    ],
+    "artifact": "apps/android/android/app/build/outputs/bundle/release/app-release.aab",
+    "artifactChecks": [
+      "bundletool build-apks from the AAB succeeds",
+      "applicationId and versionCode match the release record",
+      "no debuggable=true, no plaintext secrets in the bundle"
+    ]
+  },
+  "tracks": ["internal", "closed", "production"],
+  "promotionGates": {
+    "internal": "AAB accepted by Play Console internal track; on-device test plan executed with evidence",
+    "closed": "explicit owner approval + Play policy/data-safety checklist complete",
+    "production": "explicit owner approval after closed-track soak; never automatic"
+  }
+}

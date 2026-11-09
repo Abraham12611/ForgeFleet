@@ -1,0 +1,22 @@
+{
+  "appId": "com.example.forgefleet.placeholder",
+  "appName": "ForgeFleet",
+  "webDir": "../web/dist",
+  "backgroundColor": "#111418",
+  "androidScheme": "https",
+  "server": {
+    "cleartext": false
+  },
+  "plugins": {
+    "PushNotifications": {
+      "presentationOptions": ["badge", "sound", "alert"]
+    },
+    "App": {},
+    "Browser": {}
+  },
+  "_notes": {
+    "appId": "PLACEHOLDER. The release application ID is OPEN per ADR-0006 and must be chosen with the owner before any Play submission. check-packaging.py rejects any appId without a placeholder/example marker.",
+    "webDir": "Relative local build output of the shared responsive web source. A remote https URL here is rejected: the Android app must be built from the same source, not pointed at the deployed website.",
+    "server": "No remote url is configured. The packaged app talks to the authenticated public API ingress (E17) through normal HTTPS requests, never to tailnet-only or loopback addresses."
+  }
+}

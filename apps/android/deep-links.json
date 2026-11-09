@@ -1,0 +1,40 @@
+{
+  "customScheme": "forgefleet",
+  "universalHosts": ["app.example.invalid"],
+  "note": "Hosts use .invalid placeholders per ADR-0006 (exact domains remain OPEN, do not guess them). Replace with the owner-chosen domain before any Play submission.",
+  "routes": [
+    {"path": "/home", "screen": "home-dashboard", "params": []},
+    {"path": "/projects", "screen": "project-list", "params": []},
+    {"path": "/projects/:projectId/chat", "screen": "coordinator-chat", "params": ["projectId"]},
+    {"path": "/projects/:projectId/tasks", "screen": "task-board", "params": ["projectId"]},
+    {"path": "/projects/:projectId/tasks/:taskId", "screen": "task-detail", "params": ["projectId", "taskId"]},
+    {"path": "/projects/:projectId/prs", "screen": "pr-review-summary", "params": ["projectId"]},
+    {"path": "/projects/:projectId/files", "screen": "project-context", "params": ["projectId"]},
+    {"path": "/inbox", "screen": "decision-inbox", "params": []},
+    {"path": "/inbox/:decisionId", "screen": "decision-detail", "params": ["decisionId"]},
+    {"path": "/fleet", "screen": "fleet-overview", "params": []},
+    {"path": "/fleet/:agentId", "screen": "agent-detail", "params": ["agentId"]},
+    {"path": "/more", "screen": "settings-sleep", "params": []}
+  ],
+  "knownScreens": [
+    "home-dashboard",
+    "project-list",
+    "project-detail",
+    "coordinator-chat",
+    "task-board",
+    "task-detail",
+    "worker-thread",
+    "pr-review-summary",
+    "project-context",
+    "decision-inbox",
+    "decision-detail",
+    "fleet-overview",
+    "agent-detail",
+    "settings-sleep"
+  ],
+  "rules": [
+    "Every route target must be a member of knownScreens (screens from docs/02-experience/mobile-app-map.md).",
+    "Unauthenticated deep-link opens land on launch/auth first, then resume the link after sign-in.",
+    "Expired sessions surfacing from a deep link must show secure session-expiry UI, never cached privileged content."
+  ]
+}
