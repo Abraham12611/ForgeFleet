@@ -1,0 +1,24 @@
+{
+  "name": "ForgeFleet Mobile (fixture prototype)",
+  "short_name": "ForgeFleet",
+  "description": "Fixture prototype of the ForgeFleet responsive mobile workflow PWA for FF-019 360px acceptance walkthrough. No backend.",
+  "start_url": "./index.html#/home",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
