@@ -1,24 +1,11 @@
-/* FF-015 (E12) — Command Center + project overview styles (fixture spike).
+/* FF-015 (E12) — Command Center + project overview styles.
    Mobile-first. Sign-off widths: 360 / 412 / 768 / 1280 / 1440.
    Status is never color-only: every badge carries a text label. */
 
-:root {
-  --ff-surface: #ffffff;
-  --ff-surface-muted: #f4f5f7;
-  --ff-ink: #1a1d21;
-  --ff-ink-muted: #5b6470;
-  --ff-line: #dde2e8;
-  --ff-accent: #1f5eff;
-  --ff-warn: #8a4b00;
-  --ff-bad: #a4262c;
-  --ff-ok: #1e6b3a;
-  --ff-focus: #7aa2ff;
-}
-
 .ff-dashboard {
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  color: var(--ff-ink);
-  background: var(--ff-surface);
+  color: #1a1d21;
+  background: #ffffff;
   margin: 0 auto;
   max-width: 1440px;
   padding: 12px;
@@ -30,11 +17,11 @@
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  border: 1px solid var(--ff-line);
+  border: 1px solid #dde2e8;
   border-radius: 999px;
   padding: 2px 10px;
-  background: var(--ff-surface-muted);
-  color: var(--ff-ink-muted);
+  background: #f4f5f7;
+  color: #5b6470;
 }
 
 .ff-header {
@@ -42,7 +29,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  border-bottom: 1px solid var(--ff-line);
+  border-bottom: 1px solid #dde2e8;
   padding-bottom: 10px;
 }
 
@@ -54,10 +41,10 @@
 }
 
 .ff-card {
-  border: 1px solid var(--ff-line);
+  border: 1px solid #dde2e8;
   border-radius: 12px;
   padding: 12px;
-  background: var(--ff-surface);
+  background: #ffffff;
 }
 
 .ff-card h2 {
@@ -75,24 +62,24 @@
 }
 
 .ff-stat {
-  border: 1px solid var(--ff-line);
+  border: 1px solid #dde2e8;
   border-radius: 8px;
   padding: 8px;
 }
 
-.ff-stat dt { font-size: 12px; color: var(--ff-ink-muted); }
+.ff-stat dt { font-size: 12px; color: #5b6470; }
 .ff-stat dd { font-size: 20px; font-weight: 700; margin: 2px 0 0; }
 
 .ff-state {
   border-radius: 8px;
   padding: 10px 12px;
   margin-top: 12px;
-  border: 1px solid var(--ff-line);
-  background: var(--ff-surface-muted);
+  border: 1px solid #dde2e8;
+  background: #f4f5f7;
 }
 
-.ff-state[data-tone="bad"] { border-color: var(--ff-bad); }
-.ff-state[data-tone="warn"] { border-color: var(--ff-warn); }
+.ff-state[data-tone="bad"] { border-color: #a4262c; }
+.ff-state[data-tone="warn"] { border-color: #8a4b00; }
 
 .ff-bottom-tabs {
   position: sticky;
@@ -100,8 +87,8 @@
   display: grid;
   grid-template-columns: repeat(5, 1fr);
   gap: 4px;
-  background: var(--ff-surface);
-  border-top: 1px solid var(--ff-line);
+  background: #ffffff;
+  border-top: 1px solid #dde2e8;
   padding: 8px 4px calc(8px + env(safe-area-inset-bottom));
   margin-top: 16px;
 }
@@ -111,19 +98,19 @@
   font-size: 12px;
   padding: 10px 4px;
   min-height: 44px;
-  color: var(--ff-ink);
+  color: #1a1d21;
   text-decoration: none;
   border-radius: 8px;
 }
 
 .ff-bottom-tabs a[aria-current="page"] {
-  outline: 2px solid var(--ff-accent);
+  outline: 2px solid #1f5eff;
   outline-offset: -2px;
   font-weight: 700;
 }
 
-a:focus-visible, button:focus-visible {
-  outline: 3px solid var(--ff-focus);
+a:focus-visible, button:focus-visible, select:focus-visible {
+  outline: 3px solid #7aa2ff;
   outline-offset: 2px;
 }
 

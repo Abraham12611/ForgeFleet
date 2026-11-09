@@ -1,46 +1,63 @@
-# Dashboard fixtures — Command Center + project overview (FF-015 / E12)
+# Dashboard — Command Center + project overview (FF-015 / E12)
 
-Fixture-only spike. Prerequisites E01 (Paperclip upstream) and E05 (frozen
-contracts) are **not** satisfied, so this directory renders **mock status
-only** and labels every payload `dataSource: 'fixture'`. Live Orca/Paperclip
-state is refused loudly (`dashboard.js` throws on `dataSource: 'live'`)
-rather than misrendered.
+React port on the version-pinned `apps/web` composition (upstream
+`paperclipai/paperclip` @ `088bdf7`; foundation from PR #56, E01-owned).
+This directory supersedes the first-commit standalone JS/HTML spike, which
+has been removed. **Not the complete product dashboard; FF-015 is not
+claimed complete.**
 
-## Files (all under exclusive E12 ownership `apps/web/src/features/dashboard/`)
+## Files (exclusive E12 ownership `apps/web/src/features/dashboard/`)
 
-- `fixtures.js` — deterministic factories: 20/200 workers, 30 inbox items,
-  PR with 12 checks, healthy/empty/offline/throttled/sleeping command
-  centers, Atlas project overview. No clock, no randomness.
-- `dashboard.js` — pure state logic: 7 screen states
-  (`loading/ready/empty/recoverable-error/permission-denied/offline/stale`),
-  command-center summary, project overview, `unknown`-preserving worker
-  states, responsive nav model for sign-off widths 360/412/768/1280/1440.
-- `dashboard.css` — mobile-first responsive styles, bottom tabs on narrow
-  screens, focus-visible + reduced-motion support, text-labelled statuses.
-- `index.html` — self-contained demo: open directly in a browser, switch
-  screen states with the picker, resize to verify breakpoints. No build step.
-- `dashboard.test.js` — `node --test` suite (10 tests).
+- `types.ts` — `DataSource` (`fixture` | `unknown` | `live`), screen-state
+  and payload shapes.
+- `state.ts` — pure accepted screen/state model: 7 screen states, summary,
+  overview, `unknown`-preserving worker states, nav model for 360–1440px,
+  honest-source binding policy (`resolveSource`).
+- `fixtures.ts` — deterministic fixtures + preview variants
+  (healthy/empty/offline/throttled/sleeping/denied).
+- `useControlPlane.ts` — real binding via `src/lib/api.ts` + `src/lib/live.ts`
+  (read-only). `live` requires a successful health check this session.
+- `CommandCenter.tsx` — `/projects` route (fixture preview + binding modes).
+- `ProjectOverview.tsx` — `/projects/:id` route.
+- `SourceBadge.tsx`, `StateBanner.tsx` — explicit source labels, 7-state UI.
+- `routes.tsx` — route exports for the shell (see touchpoint below).
+- `dashboard.css` — mobile-first styles, bottom tabs, focus + reduced motion.
+- `state.test.ts`, `fixtures.test.ts` — vitest suites.
+- `MANUAL-UI-CHECKLIST.md` — **owner-executed** UI tests + screenshot list.
+
+## Shared-entry touchpoint (coordinator sign-off requested, PR #38)
+
+`src/App.tsx` (E01-owned): added the `dashboardRoutes` import, a
+`Projects` nav link, and `{dashboardRoutes}` inside `<Routes>` — additive
+only. `/` probe and `/fleet` placeholder untouched (E01/E13).
+
+## Run (from `apps/web`)
+
+```sh
+npm install
+npm test        # vitest, incl. dashboard suites
+npm run typecheck
+npm run build
+npm run dev     # :5173; /api proxied to $PAPERCLIP_DEV_API or localhost:3100
+```
 
 ## Contracts followed
 
-- Copy: `docs/02-experience/screens-states-and-copy.md`
-- Routes/IA: `docs/02-experience/web-app-map.md`,
-  `docs/02-experience/information-architecture.md`,
-  `docs/02-experience/mobile-app-map.md`
-- States: `docs/05-contracts/state-machines.md` (`unknown` stays unknown)
-- Scope: `docs/06-delivery/dispatch/E12.md`, `docs/06-delivery/work-breakdown.md` FF-015
+- Copy/IA/routes: `docs/02-experience/screens-states-and-copy.md`,
+  `web-app-map.md`, `information-architecture.md`, `mobile-app-map.md`,
+  `design-direction.md`.
+- States: `docs/05-contracts/state-machines.md` (`unknown` stays unknown).
+- Scope: `docs/06-delivery/dispatch/E12.md`, work-breakdown FF-015.
 
-## Run
+## Unverified assumptions / limits
 
-```sh
-node --test apps/web/src/features/dashboard/dashboard.test.js
-open apps/web/src/features/dashboard/index.html
-```
-
-## Unverified assumptions / next steps for coordinator
-
-- No Paperclip components reused yet (E01 spike pending); CSS/classes here
-  are throwaway-compatible and must be reconciled with upstream tokens.
-- No bridge types consumed (E05 draft OpenAPI only, unpinned).
-- Task/fleet/inbox full screens belong to E13/E14 — only summary counts
-  are exposed here for cross-linking.
+- No live Vultr backend exists: the `live` code path is wired but
+  unverified against staging (E17); reachable states today are
+  `fixture` / `unknown` / `offline` / `stale`.
+- Project-level endpoints unbound (E05/E08): project fields render as
+  `unknown` in binding mode, never as `live` — enforced by throws in
+  `state.ts`.
+- Spending figures are labelled estimates until E18 binds metering.
+- Task/fleet/inbox full screens stay E13/E14; only summary counts here.
+- Manual UI verification + screenshots are owner-executed per
+  `MANUAL-UI-CHECKLIST.md`; the agent claims only the automated gates.
