@@ -20,17 +20,30 @@ and the GitHub cases in
   never merge. Nobody except the human owner merges their own PR.
 - `develop`: merged by the coordinator or owner after checks plus
   independent review. No owner approval record required.
-- `main`: merged only by the human owner with an explicit owner approval in
-  the canonical FF-004 `OwnerApproval` shape, bound to the exact resource,
-  head SHA, action, and expiry, **plus a server-minted `authProof`**.
-  An approval object without `authProof` is rejected
-  (`OWNER_APPROVAL_UNAUTHENTICATED`): a role string alone proves nothing.
-  Message-origin or sleep-expiry approvals are rejected. New commits and
-  expiry invalidate approval. A missing approval queues an owner decision
-  (`require_owner`, never auto-approval, including when the owner sleeps);
-  a malformed one denies. Coordinator may only request, never execute.
+- `main`: merged only by the human owner with a raw approval claim **plus**
+  a server-side `BoundaryAttestation` from a component in the fail-closed
+  `ApprovalTrustPolicy` allowlist. Raw records carry no proof field by
+  construction; a smuggled proof value in PR/agent data is never read.
+  Per FF-004 `f00de20` (T4b), a bare `authProof` string alone never grants
+  privileges — only storage-checked attestation counts. Unattested,
+  untrusted-verifier, unauthenticated, message/sleep-origin, expired, or
+  mismatched claims deny; a missing claim queues an owner decision
+  (`require_owner`, never auto-approval, including when the owner sleeps).
+  Coordinator may only request, never execute.
 - Decisions use canonical verdicts (`allow` / `deny` / `require_owner`) and
   FF-004 reason codes.
+
+## What this is not
+
+This package is a **pure evidence gate**, not an enforceable GitHub App
+integration. It performs no webhook signature verification, makes no GitHub
+API calls, mints no proofs, and enforces no branch protection. An `allow`
+verdict here means "the presented, duly attested evidence satisfies policy";
+turning that into merged code requires the delivery path: an installed
+GitHub App with verified webhooks, real CI check runs at the head SHA
+(#59), owner-configured branch rulesets (#64), and the E07 boundary that
+mints and verifies attestations. Reviewing this package as if it merges,
+authenticates, or protects anything by itself is a category error.
 
 ## Usage
 
@@ -87,6 +100,6 @@ unit-level against the contract cases. No live GitHub interaction is claimed.
 ## Tests
 
 ```sh
-npm test      # node --test src/*.test.ts (25 tests)
+npm test      # node --test src/*.test.ts (29 tests)
 npm run typecheck
 ```

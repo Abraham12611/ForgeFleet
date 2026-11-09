@@ -2,14 +2,17 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   CANONICAL_POLICY_VERSION,
+  MERGE_ACTION,
   MERGE_GATE_POLICY_VERSION,
   evaluateGitHubEvidence,
   evaluateMergeGate,
   prResourceId,
   toAuthorizeInput,
+  type ApprovalTrustPolicy,
+  type BoundaryAttestation,
+  type ClaimedApproval,
   type MergeActor,
   type MergeGateInput,
-  type OwnerApproval,
   type PullRequestRef,
   type RequiredCheckPolicy,
 } from "./merge_gate.ts";
@@ -21,6 +24,11 @@ const POLICY: RequiredCheckPolicy = {
   targets: { develop: ["ci"], main: ["ci", "security"] },
 };
 
+const TRUST: ApprovalTrustPolicy = {
+  version: "trust-v1",
+  trustedVerifiers: ["policy-service", "github-bridge-handler"],
+};
+
 function pr(overrides: Partial<PullRequestRef> = {}): PullRequestRef {
   return {
     repoId: "repo_1",
@@ -28,6 +36,28 @@ function pr(overrides: Partial<PullRequestRef> = {}): PullRequestRef {
     headSha: "abc123",
     targetBranch: "develop",
     authorId: "worker-1",
+    ...overrides,
+  };
+}
+
+function claim(overrides: Partial<ClaimedApproval> = {}): ClaimedApproval {
+  return {
+    grantedBy: "owner",
+    action: "merge.main",
+    resourceId: "github-pr:repo_1:7:main",
+    targetSha: "abc123",
+    expiresAt: NOW + 3600_000,
+    ...overrides,
+  };
+}
+
+function attestation(
+  overrides: Partial<BoundaryAttestation> = {},
+): BoundaryAttestation {
+  return {
+    authProof: "server-minted-proof-1",
+    verifiedBy: "policy-service",
+    checkedAt: NOW - 1000,
     ...overrides,
   };
 }
@@ -43,19 +73,9 @@ function input(overrides: Partial<MergeGateInput> = {}): MergeGateInput {
       { reviewerId: "reviewer-1", kind: "agent", headSha: "abc123", decision: "approve" },
     ],
     approval: null,
+    attestation: null,
+    approvalTrust: TRUST,
     now: NOW,
-    ...overrides,
-  };
-}
-
-function ownerApproval(overrides: Partial<OwnerApproval> = {}): OwnerApproval {
-  return {
-    grantedBy: "owner",
-    authProof: "server-minted-proof-1",
-    action: "merge.main",
-    resourceId: "github-pr:repo_1:7:main",
-    targetSha: "abc123",
-    expiresAt: NOW + 3600_000,
     ...overrides,
   };
 }
@@ -80,7 +100,8 @@ describe("fail-closed required-check policy (PR #58 review)", () => {
           { name: "ci", headSha: "abc123", status: "pass" },
           { name: "security", headSha: "abc123", status: "pass" },
         ],
-        approval: ownerApproval(),
+        approval: claim(),
+        attestation: attestation(),
       }),
     );
     assert.equal(d.allowed, false);
@@ -105,7 +126,8 @@ describe("fail-closed required-check policy (PR #58 review)", () => {
       pr: ref,
       actor: owner,
       checks: [{ name: "ci", headSha: "abc123", status: "pass" }],
-      approval: ownerApproval(),
+      approval: claim(),
+      attestation: attestation(),
     });
     const d = evaluateMergeGate(base);
     assert.equal(d.allowed, false);
@@ -193,7 +215,7 @@ describe("develop merge gate", () => {
   });
 });
 
-describe("main merge gate (owner approval)", () => {
+describe("main merge gate: server-storage attestation (PR #58 re-review)", () => {
   function mainInput(overrides: Partial<MergeGateInput> = {}): MergeGateInput {
     return input({
       pr: pr({ targetBranch: "main" }),
@@ -202,12 +224,13 @@ describe("main merge gate (owner approval)", () => {
         { name: "ci", headSha: "abc123", status: "pass" },
         { name: "security", headSha: "abc123", status: "pass" },
       ],
-      approval: ownerApproval(),
+      approval: claim(),
+      attestation: attestation(),
       ...overrides,
     });
   }
 
-  it("allows an owner merge with exact-SHA verified owner approval", () => {
+  it("allows an owner merge with a verified server-side attestation", () => {
     const d = evaluateMergeGate(mainInput());
     assert.equal(d.allowed, true);
     assert.equal(d.verdict, "allow");
@@ -229,30 +252,63 @@ describe("main merge gate (owner approval)", () => {
     assert.equal(d.reasonCode, "SLEEP_QUEUED");
   });
 
-  it("rejects unsigned approvals: role string alone proves nothing", () => {
-    const d = evaluateMergeGate(
-      mainInput({ approval: ownerApproval({ authProof: "" }) }),
-    );
+  it("denies a raw claim with no attestation: raw data is never proof", () => {
+    const d = evaluateMergeGate(mainInput({ attestation: null }));
     assert.equal(d.allowed, false);
     assert.equal(d.verdict, "deny");
-    assert.equal(d.reasonCode, "OWNER_APPROVAL_UNAUTHENTICATED");
+    assert.equal(d.reasonCode, "OWNER_APPROVAL_UNVERIFIED");
   });
 
-  it("rejects approvals granted by non-owners and from message origin", () => {
+  it("ignores proof smuggled inside the raw record", () => {
+    const smuggled = { ...claim(), authProof: "forged-proof" };
+    const d = evaluateMergeGate(
+      mainInput({ approval: smuggled, attestation: null }),
+    );
+    assert.equal(d.allowed, false);
+    assert.equal(d.reasonCode, "OWNER_APPROVAL_UNVERIFIED");
+  });
+
+  it("denies attestations from outside the trusted verifier allowlist", () => {
+    const d = evaluateMergeGate(
+      mainInput({ attestation: attestation({ verifiedBy: "random-agent" }) }),
+    );
+    assert.equal(d.allowed, false);
+    assert.equal(d.reasonCode, "OWNER_APPROVAL_UNTRUSTED_VERIFIER");
+  });
+
+  it("fails closed when the verifier allowlist is missing or empty", () => {
     assert.equal(
-      evaluateMergeGate(mainInput({ approval: ownerApproval({ grantedBy: "coordinator" }) })).reasonCode,
+      evaluateMergeGate(mainInput({ approvalTrust: null })).reasonCode,
+      "OWNER_APPROVAL_TRUST_POLICY_MISSING",
+    );
+    assert.equal(
+      evaluateMergeGate(
+        mainInput({ approvalTrust: { version: "t", trustedVerifiers: [] } }),
+      ).reasonCode,
+      "OWNER_APPROVAL_TRUST_POLICY_MISSING",
+    );
+  });
+
+  it("denies empty server proofs and non-owner or message-origin claims", () => {
+    assert.equal(
+      evaluateMergeGate(mainInput({ attestation: attestation({ authProof: "" }) })).reasonCode,
+      "OWNER_APPROVAL_UNAUTHENTICATED",
+    );
+    assert.equal(
+      evaluateMergeGate(mainInput({ approval: claim({ grantedBy: "coordinator" }) })).reasonCode,
       "OWNER_APPROVAL_NOT_OWNER",
     );
     assert.equal(
-      evaluateMergeGate(mainInput({ approval: ownerApproval({ origin: "message" }) })).reasonCode,
+      evaluateMergeGate(mainInput({ approval: claim({ origin: "message" }) })).reasonCode,
       "OWNER_APPROVAL_BAD_ORIGIN",
     );
   });
 
-  it("new commits and expiry invalidate the owner approval", () => {
+  it("new commits and expiry invalidate the verified approval", () => {
     const stale = evaluateMergeGate(
       mainInput({
         pr: pr({ targetBranch: "main", headSha: "def456" }),
+        approval: claim({ resourceId: "github-pr:repo_1:7:main" }),
         checks: [
           { name: "ci", headSha: "def456", status: "pass" },
           { name: "security", headSha: "def456", status: "pass" },
@@ -265,7 +321,7 @@ describe("main merge gate (owner approval)", () => {
     assert.equal(stale.allowed, false);
     assert.equal(stale.reasonCode, "OWNER_APPROVAL_SHA_MISMATCH");
     const expired = evaluateMergeGate(
-      mainInput({ approval: ownerApproval({ expiresAt: NOW - 1 }) }),
+      mainInput({ approval: claim({ expiresAt: NOW - 1 }) }),
     );
     assert.equal(expired.allowed, false);
     assert.equal(expired.reasonCode, "OWNER_APPROVAL_EXPIRED");
@@ -279,20 +335,24 @@ describe("main merge gate (owner approval)", () => {
     assert.equal(d.verdict, "require_owner");
   });
 
-  it("hard failures dominate: bad approval denies even without execution rights", () => {
+  it("hard failures dominate: unverified claim denies even without execution rights", () => {
     const d = evaluateMergeGate(
       mainInput({
         actor: { id: "coordinator-1", role: "coordinator" },
-        approval: ownerApproval({ authProof: "" }),
+        attestation: null,
       }),
     );
     assert.equal(d.verdict, "deny");
   });
 });
 
-describe("canonical-engine binding", () => {
-  it("mirrors the canonical FF-004 policy version", () => {
+describe("canonical-engine binding (FF-004, PR #33 tip)", () => {
+  it("mirrors the canonical policy version and dotted action strings", () => {
     assert.equal(CANONICAL_POLICY_VERSION, "0.1.0");
+    assert.deepEqual(MERGE_ACTION, {
+      develop: "merge.develop",
+      main: "merge.main",
+    });
   });
 
   it("prResourceId binds repo, PR, and target branch", () => {
@@ -315,6 +375,36 @@ describe("canonical-engine binding", () => {
     assert.equal(mapped.resource.id, "github-pr:repo_1:7:develop");
     assert.equal(mapped.resource.checksPass, true);
     assert.equal(mapped.resource.reviewerId, "reviewer-1");
+  });
+
+  it("toAuthorizeInput assembles server-side proof only for verified main claims", () => {
+    const verified = toAuthorizeInput(
+      input({
+        pr: pr({ targetBranch: "main" }),
+        actor: owner,
+        checks: [
+          { name: "ci", headSha: "abc123", status: "pass" },
+          { name: "security", headSha: "abc123", status: "pass" },
+        ],
+        approval: claim(),
+        attestation: attestation(),
+      }),
+    );
+    assert.ok(verified !== null);
+    assert.equal(verified.context.approval?.authProof, "server-minted-proof-1");
+    const unverified = toAuthorizeInput(
+      input({
+        pr: pr({ targetBranch: "main" }),
+        actor: owner,
+        checks: [
+          { name: "ci", headSha: "abc123", status: "pass" },
+          { name: "security", headSha: "abc123", status: "pass" },
+        ],
+        approval: claim(),
+        attestation: null,
+      }),
+    );
+    assert.equal(unverified, null);
   });
 
   it("toAuthorizeInput is null for unknown targets and unmapped roles", () => {

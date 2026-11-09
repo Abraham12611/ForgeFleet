@@ -2,42 +2,53 @@
  * FF-018 merge gate (E16): GitHub evidence evaluation plus a thin binding to
  * the canonical E07 policy engine.
  *
- * Revision 2 (coordinator review on PR #58):
- * - Required checks come from a versioned authoritative {@link RequiredCheckPolicy},
- *   never a caller-supplied list. Missing, unknown-target, or empty policy
- *   fails closed: no check results can satisfy the gate.
- * - Approvals use the canonical FF-004 `OwnerApproval` shape. An approval
- *   object alone proves nothing: without a server-minted `authProof` the
- *   record is rejected (`OWNER_APPROVAL_UNAUTHENTICATED`), and approvals
- *   originating from message content or sleep expiry are rejected. Minting
- *   and verifying `authProof` is the integration boundary's job (E07 policy
- *   service / bridge handler), never the caller's; the gate treats it as an
- *   opaque presence requirement.
- * - Verdicts, action names (`merge.develop` / `merge.main`), and reason codes
- *   mirror the canonical engine (`packages/policy` on the FF-004 branch,
- *   `POLICY_VERSION 0.1.0`), which remains the single authority for
- *   actor/role/approval-class decisions. This package is the GitHub-evidence
- *   evaluator (E16's job: checks/review at exact SHAs) and produces
- *   canonical-shaped `authorize()` inputs via {@link toAuthorizeInput}, so
- *   delegation is mechanical once `packages/policy` lands on `develop`.
- *   Known divergence: the FF-023 branch carries a variant policy surface
- *   (`merge_main`, `{allowed, approvals[]}`); unifying the two engines is
- *   E07/coordinator work, tracked in the README. This package implements no
- *   third engine and imports neither variant.
+ * WHAT THIS IS: a pure evidence gate. It evaluates check results, reviews,
+ * and boundary-verified approvals presented to it and returns a verdict.
  *
- * References: `docs/03-architecture/github-integration.md` (merge policy),
- * `docs/04-flows/github-delivery.md` (F03), `docs/05-contracts/policy-matrix.md`,
- * `docs/05-contracts/contract-test-cases.md` (GitHub cases).
+ * WHAT THIS IS NOT: an enforceable GitHub App integration. It performs no
+ * webhook signature verification, makes no GitHub API calls, and enforces no
+ * branch protection. Real enforcement needs an installed GitHub App with
+ * verified webhooks (delivery work, not this package), owner-configured
+ * branch rulesets (issue #64), and real CI check runs (issue #59). Treating
+ * this module's verdict as enforcement without that transport is a
+ * category error; see README "Gate status".
+ *
+ * Revision 3 (coordinator re-review on PR #58, FF-004 `f00de20` rule):
+ * a nonempty `authProof` string alone never grants privileges — the
+ * canonical engine's presence check is fail-open by design against forgery,
+ * and any consumer that treats the JSON field as proof without server-side
+ * verification violates threat model T4b. Therefore raw approval records
+ * accepted here deliberately carry NO proof field ({@link ClaimedApproval}).
+ * Proof enters only through {@link BoundaryAttestation}: a server-side
+ * record from a boundary component in the fail-closed
+ * {@link ApprovalTrustPolicy} allowlist, which minted/checked the proof
+ * against authenticated server storage. A smuggled proof value in raw data
+ * is never read. Assembling the canonical `authorize()` input from claim +
+ * attestation in {@link toAuthorizeInput} IS the boundary function.
+ *
+ * Verdicts, action names (`merge.develop` / `merge.main`), and reason codes
+ * mirror the canonical engine (`packages/policy`, PR #33 branch tip,
+ * `POLICY_VERSION 0.1.0`; confirmed dotted action strings; the `merge_main`
+ * variant on the FF-023 branch is E07/coordinator unification work, not
+ * adopted here). The canonical engine remains the single authority for
+ * actor/role/approval-class decisions; this package is the GitHub-evidence
+ * evaluator (E16's job) and implements no third engine.
+ *
+ * References: `docs/03-architecture/github-integration.md`,
+ * `docs/04-flows/github-delivery.md` (F03),
+ * `docs/05-contracts/policy-matrix.md`,
+ * `docs/05-contracts/contract-test-cases.md` (GitHub cases),
+ * `docs/03-architecture/security-policy.md` (T4b, authProof rule).
  */
 
 /** Canonical engine version mirrored here (FF-004 `POLICY_VERSION`). */
 export const CANONICAL_POLICY_VERSION = "0.1.0";
-export const MERGE_GATE_POLICY_VERSION = "ff018-v2";
+export const MERGE_GATE_POLICY_VERSION = "ff018-v3";
 
 export const MERGE_TARGETS = ["develop", "main"] as const;
 export type MergeTarget = (typeof MERGE_TARGETS)[number];
 
-/** Canonical action names (FF-004 `ACTION_CATALOG` keys). */
+/** Canonical action names (FF-004 `ACTION_CATALOG` keys, dotted form). */
 export const MERGE_ACTION: Record<MergeTarget, string> = {
   develop: "merge.develop",
   main: "merge.main",
@@ -96,10 +107,10 @@ export interface Review {
 }
 
 /**
- * Authoritative required-check policy for repositories/targets. This object
- * is repo configuration (versioned), not a per-call caller argument: the
- * gate fails closed whenever it is absent, silent about the target, or
- * empty, so a caller can never smuggle in an empty required set.
+ * Authoritative required-check policy for repositories/targets. Repo
+ * configuration (versioned), not a per-call caller argument: the gate fails
+ * closed whenever it is absent, silent about the target, or empty, so a
+ * caller can never smuggle in an empty required set.
  */
 export interface RequiredCheckPolicy {
   version: string;
@@ -115,11 +126,48 @@ export interface PullRequestRef {
 }
 
 /**
- * Canonical FF-004 `OwnerApproval`: a durable, authenticated owner action,
- * never a chat utterance. `authProof` is an opaque server-minted reference
- * proving the owner authenticated at the integration boundary.
+ * Raw approval record from untrusted sources (PR data, agent messages).
+ * Deliberately carries NO proof field: any `authProof`-shaped value in raw
+ * data is untrusted by construction and is never read by this gate, even
+ * if a JavaScript caller smuggles one in. Proof lives only in
+ * {@link BoundaryAttestation}.
  */
-export interface OwnerApproval {
+export interface ClaimedApproval {
+  grantedBy: string;
+  action: string;
+  resourceId: string;
+  targetSha: string;
+  expiresAt: number;
+  origin?: string;
+}
+
+/**
+ * Server-side attestation: the boundary component `verifiedBy` minted the
+ * opaque `authProof` after real owner authentication and checked it against
+ * authenticated server storage, bound to the exact approval. Only
+ * attestations from components in {@link ApprovalTrustPolicy} count.
+ */
+export interface BoundaryAttestation {
+  authProof: string;
+  verifiedBy: string;
+  checkedAt: number;
+}
+
+/**
+ * Fail-closed allowlist of boundary components permitted to attest
+ * approvals (server configuration, versioned). Null or empty denies every
+ * approval: unverifiable claims grant nothing.
+ */
+export interface ApprovalTrustPolicy {
+  version: string;
+  trustedVerifiers: string[];
+}
+
+/**
+ * Canonical FF-004 `OwnerApproval` shape, assembled server-side only (see
+ * {@link toAuthorizeInput}). Never parsed from raw PR/agent data.
+ */
+export interface VerifiedOwnerApproval {
   grantedBy: string;
   authProof: string;
   action: string;
@@ -144,8 +192,12 @@ export interface MergeGateInput {
   checkPolicy: RequiredCheckPolicy | null;
   /** Observed reviews (any SHA; superseded entries are ignored). */
   reviews: Review[];
-  /** Recorded owner approval, or null when none exists. */
-  approval: OwnerApproval | null;
+  /** Raw claimed approval, or null when none exists. Carries no proof. */
+  approval: ClaimedApproval | null;
+  /** Server-side attestation for the claim, or null when unverified. */
+  attestation: BoundaryAttestation | null;
+  /** Verifier allowlist, or null when unconfigured (fail closed). */
+  approvalTrust: ApprovalTrustPolicy | null;
   /** Epoch ms clock; defaults to `Date.now()`. */
   now?: number;
   /** Owner sleep mode: missing approval queues instead of approving. */
@@ -188,7 +240,7 @@ function isMergeTarget(branch: string): branch is MergeTarget {
 /**
  * Pure GitHub-evidence evaluation (E16's adapter job): required checks green
  * at the exact current head SHA, and an independent reviewer at that SHA.
- * No roles or approvals are consulted here.
+ * No roles, approvals, or attestations are consulted here.
  */
 export function evaluateGitHubEvidence(
   checkPolicy: RequiredCheckPolicy | null,
@@ -244,50 +296,82 @@ export function evaluateGitHubEvidence(
 }
 
 /**
- * Canonical FF-004 approval validation, fail-closed. Returns null when valid,
- * otherwise the canonical reason code. Only a missing approval queues an
- * owner decision; every malformed, unauthenticated, expired, or mismatched
- * approval denies.
+ * Verify a claimed approval against its server-side attestation, fail-closed.
+ * Returns the canonical `VerifiedOwnerApproval` (assembled server-side from
+ * claim + attested proof — this assembly IS the boundary function), or a
+ * reason code when the claim cannot be honored. Only a missing claim queues
+ * an owner decision; every unverified, untrusted, unauthenticated, expired,
+ * or mismatched claim denies.
  */
-function ownerApprovalError(
-  approval: OwnerApproval | null,
+function verifyApproval(
+  approval: ClaimedApproval | null,
+  attestation: BoundaryAttestation | null,
+  trust: ApprovalTrustPolicy | null,
   action: string,
   resourceId: string,
   headSha: string,
   now: number,
-): string | null {
-  if (approval === null) return "OWNER_APPROVAL_MISSING";
-  if (approval.grantedBy !== "owner") return "OWNER_APPROVAL_NOT_OWNER";
-  if (typeof approval.authProof !== "string" || approval.authProof.length === 0) {
-    return "OWNER_APPROVAL_UNAUTHENTICATED";
+): { verified: VerifiedOwnerApproval } | { code: string; queued: boolean } {
+  if (approval === null) return { code: "OWNER_APPROVAL_MISSING", queued: true };
+  if (trust === null || trust.trustedVerifiers.length === 0) {
+    return { code: "OWNER_APPROVAL_TRUST_POLICY_MISSING", queued: false };
   }
-  if (approval.action !== action) return "OWNER_APPROVAL_ACTION_MISMATCH";
+  // The raw record proves nothing on its own: without a server-side
+  // attestation the claim is indistinguishable from forgery.
+  if (attestation === null) {
+    return { code: "OWNER_APPROVAL_UNVERIFIED", queued: false };
+  }
+  if (!trust.trustedVerifiers.includes(attestation.verifiedBy)) {
+    return { code: "OWNER_APPROVAL_UNTRUSTED_VERIFIER", queued: false };
+  }
+  // NOTE: `approval` has no proof field by construction; only the attested
+  // server-side proof is ever used. A smuggled value in raw data is ignored.
+  if (typeof attestation.authProof !== "string" || attestation.authProof.length === 0) {
+    return { code: "OWNER_APPROVAL_UNAUTHENTICATED", queued: false };
+  }
+  if (approval.grantedBy !== "owner") {
+    return { code: "OWNER_APPROVAL_NOT_OWNER", queued: false };
+  }
+  if (approval.action !== action) {
+    return { code: "OWNER_APPROVAL_ACTION_MISMATCH", queued: false };
+  }
   if (approval.origin === "message" || approval.origin === "sleep-expiry") {
-    return "OWNER_APPROVAL_BAD_ORIGIN";
+    return { code: "OWNER_APPROVAL_BAD_ORIGIN", queued: false };
   }
   if (typeof approval.expiresAt !== "number" || now >= approval.expiresAt) {
-    return "OWNER_APPROVAL_EXPIRED";
+    return { code: "OWNER_APPROVAL_EXPIRED", queued: false };
   }
   if (typeof approval.resourceId !== "string" || approval.resourceId.length === 0) {
-    return "OWNER_APPROVAL_TARGET_MISSING";
+    return { code: "OWNER_APPROVAL_TARGET_MISSING", queued: false };
   }
   if (approval.resourceId !== resourceId) {
-    return "OWNER_APPROVAL_TARGET_MISMATCH";
+    return { code: "OWNER_APPROVAL_TARGET_MISMATCH", queued: false };
   }
   if (typeof approval.targetSha !== "string" || approval.targetSha.length === 0) {
-    return "OWNER_APPROVAL_SHA_MISSING";
+    return { code: "OWNER_APPROVAL_SHA_MISSING", queued: false };
   }
   if (approval.targetSha !== headSha) {
-    return "OWNER_APPROVAL_SHA_MISMATCH";
+    return { code: "OWNER_APPROVAL_SHA_MISMATCH", queued: false };
   }
-  return null;
+  return {
+    verified: {
+      grantedBy: approval.grantedBy,
+      authProof: attestation.authProof,
+      action: approval.action,
+      resourceId: approval.resourceId,
+      targetSha: approval.targetSha,
+      expiresAt: approval.expiresAt,
+      ...(approval.origin !== undefined ? { origin: approval.origin } : {}),
+    },
+  };
 }
 
 /**
- * Build the canonical FF-004 `authorize()` input for this merge, so the
- * bridge can delegate to the single policy engine once `packages/policy`
- * lands on `develop`. Returns null when the merge cannot even be expressed
- * canonically (unknown target or unmapped role); both cases deny.
+ * Build the canonical FF-004 `authorize()` input for this merge, for
+ * mechanical delegation once `packages/policy` lands on `develop`. Returns
+ * null when the merge cannot be expressed canonically (unknown target,
+ * unmapped role) or the approval is unverified: the canonical object is
+ * assembled server-side only, never from raw data.
  */
 export function toAuthorizeInput(input: MergeGateInput): {
   actor: { type: string; id: string; role: string };
@@ -299,20 +383,36 @@ export function toAuthorizeInput(input: MergeGateInput): {
     reviewerId?: string;
     checksPass: boolean;
   };
-  context: { approval: OwnerApproval | null; now: number };
+  context: { approval: VerifiedOwnerApproval | null; now: number };
 } | null {
   if (!isMergeTarget(input.pr.targetBranch)) return null;
   const role = canonicalRole(input.actor.role);
   if (role === null) return null;
+  const now = input.now ?? Date.now();
+  const action = MERGE_ACTION[input.pr.targetBranch];
   const evidence = evaluateGitHubEvidence(
     input.checkPolicy,
     input.pr,
     input.checks,
     input.reviews,
   );
+  let approval: VerifiedOwnerApproval | null = null;
+  if (input.pr.targetBranch === "main" && input.approval !== null) {
+    const result = verifyApproval(
+      input.approval,
+      input.attestation,
+      input.approvalTrust,
+      action,
+      prResourceId(input.pr),
+      input.pr.headSha,
+      now,
+    );
+    if (!("verified" in result)) return null;
+    approval = result.verified;
+  }
   return {
     actor: { type: actorType(input.actor.role), id: input.actor.id, role },
-    action: MERGE_ACTION[input.pr.targetBranch],
+    action,
     resource: {
       id: prResourceId(input.pr),
       headSha: input.pr.headSha,
@@ -320,17 +420,20 @@ export function toAuthorizeInput(input: MergeGateInput): {
       ...(evidence.reviewerId !== null ? { reviewerId: evidence.reviewerId } : {}),
       checksPass: evidence.checksPass,
     },
-    context: {
-      approval: input.approval,
-      now: input.now ?? Date.now(),
-    },
+    context: { approval, now },
   };
 }
 
 const APPROVAL_FAILURE_REASONS: Record<string, string> = {
+  OWNER_APPROVAL_TRUST_POLICY_MISSING:
+    "No verifier allowlist is configured; unverifiable approval claims grant nothing.",
+  OWNER_APPROVAL_UNVERIFIED:
+    "Approval claim has no server-side attestation; raw PR/agent data proves nothing and is never accepted as proof.",
+  OWNER_APPROVAL_UNTRUSTED_VERIFIER:
+    "Approval was attested by a component outside the trusted verifier allowlist.",
   OWNER_APPROVAL_NOT_OWNER: "Approval was not granted by the owner.",
   OWNER_APPROVAL_UNAUTHENTICATED:
-    "Approval carries no server-minted authentication proof; the object alone proves nothing.",
+    "Attestation carries no server-minted authentication proof; the claim alone proves nothing.",
   OWNER_APPROVAL_ACTION_MISMATCH: "Approval covers a different action and does not transfer.",
   OWNER_APPROVAL_BAD_ORIGIN: "Approval originates from message content or sleep expiry and is invalid.",
   OWNER_APPROVAL_EXPIRED: "The owner approval has expired; expiry never grants authority.",
@@ -421,14 +524,20 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
   }
 
   if (pr.targetBranch === "main" && (role === "owner" || role === "coordinator")) {
-    const err = ownerApprovalError(
+    const result = verifyApproval(
       input.approval,
+      input.attestation,
+      input.approvalTrust,
       action,
       prResourceId(pr),
       pr.headSha,
       now,
     );
-    if (err === "OWNER_APPROVAL_MISSING") {
+    if ("verified" in result) {
+      // Verified: no approval reason recorded.
+    } else if (result.queued) {
+      // Canonical mapping: a missing approval queues an owner decision
+      // (`OWNER_REQUIRED`); sleep queues without approving (`SLEEP_QUEUED`).
       queueReasons.push({
         code: input.ownerSleeping === true ? "SLEEP_QUEUED" : "OWNER_REQUIRED",
         reason:
@@ -436,10 +545,10 @@ export function evaluateMergeGate(input: MergeGateInput): MergeGateDecision {
             ? "Owner is sleeping: request is queued, never auto-approved."
             : `Owner approval required for '${action}'.`,
       });
-    } else if (err !== null) {
+    } else {
       denyReasons.push({
-        code: err,
-        reason: APPROVAL_FAILURE_REASONS[err] ?? "Approval invalid.",
+        code: result.code,
+        reason: APPROVAL_FAILURE_REASONS[result.code] ?? "Approval invalid.",
       });
     }
   }
