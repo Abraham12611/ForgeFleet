@@ -7,7 +7,7 @@
     "test": "node --test src/persistence/attempt-store.test.ts src/runtime/discovery.test.ts"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24.11"
   },
   "license": "UNLICENSED",
   "private": true

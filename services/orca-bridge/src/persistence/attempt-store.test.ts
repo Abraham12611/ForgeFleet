@@ -1,10 +1,19 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import {
+  assertSafeDbFile,
   AttemptStore,
   type CreateAttemptRequest,
   StoreError,
@@ -59,7 +68,7 @@ describe("createAttempt idempotency (durable)", () => {
     for (const s of stores) s.close();
   });
   function open(options: ConstructorParameters<typeof AttemptStore>[0] = {}) {
-    const s = new AttemptStore(options);
+    const s = new AttemptStore({ testMode: true, ...options });
     stores.push(s);
     return s;
   }
@@ -270,6 +279,7 @@ describe("applyRuntimeEvent (durable inbox)", () => {
 
   async function startedStore() {
     const store = new AttemptStore({
+      testMode: true,
       dispatch: async () => ({ state: "dispatching", orcaDispatchId: "ext-9" }),
     });
     stores.push(store);
@@ -382,7 +392,7 @@ describe("outbox (durable)", () => {
 
   it("claims due entries and marks them delivered", async () => {
     const now = Date.parse("2026-11-08T12:00:00.000Z");
-    const store = new AttemptStore({ now: () => now });
+    const store = new AttemptStore({ now: () => now, testMode: true });
     stores.push(store);
     assert.equal(store.claimDueOutbound().length, 0);
     await store.createAttempt("ob-key-1234", request());
@@ -401,6 +411,7 @@ describe("outbox (durable)", () => {
       now: () => now,
       maxOutboxAttempts: 3,
       outboxBaseDelayMs: 1000,
+      testMode: true,
     });
     stores.push(store);
     await store.createAttempt("dlq-key-1234", request());
@@ -590,3 +601,337 @@ describe("restart + crash reconciliation (real files)", () => {
     assert.equal(store.canDispatch("project_123", "task_123"), true);
   });
 });
+
+describe("constructor durability gates", () => {
+  it("fails startup without an explicit path (production has no default)", () => {
+    assert.throws(
+      () => new AttemptStore(),
+      (e: unknown) =>
+        e instanceof StoreError &&
+        e.status === 500 &&
+        /explicit durable database file path/.test(e.message),
+    );
+  });
+
+  it('fails startup for ":memory:" outside explicit test mode', () => {
+    assert.throws(
+      () => new AttemptStore({ path: ":memory:" }),
+      (e: unknown) =>
+        e instanceof StoreError &&
+        e.status === 500 &&
+        /no crash durability/.test(e.message),
+    );
+    const testOnly = new AttemptStore({ testMode: true });
+    assert.equal(testOnly.databasePath(), null);
+    testOnly.close();
+  });
+
+  it("fails startup when the database directory does not exist", () => {
+    assert.throws(
+      () =>
+        new AttemptStore({
+          path: join(tmpdir(), `ff006-nope-${Date.now()}`, "bridge.sqlite"),
+        }),
+      (e: unknown) =>
+        e instanceof StoreError &&
+        e.status === 500 &&
+        /database directory does not exist/.test(e.message),
+    );
+  });
+
+  it("refuses to open a group/world-writable database file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ff006-perm-"));
+    try {
+      const path = join(dir, "bridge.sqlite");
+      const store = new AttemptStore({ path });
+      store.close();
+      chmodSync(path, 0o666);
+      assert.throws(
+        () => new AttemptStore({ path }),
+        (e: unknown) =>
+          e instanceof StoreError &&
+          /group\/world-writable/.test((e as Error).message),
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("assertSafeDbFile policy: own-uid passes, foreign uid and lax modes fail", () => {
+    const euid =
+      typeof process.getuid === "function" ? process.getuid() : 1000;
+    assert.doesNotThrow(() =>
+      assertSafeDbFile({ uid: euid, mode: 0o100600 }, euid),
+    );
+    assert.throws(
+      () => assertSafeDbFile({ uid: euid + 100000, mode: 0o100600 }, euid),
+      /owned by uid/,
+    );
+    assert.throws(
+      () => assertSafeDbFile({ uid: euid, mode: 0o100666 }, euid),
+      /writable/,
+    );
+    assert.throws(
+      () => assertSafeDbFile({ uid: euid, mode: 0o100660 }, euid),
+      /writable/,
+    );
+  });
+});
+
+describe("backup and restore", () => {
+  it("round-trips through backup file: restore discards post-backup writes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ff006-bak-"));
+    try {
+      const path = join(dir, "bridge.sqlite");
+      const backup = join(dir, "bridge.backup.sqlite");
+      let bakLaunches = 0;
+      const store = new AttemptStore({
+        path,
+        dispatch: async () => {
+          bakLaunches += 1;
+          return { state: "running", orcaDispatchId: `ext-bak-${bakLaunches}` };
+        },
+      });
+      const { receipt: first } = await store.createAttempt(
+        "backup-key-1",
+        request(),
+      );
+      store.createBackup(backup);
+      assert.ok(existsSync(backup));
+      await store.createAttempt(
+        "backup-key-2",
+        request({
+          paperclipTaskId: "task_999",
+          lease: { fencingEpoch: 1, leaseToken: "lease-9" },
+        }),
+      );
+      store.restoreFromBackup(backup);
+      assert.equal(store.getAttempt(first.attemptId).state, "running");
+      assert.throws(
+        () => store.getAttempt("00000000-0000-4000-8000-999999999999"),
+        (e: unknown) => e instanceof StoreError && e.code === "unknown_attempt",
+      );
+      store.close();
+      // Reopen after restore: WAL replayed, schema verified, data intact.
+      const reopened = new AttemptStore({ path });
+      assert.equal(reopened.getAttempt(first.attemptId).state, "running");
+      reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses backup/restore for :memory: test databases", () => {
+    const store = new AttemptStore({ testMode: true });
+    try {
+      assert.throws(
+        () => store.createBackup(join(tmpdir(), "x.sqlite")),
+        /cannot back up a :memory:/,
+      );
+      assert.throws(
+        () => store.restoreFromBackup(join(tmpdir(), "x.sqlite")),
+        /cannot restore a :memory:/,
+      );
+    } finally {
+      store.close();
+    }
+  });
+});
+
+describe("cross-process idempotency, fencing and crash (two OS processes)", () => {
+  const CHILD = `
+import { AttemptStore } from ${JSON.stringify(join(import.meta.dirname, "attempt-store.ts"))};
+import { writeFileSync } from "node:fs";
+const [dbPath, key, payloadJson, mode, marker] = process.argv.slice(2);
+const payload = JSON.parse(payloadJson);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function launcher() {
+  if (mode === "slow") {
+    return async () => {
+      await sleep(1200);
+      writeFileSync(marker, "slow");
+      return { state: "running", orcaDispatchId: "ext-slow" };
+    };
+  }
+  if (mode === "marker") {
+    return async () => {
+      writeFileSync(marker, "marker");
+      return { state: "running", orcaDispatchId: "ext-marker" };
+    };
+  }
+  if (mode === "crash") {
+    return async () => {
+      writeFileSync(marker, JSON.stringify({ externalDispatchId: "ext-crashed" }));
+      process.exit(137);
+    };
+  }
+  return async () => ({ state: "running", orcaDispatchId: marker ?? "ext-child" });
+}
+const store = new AttemptStore({ path: dbPath, dispatch: launcher() });
+try {
+  const result = await store.createAttempt(key, payload);
+  console.log(JSON.stringify({ ok: true, attemptId: result.receipt.attemptId, deduplicated: result.deduplicated, state: result.receipt.state, orcaDispatchId: result.receipt.orcaDispatchId ?? null }));
+} catch (error) {
+  console.log(JSON.stringify({ ok: false, code: error?.code ?? "unknown", status: error?.status ?? 0 }));
+}
+store.close();
+`;
+
+  function childFile(dir: string): string {
+    const path = join(dir, "child-worker.ts");
+    writeFileSync(path, CHILD);
+    return path;
+  }
+
+  function runChild(
+    child: string,
+    args: string[],
+  ): { status: number | null; stdout: string; stderr: string } {
+    const proc = spawnSync(process.execPath, [child, ...args], {
+      encoding: "utf8",
+      timeout: 30000,
+    });
+    return { status: proc.status, stdout: proc.stdout, stderr: proc.stderr };
+  }
+
+  function runChildAsync(
+    child: string,
+    args: string[],
+  ): Promise<{ status: number | null; stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(process.execPath, [child, ...args], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      proc.stdout.on("data", (d) => {
+        stdout += String(d);
+      });
+      proc.stderr.on("data", (d) => {
+        stderr += String(d);
+      });
+      proc.on("error", reject);
+      proc.on("close", (status) => resolve({ status, stdout, stderr }));
+    });
+  }
+
+  it("two processes, one key: exactly one runtime launch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ff006-xproc-"));
+    try {
+      const child = childFile(dir);
+      const dbPath = join(dir, "bridge.sqlite");
+      const key = "xproc-key-0001";
+      const payload = JSON.stringify(request());
+      const markerA = join(dir, "launched-A");
+      const markerB = join(dir, "launched-B");
+
+      const procA = runChildAsync(child, [dbPath, key, payload, "slow", markerA]);
+      await sleepMs(400);
+      const procB = runChildAsync(child, [dbPath, key, payload, "marker", markerB]);
+      const [a, b] = await Promise.all([procA, procB]);
+
+      assert.equal(a.status, 0, `child A stderr: ${a.stderr}`);
+      assert.equal(b.status, 0, `child B stderr: ${b.stderr}`);
+      const ra = JSON.parse(a.stdout.trim().split("\n").pop()!);
+      const rb = JSON.parse(b.stdout.trim().split("\n").pop()!);
+      assert.equal(ra.ok, true);
+      assert.equal(rb.ok, true);
+      // Order-agnostic: whichever process won the claim, both agree on one
+      // attempt and exactly one runtime launch happened.
+      assert.equal(ra.attemptId, rb.attemptId);
+      const markers = [markerA, markerB].filter((m) => existsSync(m));
+      assert.equal(markers.length, 1, "exactly one process launched the runtime");
+      const winnerExt = markers[0] === markerA ? "ext-slow" : "ext-marker";
+      const verify = new AttemptStore({ path: dbPath });
+      try {
+        const final = verify.getAttempt(ra.attemptId);
+        assert.equal(final.state, "running");
+        assert.equal(final.orcaDispatchId, winnerExt);
+      } finally {
+        verify.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("second process with a different key is fenced by the active lease", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ff006-xfence-"));
+    try {
+      const child = childFile(dir);
+      const dbPath = join(dir, "bridge.sqlite");
+      const first = runChild(child, [
+        dbPath,
+        "xproc-first-1",
+        JSON.stringify(request()),
+        "normal",
+        "ext-first",
+      ]);
+      assert.equal(first.status, 0);
+      assert.equal(JSON.parse(first.stdout.trim().split("\n").pop()!).ok, true);
+      const second = runChild(child, [
+        dbPath,
+        "xproc-second-2",
+        JSON.stringify(
+          request({ lease: { fencingEpoch: 2, leaseToken: "lease-2" } }),
+        ),
+        "normal",
+        "ext-second",
+      ]);
+      assert.equal(second.status, 0);
+      const parsed = JSON.parse(second.stdout.trim().split("\n").pop()!);
+      assert.equal(parsed.ok, false);
+      assert.equal(parsed.code, "active_lease");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("hard-killed dispatch process reattaches on restart with zero relaunch", () => {
+    const dir = mkdtempSync(join(tmpdir(), "ff006-xcrash-"));
+    try {
+      const child = childFile(dir);
+      const dbPath = join(dir, "bridge.sqlite");
+      const sidecar = join(dir, "runtime-sidecar.json");
+      const key = "xproc-crash-1";
+      const payload = JSON.stringify(request());
+      const crashed = runChild(child, [dbPath, key, payload, "crash", sidecar]);
+      assert.notEqual(crashed.status, 0, "crash child must die without returning");
+      assert.ok(existsSync(sidecar), "runtime sidecar records the accepted launch");
+
+      // Restart in this process over the same file: reconcile, do not launch.
+      let launches = 0;
+      const restarted = new AttemptStore({
+        path: dbPath,
+        dispatch: async () => {
+          launches += 1;
+          return { state: "dispatching", orcaDispatchId: "ext-never" };
+        },
+      });
+      try {
+        const inventory = [JSON.parse(readFileSync(sidecar, "utf8"))].map(
+          (r: { externalDispatchId: string }) => ({
+            externalDispatchId: r.externalDispatchId,
+            paperclipTaskId: "task_123",
+            leaseToken: "lease-1",
+            state: "running" as const,
+          }),
+        );
+        const report = restarted.reconcileAfterRestart(inventory);
+        assert.equal(report.kept.length, 1);
+        const kept = restarted.getAttempt(report.kept[0]!);
+        assert.equal(kept.state, "running");
+        assert.equal(kept.orcaDispatchId, "ext-crashed");
+        assert.equal(launches, 0);
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}

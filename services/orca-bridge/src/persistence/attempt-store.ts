@@ -33,6 +33,13 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
+import {
+  copyFileSync,
+  existsSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
+import { dirname } from "node:path";
 import type {
   AttemptReceipt,
   AttemptState,
@@ -145,10 +152,17 @@ export interface DispatchResult {
 
 export interface AttemptStoreOptions {
   /**
-   * Database file path. Real files give crash durability (close + reopen =
-   * process restart); `":memory:"` is for pure unit tests only.
+   * Explicit durable database file path. **Required in production**: the
+   * constructor fails startup when no path is given. Crash durability
+   * (close + reopen = process restart) only holds for real files.
    */
   path?: string;
+  /**
+   * Explicit test mode. The only way to use `":memory:"` (or omit `path`):
+   * production code must never set this. `:memory:` databases have no
+   * crash durability and no backup story.
+   */
+  testMode?: boolean;
   /** Milliseconds clock; inject a fake in tests. Defaults to Date.now. */
   now?: () => number;
   /**
@@ -276,8 +290,44 @@ interface AttemptRow {
   updated_at: string;
 }
 
+/**
+ * Minimal stat shape for the database-file ownership check (kept narrow so
+ * tests can exercise the policy with fabricated stats and production passes
+ * the real `fs.statSync` result).
+ */
+export interface DbFileStat {
+  uid: number;
+  mode: number;
+}
+
+/**
+ * Fail closed on unsafe database files: the file must be owned by the
+ * bridge's own uid and must not be group/world-writable. Pure function so
+ * the policy itself is unit-testable.
+ */
+export function assertSafeDbFile(
+  stat: DbFileStat,
+  euid: number | undefined,
+): void {
+  if (euid !== undefined && stat.uid !== euid) {
+    throw new StoreError(
+      "validation",
+      500,
+      `refusing database file owned by uid ${stat.uid} (process uid ${euid})`,
+    );
+  }
+  if ((stat.mode & 0o022) !== 0) {
+    throw new StoreError(
+      "validation",
+      500,
+      "refusing group/world-writable database file",
+    );
+  }
+}
+
 export class AttemptStore {
-  private readonly db: DatabaseSync;
+  private db: DatabaseSync;
+  private readonly dbPath: string | null;
   private readonly clock: () => number;
   private readonly launcher: (
     attempt: { attemptId: string; projectId: string; paperclipTaskId: string },
@@ -287,9 +337,42 @@ export class AttemptStore {
   private readonly outboxMaxDelayMs: number;
 
   constructor(options: AttemptStoreOptions = {}) {
-    this.db = new DatabaseSync(options.path ?? ":memory:");
-    this.db.exec("PRAGMA journal_mode = WAL;");
-    this.db.exec("PRAGMA synchronous = FULL;");
+    const testMode = options.testMode ?? false;
+    if (options.path === undefined && !testMode) {
+      throw new StoreError(
+        "validation",
+        500,
+        "AttemptStore requires an explicit durable database file path; pass testMode:true only for :memory: unit tests",
+      );
+    }
+    if (options.path === ":memory:" && !testMode) {
+      throw new StoreError(
+        "validation",
+        500,
+        '":memory:" databases have no crash durability; pass an explicit file path (testMode:true reserves :memory: for unit tests)',
+      );
+    }
+    const resolved = options.path ?? ":memory:";
+    this.dbPath = resolved === ":memory:" ? null : resolved;
+    if (this.dbPath !== null) {
+      const parent = dirname(this.dbPath);
+      if (!existsSync(parent)) {
+        throw new StoreError(
+          "validation",
+          500,
+          `database directory does not exist: ${parent} (refusing to auto-create storage)`,
+        );
+      }
+      if (existsSync(this.dbPath)) {
+        const stat = statSync(this.dbPath);
+        assertSafeDbFile(
+          stat,
+          typeof process.getuid === "function" ? process.getuid() : undefined,
+        );
+      }
+    }
+    this.db = new DatabaseSync(resolved);
+    this.applyPragmas();
     this.db.exec(SCHEMA);
     this.clock = options.now ?? (() => Date.now());
     this.launcher =
@@ -300,9 +383,75 @@ export class AttemptStore {
     this.outboxMaxDelayMs = options.outboxMaxDelayMs ?? 5 * 60 * 1000;
   }
 
+  /** Enforce WAL + FULL synchronous; fail startup when WAL is unavailable. */
+  private applyPragmas(): void {
+    if (this.dbPath === null) return; // :memory: has no WAL; test-only.
+    this.db.exec("PRAGMA journal_mode = WAL;");
+    const row = this.db
+      .prepare("PRAGMA journal_mode")
+      .get() as { journal_mode: string } | undefined;
+    if (row?.journal_mode !== "wal") {
+      throw new StoreError(
+        "validation",
+        500,
+        `database filesystem does not support WAL journal mode (got ${row?.journal_mode ?? "unknown"})`,
+      );
+    }
+    this.db.exec("PRAGMA synchronous = FULL;");
+    // Multi-process bridge: wait on transient write locks instead of
+    // failing fast (single-process callers never notice this).
+    this.db.exec("PRAGMA busy_timeout = 5000;");
+  }
+
   /** Release the database handle. Reopen the same path to simulate restart. */
   close(): void {
     this.db.close();
+  }
+
+  /** File path of this store, or null for `:memory:` test databases. */
+  databasePath(): string | null {
+    return this.dbPath;
+  }
+
+  /**
+   * Checkpoint the WAL and copy the database file to `backupPath`.
+   * File-backed stores only; `:memory:` test databases cannot be backed up.
+   */
+  createBackup(backupPath: string): void {
+    if (this.dbPath === null) {
+      throw new StoreError(
+        "validation",
+        500,
+        "cannot back up a :memory: test database",
+      );
+    }
+    this.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
+    copyFileSync(this.dbPath, backupPath);
+  }
+
+  /**
+   * Restore this store's file from a backup created by `createBackup` and
+   * reopen it (replaying any WAL, re-verifying journal mode). The store
+   * must be file-backed; callers must re-run reconciliation after restore
+   * because the runtime may have moved on while the backup aged.
+   */
+  restoreFromBackup(backupPath: string): void {
+    if (this.dbPath === null) {
+      throw new StoreError(
+        "validation",
+        500,
+        "cannot restore a :memory: test database",
+      );
+    }
+    this.db.close();
+    copyFileSync(backupPath, this.dbPath);
+    for (const suffix of ["-wal", "-shm"]) {
+      const sidecar = `${this.dbPath}${suffix}`;
+      if (existsSync(sidecar)) unlinkSync(sidecar);
+    }
+    this.db = new DatabaseSync(this.dbPath);
+    this.applyPragmas();
+    this.db.exec(SCHEMA);
   }
 
   private isoNow(): string {
