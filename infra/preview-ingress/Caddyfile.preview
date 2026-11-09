@@ -1,0 +1,148 @@
+# FF-028 staging preview ingress (Caddy). ONE ingress design, converged with
+# E17 #45 (Caddy, disabled until gates pass) and #51 (Caddy edge).
+#
+# Verified against pinned paperclipai/paperclip @ 088bdf7 (see README):
+#  - session gate: GET /api/auth/get-session (401 without a board session)
+#  - realtime: wss:///api/companies/<id>/events/ws + 15s HTTPS poll fallback
+#  - public liveness: /api/liveness, /api/ready
+#  - body limits enforced by the backend (10mb default / 64mb / 1GiB zip max)
+#
+# No bridge, PostgreSQL, Orca, or CLI surface is routed here. No secrets here.
+
+# Loopback default is plain HTTP for validation and local round-trips.
+# Vultr staging serves this same file with PREVIEW_INGRESS_BIND set to the
+# public https:// origin (platform TLS or operator-managed certs); the HSTS
+# header below then takes effect. Never expose the loopback default publicly.
+{
+	auto_https disable_certs
+	admin off
+}
+
+{$PREVIEW_INGRESS_BIND:http://127.0.0.1:8443} {
+	# Ingress safety ceiling mirrors the backend absolute max
+	# (PORTABLE_ZIP_UPLOAD_LIMIT_BYTES default 1GiB); per-route limits stay
+	# with the backend. Never raise above what the backend accepts.
+	request_body {
+		max_size 1GB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
+	log {
+		format json
+	}
+
+	# --- Explicit browser-origin allowlist. Anchored alternation of EXACT
+	# --- hosts only, never a broad wildcard. The operator adds one exact host
+	# --- per issued Vercel preview (rotation procedure in README); unknown
+	# --- browser origins fail closed.
+	@allowed_origin header_regexp Origin ^https://(app\.staging\.example\.invalid|ff-preview-057-forge-fleet\.vercel\.app)$
+	@browser_origin expression {http.request.header.Origin} != ''
+
+	# CORS preflight: allowed origins get 204; any other Origin gets 403.
+	@preflight method OPTIONS
+	handle @preflight {
+		handle @allowed_origin {
+			header Access-Control-Allow-Origin {http.request.header.Origin}
+			header Access-Control-Allow-Credentials true
+			header Access-Control-Allow-Methods "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+			header Access-Control-Allow-Headers "Authorization, Content-Type, Last-Event-ID, Idempotency-Key"
+			header Access-Control-Max-Age 600
+			header Vary Origin
+			respond "" 204
+		}
+		handle {
+			respond "Forbidden" 403
+		}
+	}
+
+	# Bridge/private-shaped paths never exist here (defense in depth: 404 even
+	# if a backend regressed), mirroring #51.
+	handle /bridge/* {
+		respond "Not Found" 404
+	}
+	handle /v1/* {
+		respond "Not Found" 404
+	}
+	handle /internal/* {
+		respond "Not Found" 404
+	}
+	handle /metrics-private/* {
+		respond "Not Found" 404
+	}
+	handle /orca* {
+		respond "Not Found" 404
+	}
+
+	# Public liveness/readiness only. No auth, no data.
+	handle /api/liveness* {
+		reverse_proxy {$PAPERCLIP_API:127.0.0.1:18080}
+	}
+	handle /api/ready* {
+		reverse_proxy {$PAPERCLIP_API:127.0.0.1:18080}
+	}
+
+	# Auth endpoints (login/callback/get-session) proxy WITHOUT forward_auth:
+	# get-session itself returns 401 without a board session (verified pinned
+	# routes/auth.ts), so there is no anonymous bypass. Foreign browser
+	# origins still fail closed before reaching the backend.
+	handle /api/auth/* {
+		handle @browser_origin {
+			handle @allowed_origin {
+				header Access-Control-Allow-Origin {http.request.header.Origin}
+				header Access-Control-Allow-Credentials true
+				header Vary Origin
+				reverse_proxy {$PAPERCLIP_API:127.0.0.1:18080}
+			}
+			handle {
+				respond "Forbidden" 403
+			}
+		}
+		handle {
+			reverse_proxy {$PAPERCLIP_API:127.0.0.1:18080}
+		}
+	}
+
+	# Product API: REST under /api/* plus the verified WS upgrade path
+	# /api/companies/<id>/events/ws. Foreign browser origins get 403;
+	# missing/invalid sessions get 401 from forward_auth BEFORE any upgrade;
+	# allowed browser origins get exact-origin CORS echo. Non-browser callers
+	# (no Origin) go through the same session gate. The 15s poll fallback
+	# rides plain HTTPS GET on this same surface.
+	handle /api/* {
+		handle @browser_origin {
+			handle @allowed_origin {
+				header Access-Control-Allow-Origin {http.request.header.Origin}
+				header Access-Control-Allow-Credentials true
+				header Vary Origin
+				forward_auth {$PAPERCLIP_API:127.0.0.1:18080} {
+					uri /api/auth/get-session
+					copy_headers Cookie Authorization
+				}
+				reverse_proxy {$PAPERCLIP_API:127.0.0.1:18080}
+			}
+			handle {
+				respond "Forbidden" 403
+			}
+		}
+		handle {
+			forward_auth {$PAPERCLIP_API:127.0.0.1:18080} {
+				uri /api/auth/get-session
+				copy_headers Cookie Authorization
+			}
+			reverse_proxy {$PAPERCLIP_API:127.0.0.1:18080}
+		}
+	}
+
+	# Default deny: frontend assets live on Vercel, not here.
+	handle {
+		respond "Not Found" 404
+	}
+}

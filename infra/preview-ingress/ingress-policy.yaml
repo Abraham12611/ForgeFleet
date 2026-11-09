@@ -1,24 +1,34 @@
 # Preview API ingress policy (FF-028, E17 scope: infra/** + scripts/deploy/**)
 #
 # Declarative source of truth for the Vercel-preview -> Vultr-API staging ingress.
-# The nginx config in this directory implements this policy; the validator in
-# scripts/deploy/preview-ingress-check.py enforces it. No live domains or secrets
-# are recorded here -- exact domains remain OPEN per ADR-0006.
+# Implemented by Caddyfile.preview in this directory (ONE ingress design,
+# converged with E17 #45/#51 which are likewise Caddy). Validated by
+# `caddy validate` and scripts/deploy/preview_ingress_check.py. No live domains
+# or secrets are recorded here -- exact domains remain OPEN per ADR-0006.
+#
+# Upstream facts verified against pinned paperclipai/paperclip @ 088bdf7
+# (read-only GitHub API inspection, 2026-11-09; see README):
+#  - session gate: GET /api/auth/get-session (401 without a board session)
+#  - realtime: wss:///api/companies/<id>/events/ws + 15s HTTPS poll fallback
+#  - public liveness: /api/liveness, /api/ready
+#  - body limits enforced by the backend (10mb default / 64mb / 1GiB zip max)
 
 # Public entry: Vultr staging API ingress only. Production is out of scope.
 ingress:
   host_role: vultr-staging-api-ingress
+  proxy: caddy
   listen: 443
   tls: true
   # Only these paths are reachable from the public internet (via Vercel previews).
   public_paths:
-    - /api/health
-    - /api/events
-    - /api/uploads
-    - /api/tasks
+    - /api/liveness
+    - /api/ready
+    - /api/auth
+    - /api/companies
   # These must NEVER be reachable publicly; bridge stays loopback/Unix socket.
   denied_paths:
     - /bridge
+    - /v1
     - /internal
     - /metrics-private
     - /orca
@@ -27,37 +37,38 @@ ingress:
     - "localhost"
     - "unix:"
 
-# Every public path requires session auth at the ingress layer.
+# Every product route requires the pinned session gate at the ingress layer.
 auth:
-  required_on_all_public_paths: true
-  mechanism: auth_request_to_paperclip_session_validator
+  required_on_all_product_paths: true
+  mechanism: forward_auth_to_GET_/api/auth/get-session
   anonymous_allowed: false
   # Previews authenticate against staging, never production, and carry no
   # production service tokens (see vercel-preview.env.example).
   preview_backend: staging-only
 
 # Split-origin browser rules for Vercel preview deployments.
+# Exact hosts only (anchored alternation, never a broad *.vercel.app trust).
+# The operator registers one exact host per issued preview (see README).
 cors:
-  # Sibling-subdomain pattern + explicit Vercel preview suffix. Never "*".
-  allowed_origin_patterns:
+  allowed_origins_exact:
     - "https://app.staging.example.invalid"
-    - "https://*.vercel.app"
+    - "https://ff-preview-057-forge-fleet.vercel.app"
   allow_credentials: true
-  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  allowed_methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
   vary_origin: true
+  # Requests carrying a non-allowlisted Origin are rejected 403 at ingress;
+  # requests without a session are rejected 401 before any upgrade or proxy.
 
-# Reconnect contract for live event delivery across split origins.
+# Reconnect contract for live delivery across split origins (verified upstream).
 reconnect:
-  stream_endpoint: /api/events
-  protocol: sse
-  resume_header: Last-Event-ID
-  resume_fallback: "GET state snapshot, then resume stream"
-  buffering_off: true
-  long_read_timeout: true
+  stream_endpoint: /api/companies/<id>/events/ws
+  protocol: wss-with-15s-https-poll-fallback
+  resume: live.hello_handshake_plus_revision_resync_then_poll
+  upgrade_requires_session: true
 
-# Upload contract across split origins.
+# Upload contract across split origins (verified upstream body-limits).
 uploads:
-  endpoint: /api/uploads
-  max_body_size: 10m
+  scope: /api/companies/*
+  backend_limits: 10mb_default_64mb_inline_1GiB_zip_max
+  ingress_safety_ceiling: 1GB
   auth_required: true
-  allowed_methods: ["POST", "PUT"]
