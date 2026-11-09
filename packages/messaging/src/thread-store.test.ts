@@ -1,5 +1,9 @@
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MessagingDb } from "./sqlite.ts";
 import { MessageError } from "./types.ts";
 import { ThreadStore } from "./thread-store.ts";
 import type { Actor } from "./types.ts";
@@ -8,20 +12,32 @@ const WORKER_A: Actor = { type: "agent", id: "worker-a", role: "worker", project
 const WORKER_B: Actor = { type: "agent", id: "worker-b", role: "worker", projects: ["p1"] };
 const OUTSIDER: Actor = { type: "agent", id: "worker-x", role: "worker", projects: ["p2"] };
 
+const dbs: MessagingDb[] = [];
+const dirs: string[] = [];
+afterEach(() => {
+  for (const db of dbs.splice(0)) db.close();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
 function setup() {
+  const dir = mkdtempSync(join(tmpdir(), "ff-msg-"));
+  dirs.push(dir);
   let n = 0;
+  const db = new MessagingDb(join(dir, "messages.sqlite"));
+  dbs.push(db);
   const store = new ThreadStore({
+    db,
     generateId: () => `id-${++n}`,
     now: () => "2026-11-08T12:00:00.000Z",
   });
-  const thread = store.createThread({
+  store.createThread({
     channel: "task/t1",
     projectId: "p1",
     taskId: "t1",
     acl: ["worker-a", "worker-b", "role:coordinator"],
     threadId: "task/t1",
   });
-  return { store, thread };
+  return { db, store };
 }
 
 const post = (store: ThreadStore, overrides = {}) =>
@@ -39,7 +55,7 @@ const post = (store: ThreadStore, overrides = {}) =>
 
 describe("idempotent post", () => {
   it("stores message with receipts before any ack", () => {
-    const { store } = setup();
+    const { db, store } = setup();
     const { message, replayed } = post(store);
     assert.equal(replayed, false);
     assert.ok(message.messageId);
@@ -48,6 +64,8 @@ describe("idempotent post", () => {
     assert.equal(receipts.length, 1);
     assert.equal(receipts[0].recipientId, "worker-b");
     assert.equal(receipts[0].state, "queued");
+    // Posting also enqueues exactly one frozen-contract outbox event.
+    assert.equal(db.outboxPendingCount(), 1);
   });
 
   it("same key + same payload replays the original", () => {
@@ -72,7 +90,7 @@ describe("idempotent post", () => {
     const base = {
       threadId: "task/t1",
       sender: WORKER_A,
-      kind: "status" as const,
+      kind: "update" as const,
       body: "heartbeat ok",
       idempotencyKey: "key-ext-1",
       externalId: "orca:evt-9",
@@ -82,19 +100,25 @@ describe("idempotent post", () => {
     assert.equal(second.replayed, true);
     assert.equal(second.message.messageId, first.message.messageId);
   });
+
+  it("receipt keys are unique at the storage layer", () => {
+    const { db, store } = setup();
+    const { message } = post(store);
+    assert.throws(() =>
+      db.prepare("INSERT INTO receipts (message_id, recipient_id, state, updated_at) VALUES (?, ?, 'queued', ?)").run(
+        message.messageId, "worker-b", "2026-11-08T12:00:00.000Z",
+      ),
+    );
+  });
 });
 
 describe("authorization and validation", () => {
-  it("cross-project actor cannot post (403)", () => {
+  it("cross-project actor cannot post or read (403)", () => {
     const { store } = setup();
     assert.throws(
       () => post(store, { sender: OUTSIDER }),
       (e: unknown) => e instanceof MessageError && e.code === "FORBIDDEN" && e.httpStatus === 403,
     );
-  });
-
-  it("cross-project actor cannot read (403)", () => {
-    const { store } = setup();
     post(store);
     assert.throws(
       () => store.readThread("task/t1", OUTSIDER),
@@ -102,14 +126,13 @@ describe("authorization and validation", () => {
     );
   });
 
-  it("unknown thread is 404, closed thread is 410", () => {
+  it("unknown thread is 404, closed thread is 410 but stays readable", () => {
     const { store } = setup();
     assert.throws(() => store.readThread("task/nope", WORKER_A),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 404);
     store.closeThread("task/t1");
     assert.throws(() => post(store, { idempotencyKey: "key-closed-1" }),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 410);
-    // Closed threads remain readable.
     assert.equal(store.readThread("task/t1", WORKER_A).messages.length, 0);
   });
 
@@ -118,13 +141,19 @@ describe("authorization and validation", () => {
     assert.throws(() => post(store, { idempotencyKey: "short" }),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 400);
   });
+
+  it("unknown kinds and labels are rejected (frozen contract v0.1)", () => {
+    const { store } = setup();
+    assert.throws(() => post(store, { kind: "text" as never, idempotencyKey: "key-kk-11" }),
+      (e: unknown) => e instanceof MessageError && e.httpStatus === 400);
+  });
 });
 
 describe("moderation", () => {
   it("scrubs secrets before storage", () => {
     const { store } = setup();
     const { message } = post(store, {
-      kind: "text",
+      kind: "update",
       body: "token leak: ghp_abcdefghijklmnop123456 and password: s3cr3t-value",
       idempotencyKey: "key-secret-1",
     });
@@ -133,20 +162,23 @@ describe("moderation", () => {
     assert.doesNotMatch(message.body, /ghp_abcdefghijklmnop/);
   });
 
-  it("questions require severity + deadline", () => {
+  it("questions require severity + deadline; labels are validated", () => {
     const { store } = setup();
-    assert.throws(() => post(store, { kind: "question", severity: undefined, idempotencyKey: "key-qq-1" }));
-    assert.throws(() => post(store, { kind: "blocker", deadlineAt: undefined, idempotencyKey: "key-bb-1" }));
+    assert.throws(() => post(store, { kind: "question", severity: undefined, idempotencyKey: "key-qq-11" }));
+    assert.throws(() => post(store, {
+      kind: "question", severity: "normal", deadlineAt: "2026-11-08T16:00:00.000Z",
+      labels: ["nonsense" as never], idempotencyKey: "key-ll-11",
+    }));
   });
 
   it("oversized bodies and bad MIME are rejected", () => {
     const { store } = setup();
-    assert.throws(() => post(store, { kind: "text", body: "x".repeat(20001), idempotencyKey: "key-big-1" }));
+    assert.throws(() => post(store, { kind: "update", body: "x".repeat(20001), idempotencyKey: "key-big-11" }));
     assert.throws(() =>
       post(store, {
-        kind: "text",
+        kind: "update",
         attachments: [{ name: "run.exe", mime: "application/x-msdownload", bytes: 10 }],
-        idempotencyKey: "key-mime-1",
+        idempotencyKey: "key-mime-11",
       }),
     );
   });
@@ -155,9 +187,9 @@ describe("moderation", () => {
 describe("cursor reads", () => {
   it("reads after cursor with limit", () => {
     const { store } = setup();
-    const m1 = post(store, { kind: "text", body: "one", idempotencyKey: "key-cc-1" }).message;
-    post(store, { kind: "text", body: "two", idempotencyKey: "key-cc-2" });
-    post(store, { kind: "text", body: "three", idempotencyKey: "key-cc-3" });
+    const m1 = post(store, { kind: "update", body: "one", idempotencyKey: "key-cc-11" }).message;
+    post(store, { kind: "update", body: "two", idempotencyKey: "key-cc-22" });
+    post(store, { kind: "update", body: "three", idempotencyKey: "key-cc-33" });
     const page1 = store.readThread("task/t1", WORKER_B, undefined, 2);
     assert.equal(page1.messages.length, 2);
     assert.equal(page1.messages[0].messageId, m1.messageId);

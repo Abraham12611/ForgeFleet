@@ -6,6 +6,7 @@
 export * from "./types.ts";
 export * from "./moderation.ts";
 export * from "./thread-store.ts";
+export * from "./sqlite.ts";
 export * from "./router.ts";
 export * from "./escalation.ts";
 export * from "./mcp.ts";

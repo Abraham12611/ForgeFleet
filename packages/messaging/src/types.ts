@@ -1,22 +1,80 @@
 /**
  * E10 / FF-014 — Message thread and escalation routing: shared types.
  *
- * Source of truth for shapes: `docs/03-architecture/communications.md`
- * (envelope fields, channels) and `docs/04-flows/agent-messaging.md`
- * (contract: unique ID, task/thread correlation, receipt acked after
- * persistence, typed follow-up actions).
+ * Reconciled with the frozen v0.1 bridge contract
+ * (`packages/bridge-contracts`, CONTRACT-VERSION 0.1.0, PR #46):
+ * - `MessageKind` is the frozen contract enum
+ *   (`question|answer|update|unblock|instruction`). Doc-level notions from
+ *   `docs/03-architecture/communications.md` map onto it via `labels`
+ *   (see `LABEL_FOR_DOC_KIND`); the frozen enum is never extended here.
+ * - Wire actors are contract `{type, id}` (`toContractActor`). Roles and
+ *   project scope live in the service-side session resolved from the
+ *   trusted transport — never in message payload.
  *
- * Depends on (unmerged at time of writing, see PR body):
- * - E05 `packages/bridge-contracts`: field names defined locally here and
- *   must be reconciled with the contract custodian before v0.1 integration.
- * - E06 `packages/events`: message.* event types reused by name only; this
- *   package does not import the sibling tree.
- * - E07 `packages/policy`: authorization is an injected `PolicyPort`, with a
- *   default deny-closed implementation mirroring
- *   `docs/05-contracts/policy-matrix.md`. Reconcile with E07 `authorize()`.
+ * Depends on (open at time of writing, see PR body):
+ * - E06 `packages/events` / FF-006 (#37): event names reused; persistence
+ *   here is messaging-owned (`packages/messaging/**`) and does not fork
+ *   the attempt store.
+ * - E07 policy FF-004 (#33) / audit FF-023 (#53): authorization is an
+ *   injected `PolicyPort` keyed on the authenticated caller; converge on
+ *   E07 `authorize()` before v1.0.
  */
 
-/** Actor identity. Only this authenticated object counts as authority. */
+import type {
+  Actor as ContractActor,
+  BridgeEvent,
+  EventType,
+  MessageKind as ContractMessageKind,
+} from "../../bridge-contracts/generated/bridge.types.ts";
+
+export const CONTRACT_VERSION = "0.1.0";
+export const EVENT_SCHEMA_VERSION = "0.1";
+export const OUTBOX_SOURCE = "forgefleet-messaging";
+
+/** Frozen contract enum (do not extend without a contract version bump). */
+export const MESSAGE_KINDS: readonly ContractMessageKind[] = [
+  "question",
+  "answer",
+  "update",
+  "unblock",
+  "instruction",
+];
+
+export type MessageKind = ContractMessageKind;
+export type { BridgeEvent, ContractActor, EventType };
+
+/**
+ * Storage-side labels preserving communications.md notions on top of the
+ * frozen kind enum. Labels never travel on the bridge wire as kinds.
+ */
+export const MESSAGE_LABELS = [
+  "blocker",
+  "artifact",
+  "readiness",
+  "system-notice",
+] as const;
+
+export type MessageLabel = (typeof MESSAGE_LABELS)[number];
+
+/** How a communications.md `type` maps onto (kind, labels). */
+export const LABEL_FOR_DOC_KIND: Record<string, { kind: MessageKind; labels: MessageLabel[] }> = {
+  text: { kind: "update", labels: [] },
+  question: { kind: "question", labels: [] },
+  answer: { kind: "answer", labels: [] },
+  blocker: { kind: "question", labels: ["blocker"] },
+  status: { kind: "update", labels: [] },
+  artifact: { kind: "update", labels: ["artifact"] },
+  system: { kind: "update", labels: ["system-notice"] },
+  unblock: { kind: "unblock", labels: [] },
+  instruction: { kind: "instruction", labels: [] },
+};
+
+/**
+ * Service-side actor identity, resolved from the trusted transport
+ * (bridge service token / owner session) — never from message payload.
+ * `role`, `projects` and `sessionProjectId` are session data keyed by
+ * `id`; the wire carries only `{type, id}`.
+ */
 export interface Actor {
   type: "human" | "agent" | "service";
   id: string;
@@ -27,18 +85,22 @@ export interface Actor {
   sessionProjectId?: string;
 }
 
-/** Message kinds from communications.md. */
-export const MESSAGE_KINDS = [
-  "text",
-  "question",
-  "answer",
-  "blocker",
-  "status",
-  "artifact",
-  "system",
-] as const;
+/** Wire form of an actor for BridgeEvent payloads (frozen contract). */
+export function toContractActor(actor: Actor): ContractActor {
+  return { type: actor.type, id: actor.id };
+}
 
-export type MessageKind = (typeof MESSAGE_KINDS)[number];
+/**
+ * Authenticated caller: identity PLUS the transport it arrived on.
+ * Message content is never a transport: there is no `via: "message"`,
+ * and any such claim is rejected at the facade boundary.
+ */
+export type CallerTransport = "service-token" | "owner-session" | "test-harness";
+
+export interface AuthenticatedCaller {
+  identity: Actor;
+  via: CallerTransport;
+}
 
 /** Channel naming from communications.md. */
 export type Channel =
@@ -48,7 +110,7 @@ export type Channel =
   | `reviews`
   | `decisions`;
 
-/** Durable message envelope (stored; receipt acked only after persist). */
+/** Durable message envelope (stored; receipt acked only after commit). */
 export interface Message {
   messageId: string;
   threadId: string;
@@ -60,10 +122,12 @@ export interface Message {
   /** Explicit recipients; empty means thread subscribers. */
   recipientIds: string[];
   kind: MessageKind;
+  /** Storage-side labels (blocker/artifact/readiness/system-notice). */
+  labels: MessageLabel[];
   /** Redacted body as stored. */
   body: string;
   attachments?: AttachmentRef[];
-  /** Severity/deadline required for questions and blockers. */
+  /** Severity/deadline required for questions (blockers included). */
   severity?: "low" | "normal" | "high" | "urgent";
   deadlineAt?: string | null;
   createdAt: string;
@@ -91,7 +155,7 @@ export interface Thread {
   closed: boolean;
 }
 
-/** Per-recipient delivery state. Persisted before any ack is emitted. */
+/** Per-recipient delivery state. Committed before any ack is emitted. */
 export type DeliveryState = "queued" | "delivered" | "acknowledged" | "failed";
 
 export interface DeliveryReceipt {

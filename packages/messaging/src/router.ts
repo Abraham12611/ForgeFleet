@@ -1,9 +1,13 @@
 /**
  * E10 / FF-014 — Routing: who gets woken, fallback when peers are gone.
  *
+ * Pure planning (no I/O): `planDelivery` decides wake targets and the
+ * outcome; the service layer applies it via `ThreadStore.updateReceipts`
+ * in the same transaction as the `message.delivered` outbox event.
+ *
  * From `docs/04-flows/agent-messaging.md`:
  * - peer resolves: deliver answer, coordinator gets a summary event;
- * - peer unavailable / message expires: route to lead/coordinator;
+ * - peer unavailable / message expired: route to lead/coordinator;
  * - cross-team ambiguity: escalation with options/evidence;
  * - owner-only: human decision item, queued while the owner sleeps;
  * - a blocked task may move back to ready after a reply (the scheduler
@@ -13,11 +17,10 @@
  * events: replayed posts never re-wake.
  */
 
-import { ThreadStore } from "./thread-store.ts";
 import {
-  type Actor,
-  type DeliveryReceipt,
   type Message,
+  type MessageKind,
+  type MessageLabel,
   type Outcome,
   type Thread,
 } from "./types.ts";
@@ -51,14 +54,13 @@ export function planDelivery(
   const explicit = message.recipientIds.length > 0 ? message.recipientIds : [...thread.acl];
   const targets = explicit.filter((id) => id !== message.sender.id);
   const available = targets.filter((id) => presence.isAvailable(id));
-  const unavailable = targets.filter((id) => !presence.isAvailable(id));
 
   // Owner-directed questions while the owner sleeps are queued, not dropped.
   const ownerId = presence.ownerId(message.projectId);
   if (
     targets.includes(ownerId) &&
     presence.isOwnerSleeping(message.projectId) &&
-    (message.kind === "question" || message.kind === "blocker")
+    message.kind === "question"
   ) {
     return {
       outcome: "queued_while_sleeping",
@@ -69,13 +71,13 @@ export function planDelivery(
     };
   }
 
-  if (available.length > 0 && unavailable.length === 0) {
+  if (available.length > 0 && available.length === targets.length) {
     return {
       outcome: "stored",
       wake: available,
       reroutedTo: [],
       queuedForOwner: false,
-      unblocksTask: message.kind === "answer",
+      unblocksTask: message.kind === "answer" || message.kind === "unblock",
     };
   }
 
@@ -105,48 +107,33 @@ export function planDelivery(
   };
 }
 
-/** Apply a route plan to the store receipts (persisted before any ack). */
-export function applyRoutePlan(
-  store: ThreadStore,
-  message: Message,
-  plan: RoutePlan,
-  reason?: string,
-): DeliveryReceipt[] {
-  const out: DeliveryReceipt[] = [];
-  for (const recipientId of plan.wake) {
-    try {
-      out.push(store.setReceipt(message.messageId, recipientId, "delivered", reason));
-    } catch {
-      // Wake target outside the persisted receipt set (e.g. fallback lead):
-      // recorded by the caller as a new delivery event, never silently.
-      out.push({ messageId: message.messageId, recipientId, state: "failed", updatedAt: message.createdAt, reason: "no receipt slot; redeliver via thread read" });
-    }
-  }
-  return out;
-}
-
 /**
- * Normalize a raw Orca runtime payload into a task-thread post.
- * Unknown fields are ignored; the sender is always the owning worker
- * identity, never whoever the text claims to be (no impersonation).
+ * Normalize a raw Orca runtime payload into task-thread post fields.
+ * Unknown fields are ignored. The sender is NOT derived here: only the
+ * bridge service identity may file runtime messages (see
+ * `MessagingService.file_runtime_message`), which forces the sender to
+ * the owning worker role — text claiming other authority stays text.
  */
 export function normalizeOrcaMessage(input: {
   externalId: string;
   projectId: string;
   taskId: string;
   workerId: string;
-  kind: "question" | "answer" | "status" | "text";
+  kind: "question" | "answer" | "update";
   text: string;
   threadId?: string;
   idempotencyKey: string;
   severity?: string;
   deadlineAt?: string | null;
+  labels?: MessageLabel[];
 }): {
   threadId: string;
-  sender: Actor;
-  kind: "question" | "answer" | "status" | "text";
+  kind: MessageKind;
+  labels: MessageLabel[];
   body: string;
+  projectId: string;
   taskId: string;
+  workerId: string;
   idempotencyKey: string;
   externalId: string;
   severity?: string;
@@ -154,15 +141,12 @@ export function normalizeOrcaMessage(input: {
 } {
   return {
     threadId: input.threadId ?? `task/${input.taskId}`,
-    sender: {
-      type: "agent",
-      id: input.workerId,
-      role: "worker",
-      projects: [input.projectId],
-    },
     kind: input.kind,
+    labels: input.labels ?? [],
     body: input.text,
+    projectId: input.projectId,
     taskId: input.taskId,
+    workerId: input.workerId,
     idempotencyKey: input.idempotencyKey,
     externalId: `orca:${input.externalId}`,
     severity: input.severity,

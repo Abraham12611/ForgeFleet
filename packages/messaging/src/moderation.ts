@@ -9,7 +9,7 @@
  * - a chat message can never override privileged policy.
  */
 
-import { MESSAGE_KINDS, type AttachmentRef, type MessageKind } from "./types.ts";
+import { MESSAGE_KINDS, MESSAGE_LABELS, type AttachmentRef, type MessageKind, type MessageLabel } from "./types.ts";
 
 export const MAX_BODY_CHARS = 20000;
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -40,6 +40,16 @@ export function scrubSecrets(text: string): string {
 
 export function isValidKind(kind: string): kind is MessageKind {
   return (MESSAGE_KINDS as readonly string[]).includes(kind);
+}
+
+export function validateLabels(labels: unknown): MessageLabel[] {
+  if (labels === undefined) return [];
+  if (!Array.isArray(labels)) throw new Error("labels must be an array");
+  const allowed = new Set<string>(MESSAGE_LABELS as readonly string[]);
+  for (const label of labels) {
+    if (!allowed.has(label as string)) throw new Error(`unknown message label: ${String(label)}`);
+  }
+  return labels as MessageLabel[];
 }
 
 export function validateBody(body: unknown): string {
@@ -84,17 +94,18 @@ export function validateAttachments(
 }
 
 /**
- * Questions and blockers require severity + deadline so the router can
- * prioritize wakeups and escalate on expiry
- * (`docs/04-flows/agent-messaging.md`: questions need deadline/severity).
+ * Questions (blockers are questions with the `blocker` label) require
+ * severity + deadline so the router can prioritize wakeups and escalate
+ * on expiry (`docs/04-flows/agent-messaging.md`: questions need
+ * deadline/severity).
  */
 export function validateQuestionFields(
   kind: MessageKind,
   severity: unknown,
   deadlineAt: unknown,
-): { severity: "low" | "normal" | "high" | "urgent"; deadlineAt: string | null } {
-  if (kind !== "question" && kind !== "blocker") {
-    return { severity: "normal", deadlineAt: null };
+): { severity: "low" | "normal" | "high" | "urgent" | undefined; deadlineAt: string | null } {
+  if (kind !== "question") {
+    return { severity: undefined, deadlineAt: null };
   }
   if (!["low", "normal", "high", "urgent"].includes(severity as string)) {
     throw new Error(`${kind} requires severity low|normal|high|urgent`);
