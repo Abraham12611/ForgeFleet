@@ -31,6 +31,25 @@ spike. That is what `apps/android/**` currently holds.
 | `check_packaging.py` | Validator enforcing the rules above (stdlib only) |
 | `tests/test_android_packaging.py` | Fixture tests for the validator |
 
+## Run it (CI-ready, stdlib only, no dependencies)
+
+```sh
+python3 apps/android/check_packaging.py
+python3 -m unittest discover -s apps/android/tests -t . -v
+```
+
+Expected: validator `OK`, 7 fixture tests `OK`. Same discovery shape as the
+sibling suites (`play-internal`, `pwa-prototype`) so CI can run them together.
+
+## Related packages (same E20 ownership, different gates)
+
+- `play-internal/` (FF-029): offline readiness gate for a real submission
+  bundle. It **rejects** placeholder IDs by design; this package **requires**
+  them. The two gates are complementary, not contradictory: this one guards
+  fixture shape while blocked, that one guards a real bundle at submission time.
+- `pwa-prototype/` (FF-019): responsive fixture UI proving the mobile
+  acceptance walkthrough; the future Capacitor shell packages that web source.
+
 ## Rules enforced by `check_packaging.py`
 
 1. `appId` is reverse-DNS shaped but carries a `placeholder`/`example` marker —
