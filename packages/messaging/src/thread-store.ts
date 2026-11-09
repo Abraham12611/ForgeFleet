@@ -17,7 +17,7 @@
  * unclaimed outbox events are re-claimed by the sender loop.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   isValidKind,
   scrubSecrets,
@@ -56,14 +56,18 @@ export interface PolicyPort {
  * Reconcile with E07 `authorize()` (#33) before v1.0.
  */
 export function defaultPolicy(): PolicyPort {
+  // Stolen/confused session scope (FF-004 SESSION_SCOPE_MISMATCH parity):
+  // a session issued for another project can neither post nor read.
+  const scopeOk = (actor: Actor, thread: Thread): boolean =>
+    actor.sessionProjectId === undefined || actor.sessionProjectId === thread.projectId;
   const inProject = (actor: Actor, thread: Thread): boolean =>
     actor.role === "owner" ||
     (actor.projects ?? []).includes(thread.projectId);
   const inAcl = (actor: Actor, thread: Thread): boolean =>
     thread.acl.includes(actor.id) || thread.acl.includes(`role:${actor.role}`);
   return {
-    canPost: (actor, thread) => inProject(actor, thread) && inAcl(actor, thread),
-    canRead: (actor, thread) => inProject(actor, thread) && inAcl(actor, thread),
+    canPost: (actor, thread) => scopeOk(actor, thread) && inProject(actor, thread) && inAcl(actor, thread),
+    canRead: (actor, thread) => scopeOk(actor, thread) && inProject(actor, thread) && inAcl(actor, thread),
   };
 }
 
@@ -92,15 +96,17 @@ export interface StoreOptions {
   policy?: PolicyPort;
 }
 
-/** Deterministic payload hash (FNV-1a) for idempotency comparison. */
-export function payloadHash(value: unknown): string {
-  const s = JSON.stringify(value);
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+/**
+ * Canonical idempotency digest (SHA-256 over fixed-order JSON).
+ * SHA-256 replaces the original 32-bit FNV-1a: with untrusted agent
+ * messages, distinct payloads must not be able to collide into a false
+ * replay that suppresses a real message (coordinator P0 on FF-014).
+ * The digest is computed over the RAW body transiently in memory (exact
+ * equality); only the redacted body is persisted, logged, or displayed.
+ * Raw secrets never reach storage or logs.
+ */
+export function payloadDigest(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex");
 }
 
 type MessageRow = {
@@ -239,7 +245,8 @@ export class ThreadStore {
     if (typeof input.idempotencyKey !== "string" || input.idempotencyKey.length < 8) {
       throw new MessageError("VALIDATION", 400, "idempotencyKey must be a string of >= 8 chars");
     }
-    const body = scrubSecrets(validateBody(input.body));
+    const rawBody = validateBody(input.body);
+    const body = scrubSecrets(rawBody);
     const attachments = validateAttachments(input.attachments);
     const { severity, deadlineAt } = validateQuestionFields(
       input.kind,
@@ -247,12 +254,12 @@ export class ThreadStore {
       input.deadlineAt,
     );
 
-    const hash = payloadHash({
+    const digest = payloadDigest({
       threadId: thread.threadId,
       senderId: input.sender.id,
       kind: input.kind,
-      labels: [...(input.labels ?? [])].sort(),
-      body,
+      labels: [...labels].sort(),
+      body: rawBody,
       recipientIds: [...(input.recipientIds ?? [])].sort(),
     });
 
@@ -280,21 +287,14 @@ export class ThreadStore {
 
     return this.db.transaction(() => {
       const prior = this.db
-        .prepare("SELECT * FROM messages WHERE idempotency_key = ?")
-        .get(input.idempotencyKey) as MessageRow | undefined;
+        .prepare("SELECT idempotency_key, payload_sha256, message_id FROM messages WHERE idempotency_key = ?")
+        .get(input.idempotencyKey) as { payload_sha256: string; message_id: string } | undefined;
       if (prior) {
-        const priorHash = payloadHash({
-          threadId: prior.thread_id,
-          senderId: (JSON.parse(prior.sender_json) as Actor).id,
-          kind: prior.kind,
-          labels: parseJson<string[]>(prior.labels_json, []).sort(),
-          body: prior.body,
-          recipientIds: parseJson<string[]>(prior.recipient_ids_json, []).sort(),
-        });
-        if (priorHash !== hash) {
+        if (prior.payload_sha256 !== digest) {
           throw new MessageError("CONFLICT", 409, "idempotencyKey already used with a different payload");
         }
-        return { message: rowToMessage(prior), replayed: true };
+        const full = this.db.prepare("SELECT * FROM messages WHERE message_id = ?").get(prior.message_id) as MessageRow;
+        return { message: rowToMessage(full), replayed: true };
       }
 
       if (input.externalId !== undefined) {
@@ -309,8 +309,9 @@ export class ThreadStore {
           .prepare(
             `INSERT INTO messages (message_id, thread_id, channel, project_id, task_id, attempt_id,
               sender_json, recipient_ids_json, kind, labels_json, body, attachments_json,
-              severity, deadline_at, created_at, trace_id, idempotency_key, external_id, visibility_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              severity, deadline_at, created_at, trace_id, idempotency_key, external_id,
+              visibility_json, payload_sha256)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             message.messageId, message.threadId, message.channel, message.projectId,
@@ -319,7 +320,7 @@ export class ThreadStore {
             message.body, message.attachments ? JSON.stringify(message.attachments) : null,
             message.severity ?? null, message.deadlineAt ?? null, message.createdAt,
             message.traceId, message.idempotencyKey, input.externalId ?? null,
-            JSON.stringify(message.visibility),
+            JSON.stringify(message.visibility), digest,
           );
       } catch (err) {
         if (err instanceof MessageError) throw err;

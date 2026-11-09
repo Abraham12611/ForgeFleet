@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS messages (
   trace_id TEXT NOT NULL,
   idempotency_key TEXT NOT NULL UNIQUE,
   external_id TEXT UNIQUE,
-  visibility_json TEXT NOT NULL
+  visibility_json TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id);
 CREATE TABLE IF NOT EXISTS receipts (
