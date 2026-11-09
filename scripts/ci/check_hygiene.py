@@ -35,9 +35,22 @@ PATTERNS = {
 # Tracked paths that must never be committed.
 FORBIDDEN_TRACKED = (".env", "secrets/", "private-context/", "artifacts/private/")
 
-# Files where scanner-looking strings legitimately appear (this scanner's own
-# pattern definitions and docs that discuss token formats in the abstract).
-ALLOWLIST_FILES = {"scripts/ci/check_hygiene.py"}
+# Narrow per-file pattern exceptions: committed negative-test fixtures whose
+# whole purpose is to present a fake secret to the system under test.
+# Each entry names the exact pattern it may trip; anything else in that file
+# still fails. Review these entries if the listed file ever changes.
+ALLOWLIST: dict[str, set[str]] = {
+    # This scanner's own pattern definitions (regex sources, not secrets).
+    "scripts/ci/check_hygiene.py": {"github_token", "github_pat",
+                                    "aws_access_key", "aws_secret_assignment",
+                                    "private_key_block", "slack_token",
+                                    "google_api_key", "password_assignment"},
+    # Play readiness-gate negative test: synthetic manifest with
+    # keystorePassword="supersecret" must be rejected by the gate (exit 1).
+    "apps/android/play-internal/tests/test_check_play_internal_readiness.py": {
+        "password_assignment"
+    },
+}
 
 
 def tracked_files():
@@ -73,8 +86,7 @@ def main() -> int:
                 failures.append(f"{path}: forbidden tracked path ({forbidden})")
 
     for path in files:
-        if path in ALLOWLIST_FILES:
-            continue
+        exempt = ALLOWLIST.get(path, set())
         full = ROOT / path
         if not full.is_file():
             continue
@@ -83,6 +95,8 @@ def main() -> int:
         except (UnicodeDecodeError, OSError):
             continue  # binary/unreadable: out of scope for literal scan
         for name, pattern in PATTERNS.items():
+            if name in exempt:
+                continue
             for match in pattern.finditer(data):
                 lineno = data.count("\n", 0, match.start()) + 1
                 failures.append(f"{path}:{lineno}: possible {name}")
