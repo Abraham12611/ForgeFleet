@@ -106,9 +106,11 @@ describe('redactSecrets: fail closed before model handoff', () => {
     assert.ok(!text.includes('hunter2'), text);
     assert.ok(!text.includes('abc-123'), text);
     assert.ok(text.includes('password ='), text);
+    assert.ok(text.includes('api_key:'), text);
     assert.ok(text.includes('[REDACTED:credential]'), text);
-    assert.equal(redactions[0].kind, 'credential-assignment');
-    assert.equal(redactions[0].occurrences, 2);
+    const kinds = Object.fromEntries(redactions.map((r) => [r.kind, r.occurrences]));
+    assert.equal(kinds['credential-assignment'], 1);
+    assert.equal(kinds['credential-header'], 1);
   });
 
   it('leaves clean prose untouched, even with scary words', () => {
@@ -295,7 +297,7 @@ describe('manifestForTask: version-pinned scoped references + project ACL', () =
 
   it('returns only the bound sources, pinned to the manifest revision', () => {
     const m = manifest();
-    const view = manifestForTask(m, 'auth-ui', { id: 'w-1', role: 'worker', projects: ['proj-a'] });
+    const view = manifestForTask(m, 'auth-ui', { id: 'w-1', role: 'worker', projects: ['proj-a'] }, { authorization: { verdict: 'allow', policyVersion: '0.1.0' } });
     assert.equal(view.revision, m.revision);
     assert.equal(view.taskKey, 'auth-ui');
     assert.deepEqual(view.sources.map((s) => s.sourceId), ['prd']);
@@ -304,15 +306,16 @@ describe('manifestForTask: version-pinned scoped references + project ACL', () =
 
   it('denies cross-project retrieval, allows the owner to span projects', () => {
     const m = manifest();
+    const allow = { authorization: { verdict: 'allow', policyVersion: '0.1.0' } };
     assert.throws(
-      () => manifestForTask(m, 'auth-ui', { id: 'w-1', role: 'worker', projects: ['proj-b'] }),
+      () => manifestForTask(m, 'auth-ui', { id: 'w-1', role: 'worker', projects: ['proj-b'] }, allow),
       (e) => e.code === 'CROSS_PROJECT_DENIED',
     );
     assert.throws(
-      () => manifestForTask(m, 'auth-ui', { id: 'w-1', role: 'worker' }),
+      () => manifestForTask(m, 'auth-ui', { id: 'w-1', role: 'worker' }, allow),
       (e) => e.code === 'CROSS_PROJECT_DENIED',
     );
-    const ownerView = manifestForTask(m, 'auth-ui', { id: 'owner', role: 'owner' });
+    const ownerView = manifestForTask(m, 'auth-ui', { id: 'owner', role: 'owner' }, allow);
     assert.equal(ownerView.revision, m.revision);
   });
 
@@ -323,7 +326,7 @@ describe('manifestForTask: version-pinned scoped references + project ACL', () =
       (e) => e.code === 'UNKNOWN_ACTOR',
     );
     assert.throws(
-      () => manifestForTask(m, 'nope', { id: 'w-1', role: 'worker', projects: ['proj-a'] }),
+      () => manifestForTask(m, 'nope', { id: 'w-1', role: 'worker', projects: ['proj-a'] }, { authorization: { verdict: 'allow' } }),
       (e) => e.code === 'TASK_NOT_BOUND',
     );
   });
@@ -339,6 +342,86 @@ describe('refreshEvent: explicit context-refresh trail', () => {
     assert.equal(ev.revision, m2.revision);
     assert.ok(Object.isFrozen(ev));
   });
+
+describe('coordinator review regressions: adversarial secrets (all values FAKE)', () => {
+  // Vendor-style tokens are assembled at runtime so this file never holds a
+  // realistic token-shaped literal; every value below is fake by construction.
+  const SK_PROJ = ['sk', 'proj', 'FAKE0123456789abcdefghij'].join('-');
+  const SK_BARE = ['sk', 'FAKE7f3a9c2e1b4d6f8a0c2e5b7d9f1a3c5e'].join('-');
+  const ADVERSARIAL = [
+    `OPENAI_API_KEY=${SK_PROJ}`,
+    `standalone ${SK_PROJ} token`,
+    `bare ${SK_BARE} token`,
+    'https://bot:FAKE-PASSWORD-123@internal.example/hooks',
+    'X-Api-Key: FAKE-HEADER-VALUE-789',
+    'BACKUP_API_KEY=plain-fake-value-123',
+  ].join('\n');
+
+  it('redacts prefixed env names, standalone vendor tokens, URL userinfo, headers', () => {
+    const { text, redactions } = redactSecrets(ADVERSARIAL);
+    for (const secret of [SK_PROJ, SK_BARE, 'FAKE-PASSWORD-123', 'FAKE-HEADER-VALUE-789', 'plain-fake-value-123']) {
+      assert.ok(!text.includes(secret), `leaked: ${secret}\n${text}`);
+    }
+    assert.ok(!text.includes('bot:FAKE'), text);
+    assert.ok(redactions.length >= 4, JSON.stringify(redactions));
+  });
+
+  it('entropy screen catches random-looking tokens the patterns miss', () => {
+    const token = 'xQ9vZ2mK8nB4pL7rT5wY3sD6fH1jQw';
+    const { text, redactions } = redactSecrets(`id ${token} end`);
+    assert.ok(!text.includes(token), text);
+    assert.ok(redactions.some((r) => r.kind === 'high-entropy-secret'));
+  });
+
+  it('does not redact hex shas or long ordinary words in excerpts', () => {
+    const sha = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const { text, redactions } = redactSecrets(`pin ${sha} and antidisestablishmentarianism noted`);
+    assert.ok(text.includes(sha), text);
+    assert.ok(text.includes('antidisestablishmentarianism'), text);
+    assert.deepEqual(redactions, []);
+  });
+
+  it('ingested excerpts never carry raw adversarial secrets', () => {
+    const s = ingestSource({ name: 'notes.md', mediaType: 'text/markdown', bytes: ADVERSARIAL });
+    for (const secret of [SK_PROJ, SK_BARE, 'FAKE-PASSWORD-123', 'FAKE-HEADER-VALUE-789', 'plain-fake-value-123']) {
+      assert.ok(!s.excerpt.includes(secret), s.excerpt);
+    }
+  });
+});
+
+describe('coordinator review regressions: Windows paths stay rejected', () => {
+  it('rejects backslash traversal, drive paths, and UNC shares', () => {
+    for (const name of ['..\\escape.md', 'a\\..\\b.md', 'C:\\secrets\\x.md', '\\\\server\\share\\x.md']) {
+      const v = validateSource({ name, mediaType: 'text/plain', byteSize: 10 });
+      assert.equal(v.status, 'rejected', name);
+      assert.ok(v.reasons.includes('BLOCKED_PATH'), name);
+    }
+  });
+});
+
+describe('coordinator review regressions: no serving without E07 policy', () => {
+  const bound = () => bindTask(
+    createManifest({ projectId: 'proj-a', goalRevision: 'g', sources: [md('a.md', 'x', { sourceId: 's-a' })] }),
+    { taskKey: 't', sourceIds: ['s-a'] },
+  );
+  const actor = { id: 'w-1', role: 'worker', projects: ['proj-a'] };
+
+  it('refuses to serve without an E07 allow-decision', () => {
+    assert.throws(() => manifestForTask(bound(), 't', actor), (e) => e instanceof ContextError && e.code === 'POLICY_REQUIRED');
+  });
+
+  it('refuses to serve on a non-allow policy verdict', () => {
+    assert.throws(
+      () => manifestForTask(bound(), 't', actor, { authorization: { verdict: 'deny' } }),
+      (e) => e instanceof ContextError && e.code === 'POLICY_DENIED',
+    );
+  });
+
+  it('serves with an E07 allow-decision plus project scope', () => {
+    const view = manifestForTask(bound(), 't', actor, { authorization: { verdict: 'allow', policyVersion: '0.1.0' } });
+    assert.deepEqual(view.sources.map((s) => s.sourceId), ['s-a']);
+  });
+});
 
   it('refuses no-op and incomplete refresh events', () => {
     const m = createManifest({ projectId: 'p', goalRevision: 'g', sources: [] });

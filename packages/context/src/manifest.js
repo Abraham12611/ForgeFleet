@@ -14,12 +14,13 @@
  * yield the same revision, and sources are canonically ordered by
  * `sourceId`, so independently built manifests with the same content agree.
  *
- * NOTE (E07 dependency): `packages/policy` owns authorization. The actor
- * check in `manifestForTask` is intentionally minimal — owner spans
- * projects, everyone else must be scoped to the manifest project (mirrors
- * the AUTO_SAFE `context.read` row of
- * `docs/05-contracts/policy-matrix.md`). Reconcile with the E07 policy
- * engine before using this past v0.2 fixtures.
+ * NOTE (E07 dependency): `packages/policy` owns authorization, and this
+ * package does NOT substitute for it. `manifestForTask` refuses to serve
+ * without a caller-supplied E07 allow-decision (`POLICY_REQUIRED`); the
+ * project-scope check inside is defense-in-depth on top of that verdict
+ * (mirrors the AUTO_SAFE `context.read` row of
+ * `docs/05-contracts/policy-matrix.md`). Until the E07 integration lands,
+ * only fixtures and tests can satisfy the gate — never real workers.
  */
 
 import { createHash } from 'node:crypto';
@@ -88,7 +89,7 @@ const SOURCE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
  * `INVALID_SOURCE`, `DUPLICATE_SOURCE_ID`, `TOO_MANY_SOURCES`,
  * `UNKNOWN_SOURCE`, `TASK_NOT_BOUND`, `INVALID_TASK`, `TOO_MANY_TASK_SOURCES`,
  * `CROSS_PROJECT_DENIED`, `UNKNOWN_ACTOR`, `REVISION_MISMATCH`,
- * `INVALID_MANIFEST`, `NO_CHANGE`.
+ * `INVALID_MANIFEST`, `NO_CHANGE`, `POLICY_REQUIRED`, `POLICY_DENIED`.
  */
 export class ContextError extends Error {
   /** @param {string} code @param {string} message */
@@ -116,7 +117,7 @@ export function normalizeMediaType(mediaType) {
 }
 
 function basenameOf(name) {
-  return String(name).split('/').pop() ?? '';
+  return String(name).split(/[/\\]+/).pop() ?? '';
 }
 
 /**
@@ -137,10 +138,15 @@ export function validateSource(input) {
   if (typeof name !== 'string' || name.length === 0 || name.length > 512) {
     return rejected('INVALID_SOURCE');
   }
+  // Both separators are treated as path separators on every platform, so a
+  // Windows-style `..\` escape cannot smuggle a traversal past validation.
+  if (/^[A-Za-z]:/.test(name) || name.startsWith('\\\\')) {
+    return rejected('BLOCKED_PATH');
+  }
   if (name.startsWith('/') || name.startsWith('\\')) {
     return rejected('BLOCKED_PATH');
   }
-  const segments = name.split('/');
+  const segments = name.split(/[/\\]+/);
   if (segments.some((s) => s === '' || s === '.' || s === '..')) {
     return rejected('BLOCKED_PATH');
   }
@@ -530,18 +536,36 @@ export function bindTask(manifest, input) {
 /**
  * Retrieve exactly the sources bound to one task, ACL-checked. This is the
  * only read path workers should use: scoped references, never the whole
- * manifest. Throws ContextError (`TASK_NOT_BOUND`, `CROSS_PROJECT_DENIED`,
- * `UNKNOWN_ACTOR`) instead of returning partial data.
+ * manifest. Serving requires a caller-supplied E07 policy allow-decision:
+ * without `options.authorization` (or on any non-`allow` verdict) nothing
+ * is returned — the project-scope check below is defense-in-depth on top
+ * of that verdict, not a substitute for it. Throws ContextError
+ * (`POLICY_REQUIRED`, `POLICY_DENIED`, `TASK_NOT_BOUND`,
+ * `CROSS_PROJECT_DENIED`, `UNKNOWN_ACTOR`) instead of returning data.
  *
  * @param {ContextManifest} manifest
  * @param {string} taskKey
  * @param {ContextActor} actor
+ * @param {{authorization?: {verdict: string, policyVersion?: string}}} [options]
  * @returns {ScopedContext} frozen.
  */
-export function manifestForTask(manifest, taskKey, actor) {
+export function manifestForTask(manifest, taskKey, actor, options) {
   verifyManifest(manifest);
   if (!actor || typeof actor.role !== 'string' || actor.role === '') {
     throw new ContextError('UNKNOWN_ACTOR', 'An authenticated actor with a role is required.');
+  }
+  const authorization = options?.authorization;
+  if (!authorization || typeof authorization.verdict !== 'string') {
+    throw new ContextError(
+      'POLICY_REQUIRED',
+      'Serving context requires an E07 policy allow-decision; refusing to serve without one.',
+    );
+  }
+  if (authorization.verdict !== 'allow') {
+    throw new ContextError(
+      'POLICY_DENIED',
+      `Policy verdict '${authorization.verdict}' does not permit serving context.`,
+    );
   }
   if (actor.role !== 'owner') {
     const projects = Array.isArray(actor.projects) ? actor.projects : [];
