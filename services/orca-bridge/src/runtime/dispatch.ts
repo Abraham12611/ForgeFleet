@@ -138,11 +138,38 @@ export type CommandRunner = (
   opts: { timeoutMs?: number },
 ) => Promise<CommandResult>;
 
+/**
+ * Explicit runtime capability evidence required before any worker start.
+ * No start runs on assumption: the caller must hand the bridge a
+ * version-matched probe result (E02 `CapabilityReport`, owner probe #65,
+ * or a fake gate in tests). Unknown/unavailable providers never dispatch.
+ *
+ * Linux entrypoint correction (#65): the executable must be the packaged
+ * CLI shim (`~/.local/bin/orca-ide` or
+ * `/opt/orca/squashfs-root/resources/bin/orca-ide` via ELECTRON_RUN_AS_NODE),
+ * never the extracted Electron GUI binary
+ * (`/opt/orca/squashfs-root/orca-ide`), and never with `--no-sandbox` or
+ * setuid/chown repairs. Executable resolution itself is E02-owned; this
+ * gate only records which evidence authorized the launch.
+ */
+export interface CapabilityGate {
+  /** True only when a version-matched probe proved the runtime reachable. */
+  reachable: boolean;
+  /** True only when a probe proved the `muse` agent id launchable. */
+  museLaunchVerified: boolean;
+  /** Evidence pointer, e.g. "FF-002 CapabilityReport 2026-11-08" or "owner probe #65". */
+  evidence: string;
+  /** Installed Orca version the evidence was captured from, when known. */
+  orcaVersion?: string;
+}
+
 /** Injection point for the bridge daemon. */
 export interface DispatchDeps {
   /** Pre-resolved Orca executable (E02 owns resolution). */
   executable: string;
   run: CommandRunner;
+  /** Required: no `startAttempt` runs without passing this gate. */
+  capabilities: CapabilityGate;
   now?: () => Date;
   newAttemptId?: () => string;
 }
@@ -265,6 +292,31 @@ function assertValidStartInput(input: StartAttemptInput): void {
       "INVALID_START_REQUEST",
       "lease.fencingEpoch must be an integer >= 1 (frozen contract #46).",
       `fencingEpoch=${String(lease.fencingEpoch)}`,
+      false,
+    );
+  }
+}
+
+/**
+ * Require explicit runtime capability evidence before any worker start.
+ * Read-only inspection (`worker-show`, `request-show`, status) is never
+ * gated: only the mutating start path calls this. Unknown, unavailable,
+ * or unevidenced providers throw without touching the runner.
+ */
+export function assertCapabilityGate(gate: CapabilityGate | undefined): void {
+  if (!gate || !gate.reachable || !gate.museLaunchVerified) {
+    throw new DispatchError(
+      "CAPABILITY_UNVERIFIED",
+      "Refusing worker start: no explicit capability evidence that the runtime is reachable and the muse agent is launchable. Supply a version-matched probe result (E02 report, owner probe #65).",
+      `reachable=${String(gate?.reachable)} museLaunchVerified=${String(gate?.museLaunchVerified)}`,
+      false,
+    );
+  }
+  if (!gate.evidence?.trim()) {
+    throw new DispatchError(
+      "CAPABILITY_UNVERIFIED",
+      "Refusing worker start: capability evidence pointer is empty. Name the probe (e.g. owner probe #65) so the launch is auditable.",
+      "",
       false,
     );
   }
@@ -524,6 +576,7 @@ export async function startAttempt(
   input: StartAttemptInput,
 ): Promise<AttemptReceipt> {
   assertValidStartInput(input);
+  assertCapabilityGate(deps.capabilities);
   const requestHash = hashStartRequest(input);
   const existing = ledger.get(input.idempotencyKey);
   if (existing) {

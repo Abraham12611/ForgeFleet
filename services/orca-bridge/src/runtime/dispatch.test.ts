@@ -60,6 +60,12 @@ function fakeDeps(
   const calls: SeenCall[] = [];
   let n = 0;
   const deps: DispatchDeps = {
+    capabilities: {
+      evidence: "test fake gate",
+      museLaunchVerified: true,
+      orcaVersion: "test",
+      reachable: true,
+    },
     executable: "orca-ide",
     newAttemptId: () => `attempt-${n}`,
     now: () => new Date("2026-11-08T12:00:00.000Z"),
@@ -494,6 +500,101 @@ describe("frozen contract v0.1 alignment (#46)", () => {
     for (const token of ["running", "finished", "failed", "waiting", "nope", undefined]) {
       assert.ok(frozen.has(mapWorkerStatus(token)), `mapping leaked ${String(token)}`);
     }
+  });
+});
+
+describe("capability gate (explicit evidence before start)", () => {
+  it("refuses to dispatch when the runtime is unreachable", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    deps.capabilities = {
+      evidence: "test fake gate",
+      museLaunchVerified: true,
+      reachable: false,
+    };
+    await assert.rejects(
+      startAttempt(deps, new DispatchLedger(), baseInput()),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "CAPABILITY_UNVERIFIED",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("refuses to dispatch when muse launch is unverified", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    deps.capabilities = {
+      evidence: "owner probe #65 (pending)",
+      museLaunchVerified: false,
+      reachable: true,
+    };
+    await assert.rejects(
+      startAttempt(deps, new DispatchLedger(), baseInput()),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "CAPABILITY_UNVERIFIED",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("refuses to dispatch with an empty evidence pointer", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    deps.capabilities = {
+      evidence: "  ",
+      museLaunchVerified: true,
+      reachable: true,
+    };
+    await assert.rejects(
+      startAttempt(deps, new DispatchLedger(), baseInput()),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "CAPABILITY_UNVERIFIED",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("read-only status never requires the gate", async () => {
+    const { deps } = fakeDeps([
+      {
+        exitCode: 0,
+        stderr: "",
+        stdout: JSON.stringify({ result: { state: "running" } }),
+      },
+    ]);
+    const gateLess = { ...deps, capabilities: undefined as never };
+    const r = await getAttemptStatus(gateLess, "d-1", "p-1", "a-1");
+    assert.equal(r.state, "running");
+  });
+});
+
+describe("request-show recovery without duplicate spawn (F05)", () => {
+  it("lost reply -> reconcile completed -> replay serves the ledger, runner idle", async () => {
+    const lost: CommandResult = {
+      exitCode: 0,
+      stderr: "",
+      stdout: "not json{{{",
+    };
+    const { calls, deps } = fakeDeps([lost]);
+    const ledger = DispatchLedger.restore({});
+    const first = await startAttempt(deps, ledger, baseInput());
+    assert.equal(first.state, "unknown");
+    assert.equal(first.errorCode, "RECEIPT_UNPARSEABLE");
+    assert.equal(calls.length, 1);
+
+    // Restart path: read-only reconcile proves the original completed.
+    const completed: CommandResult = {
+      exitCode: 0,
+      stderr: "",
+      stdout: JSON.stringify({ result: { status: "completed" } }),
+    };
+    const { deps: reconDeps } = fakeDeps([completed]);
+    assert.equal(
+      await reconcileStart(reconDeps, first.orcaRequestId ?? ""),
+      "completed",
+    );
+
+    // Replay under the same key+payload replays the recorded outcome:
+    // no second Orca command runs on the original runner.
+    const replay = await startAttempt(deps, ledger, baseInput());
+    assert.equal(replay.deduplicated, true);
+    assert.equal(replay.state, "unknown");
+    assert.equal(calls.length, 1);
   });
 });
 
