@@ -1,0 +1,25 @@
+# ForgeFleet orca-bridge daemon (private phase). Hardened; loopback only.
+# Reference minimal example: ../example-orca-bridge.service (kept unchanged).
+[Unit]
+Description=ForgeFleet Orca Bridge (private, loopback only)
+After=network-online.target forgefleet-paperclip.service
+Wants=network-online.target
+# Explicitly NOT BoundTo/PartOf orca-serve.service: bridge reads Orca via the
+# version-matched CLI only and must never restart or reconfigure it.
+
+[Service]
+Type=simple
+ExecStartPre=/opt/forgefleet/scripts/deploy/guard-loopback.sh
+ExecStart=/usr/bin/env node /opt/forgefleet/services/orca-bridge/dist/index.js
+WorkingDirectory=/opt/forgefleet
+EnvironmentFile=/etc/forgefleet/bridge.env
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

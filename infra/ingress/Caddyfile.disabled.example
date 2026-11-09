@@ -1,0 +1,11 @@
+# DISABLED EXAMPLE — future public HTTPS ingress for the split Vercel/Vultr
+# topology. Do NOT enable in the private phase: the browser/API split has not
+# passed the auth, cookie, CORS, and streaming gates in
+# docs/03-architecture/infra-deployment.md, and the bridge must stay private.
+#
+# When the gates pass, serve only the Paperclip API host here; the bridge,
+# PostgreSQL, and any Orca/CLI surface must never appear in a public block.
+#
+# {$API_HOST} api.<owned-domain> {
+#   reverse_proxy 127.0.0.1:{$PAPERCLIP_PORT:8080}
+# }
