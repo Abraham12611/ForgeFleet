@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgefeet.example/contracts/v0.1/bridge-events.schema.json",
+  "title": "ForgeFleet normalized bridge event envelope (frozen v0.1)",
+  "description": "Normative JSON Schema for docs/05-contracts/events.md envelope v0.1. New event types must be safely ignorable by older clients; breaking field changes require a schema version bump.",
+  "$defs": {
+    "EventType": {
+      "type": "string",
+      "enum": [
+        "project.created",
+        "project.paused",
+        "project.resumed",
+        "task.ready",
+        "task.claimed",
+        "task.blocked",
+        "task.unblocked",
+        "task.submitted",
+        "task.verified",
+        "task.failed",
+        "attempt.accepted",
+        "attempt.started",
+        "attempt.heartbeat",
+        "attempt.question",
+        "attempt.finished",
+        "attempt.failed",
+        "attempt.unknown",
+        "attempt.cancelled",
+        "message.posted",
+        "message.delivered",
+        "message.acknowledged",
+        "message.failed",
+        "decision.requested",
+        "decision.answered",
+        "decision.expired",
+        "decision.withdrawn",
+        "github.pr.opened",
+        "github.checks.updated",
+        "github.review.submitted",
+        "github.merged",
+        "github.closed",
+        "runtime.connected",
+        "runtime.disconnected",
+        "runtime.capacity.changed",
+        "budget.threshold",
+        "budget.exhausted"
+      ]
+    },
+    "Actor": {
+      "type": "object",
+      "required": ["type", "id"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string", "enum": ["service", "human", "agent"] },
+        "id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "BridgeEvent": {
+      "type": "object",
+      "required": ["eventId", "schemaVersion", "eventType", "occurredAt", "source", "projectId"],
+      "additionalProperties": false,
+      "properties": {
+        "eventId": { "type": "string", "minLength": 1 },
+        "schemaVersion": { "type": "string", "const": "0.1" },
+        "eventType": { "$ref": "#/$defs/EventType" },
+        "occurredAt": { "type": "string", "format": "date-time" },
+        "receivedAt": { "type": "string", "format": "date-time" },
+        "source": { "type": "string", "minLength": 1 },
+        "projectId": { "type": "string", "minLength": 1 },
+        "taskId": { "type": "string", "minLength": 1 },
+        "attemptId": { "type": "string", "format": "uuid" },
+        "correlationId": { "type": "string", "minLength": 1 },
+        "fencingEpoch": { "type": "integer", "minimum": 1 },
+        "actor": { "$ref": "#/$defs/Actor" },
+        "data": { "type": "object" }
+      }
+    }
+  }
+}

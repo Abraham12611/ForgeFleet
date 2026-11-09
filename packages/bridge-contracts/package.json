@@ -1,0 +1,10 @@
+{
+  "name": "@forgefleet/bridge-contracts",
+  "version": "0.1.0",
+  "description": "Frozen ForgeFleet Orca bridge API contract v0.1: schemas, generated types, validation",
+  "scripts": {
+    "test": "python3 -m unittest discover -s tests -v",
+    "generate": "python3 scripts/generate.py",
+    "generate:check": "python3 scripts/generate.py --check"
+  }
+}

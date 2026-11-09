@@ -1,0 +1,20 @@
+{
+  "eventId": "01JDX1234567890ABCDEFGHIJ",
+  "schemaVersion": "0.1",
+  "eventType": "attempt.started",
+  "occurredAt": "2026-11-08T12:00:00Z",
+  "receivedAt": "2026-11-08T12:00:01Z",
+  "source": "orca-bridge",
+  "projectId": "project_123",
+  "taskId": "task_123",
+  "attemptId": "00000000-0000-4000-8000-000000000001",
+  "correlationId": "01JDXTRACE00000000000000",
+  "fencingEpoch": 1,
+  "actor": {
+    "type": "service",
+    "id": "orca-bridge"
+  },
+  "data": {
+    "externalDispatchId": "orca_dispatch_abc"
+  }
+}

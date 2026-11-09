@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://forgefeet.example/contracts/v0.1/bridge-api.schema.json",
+  "title": "ForgeFleet Orca Bridge API payloads (frozen v0.1)",
+  "description": "Normative JSON Schemas mirroring docs/05-contracts/bridge.openapi.yaml info.version 0.1.0. Do not edit generated consumers by hand; run scripts/generate.py.",
+  "$defs": {
+    "AttemptId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "IdempotencyKey": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 160
+    },
+    "ProviderStatus": {
+      "type": "string",
+      "enum": ["verified", "unsupported", "unknown", "unavailable"]
+    },
+    "SessionState": {
+      "type": "string",
+      "enum": ["running", "waiting", "stopped", "failed", "unknown"]
+    },
+    "AttemptState": {
+      "type": "string",
+      "enum": ["accepted", "dispatching", "running", "waiting", "unknown", "finished", "failed", "cancelled"]
+    },
+    "MessageKind": {
+      "type": "string",
+      "enum": ["question", "answer", "update", "unblock", "instruction"]
+    },
+    "RuntimeCapabilities": {
+      "type": "object",
+      "required": ["reachable", "checkedAt", "providers"],
+      "additionalProperties": false,
+      "properties": {
+        "reachable": { "type": "boolean" },
+        "checkedAt": { "type": "string", "format": "date-time" },
+        "cliVersion": { "type": ["string", "null"] },
+        "commandPath": { "type": ["string", "null"] },
+        "providers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "status"],
+            "additionalProperties": false,
+            "properties": {
+              "name": { "type": "string" },
+              "status": { "$ref": "#/$defs/ProviderStatus" },
+              "notes": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "RuntimeSession": {
+      "type": "object",
+      "required": ["externalId", "state", "managed"],
+      "additionalProperties": false,
+      "properties": {
+        "externalId": { "type": "string" },
+        "provider": { "type": ["string", "null"] },
+        "state": { "$ref": "#/$defs/SessionState" },
+        "managed": { "type": "boolean" },
+        "taskId": { "type": ["string", "null"] },
+        "worktreeId": { "type": ["string", "null"] },
+        "lastObservedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "RuntimeSessionList": {
+      "type": "object",
+      "required": ["sessions"],
+      "additionalProperties": false,
+      "properties": {
+        "sessions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/RuntimeSession" }
+        }
+      }
+    },
+    "AttemptLease": {
+      "type": "object",
+      "required": ["fencingEpoch", "leaseToken"],
+      "additionalProperties": false,
+      "properties": {
+        "fencingEpoch": { "type": "integer", "minimum": 1 },
+        "leaseToken": { "type": "string", "minLength": 1 }
+      }
+    },
+    "CreateAttemptRequest": {
+      "type": "object",
+      "required": ["projectId", "paperclipTaskId", "paperclipRunId", "workerKind", "contextManifestId", "lease"],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "paperclipTaskId": { "type": "string", "minLength": 1 },
+        "paperclipRunId": { "type": "string", "minLength": 1 },
+        "workerKind": { "type": "string", "minLength": 1 },
+        "taskTitle": { "type": "string" },
+        "instruction": { "type": "string" },
+        "contextManifestId": { "type": "string", "minLength": 1 },
+        "repositoryId": { "type": "string" },
+        "lease": { "$ref": "#/$defs/AttemptLease" }
+      }
+    },
+    "AttemptReceipt": {
+      "type": "object",
+      "required": ["attemptId", "projectId", "state", "observedAt"],
+      "additionalProperties": false,
+      "properties": {
+        "attemptId": { "$ref": "#/$defs/AttemptId" },
+        "projectId": { "type": "string", "minLength": 1 },
+        "state": { "$ref": "#/$defs/AttemptState" },
+        "observedAt": { "type": "string", "format": "date-time" },
+        "orcaRunId": { "type": ["string", "null"] },
+        "orcaTaskId": { "type": ["string", "null"] },
+        "orcaDispatchId": { "type": ["string", "null"] },
+        "worktreeId": { "type": ["string", "null"] },
+        "errorCode": { "type": ["string", "null"] }
+      }
+    },
+    "SendMessageRequest": {
+      "type": "object",
+      "required": ["projectId", "threadId", "actorId", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "projectId": { "type": "string", "minLength": 1 },
+        "threadId": { "type": "string", "minLength": 1 },
+        "actorId": { "type": "string", "minLength": 1 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 20000 },
+        "kind": { "$ref": "#/$defs/MessageKind" }
+      }
+    },
+    "CancelAttemptRequest": {
+      "type": "object",
+      "required": ["reason", "approvedBy"],
+      "additionalProperties": false,
+      "properties": {
+        "reason": { "type": "string", "minLength": 1 },
+        "approvedBy": { "type": "string", "minLength": 1 }
+      }
+    },
+    "Error": {
+      "type": "object",
+      "required": ["errorCode", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "errorCode": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "details": { "type": "object" }
+      }
+    }
+  }
+}

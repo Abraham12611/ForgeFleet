@@ -1,0 +1,11 @@
+{
+  "attemptId": "00000000-0000-4000-8000-000000000001",
+  "projectId": "project_123",
+  "state": "accepted",
+  "observedAt": "2026-11-08T12:00:01Z",
+  "orcaRunId": null,
+  "orcaTaskId": null,
+  "orcaDispatchId": null,
+  "worktreeId": null,
+  "errorCode": null
+}
