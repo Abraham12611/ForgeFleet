@@ -1,0 +1,63 @@
+# Preview API ingress policy (FF-028, E17 scope: infra/** + scripts/deploy/**)
+#
+# Declarative source of truth for the Vercel-preview -> Vultr-API staging ingress.
+# The nginx config in this directory implements this policy; the validator in
+# scripts/deploy/preview-ingress-check.py enforces it. No live domains or secrets
+# are recorded here -- exact domains remain OPEN per ADR-0006.
+
+# Public entry: Vultr staging API ingress only. Production is out of scope.
+ingress:
+  host_role: vultr-staging-api-ingress
+  listen: 443
+  tls: true
+  # Only these paths are reachable from the public internet (via Vercel previews).
+  public_paths:
+    - /api/health
+    - /api/events
+    - /api/uploads
+    - /api/tasks
+  # These must NEVER be reachable publicly; bridge stays loopback/Unix socket.
+  denied_paths:
+    - /bridge
+    - /internal
+    - /metrics-private
+    - /orca
+  bridge_bind_allowed:
+    - "127.0.0.1"
+    - "localhost"
+    - "unix:"
+
+# Every public path requires session auth at the ingress layer.
+auth:
+  required_on_all_public_paths: true
+  mechanism: auth_request_to_paperclip_session_validator
+  anonymous_allowed: false
+  # Previews authenticate against staging, never production, and carry no
+  # production service tokens (see vercel-preview.env.example).
+  preview_backend: staging-only
+
+# Split-origin browser rules for Vercel preview deployments.
+cors:
+  # Sibling-subdomain pattern + explicit Vercel preview suffix. Never "*".
+  allowed_origin_patterns:
+    - "https://app.staging.example.invalid"
+    - "https://*.vercel.app"
+  allow_credentials: true
+  allowed_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+  vary_origin: true
+
+# Reconnect contract for live event delivery across split origins.
+reconnect:
+  stream_endpoint: /api/events
+  protocol: sse
+  resume_header: Last-Event-ID
+  resume_fallback: "GET state snapshot, then resume stream"
+  buffering_off: true
+  long_read_timeout: true
+
+# Upload contract across split origins.
+uploads:
+  endpoint: /api/uploads
+  max_body_size: 10m
+  auth_required: true
+  allowed_methods: ["POST", "PUT"]
