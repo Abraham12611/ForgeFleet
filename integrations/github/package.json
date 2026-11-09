@@ -1,0 +1,16 @@
+{
+  "name": "@forgefleet/github-integration",
+  "version": "0.1.0",
+  "description": "GitHub checks/review/merge gate for ForgeFleet (FF-018, E16). Pure logic, zero dependencies.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "node --test src/*.test.ts",
+    "typecheck": "tsc --noEmit --strict --allowImportingTsExtensions --module nodenext --target es2022 src/*.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
