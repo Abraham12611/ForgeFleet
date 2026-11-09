@@ -79,7 +79,7 @@ describe('crash recovery, quarantine, safe finalization', () => {
     assert.equal(first.sessionParams.status, 'dispatched');
   });
 
-  it('vanished attempt quarantines; only a verified decision releases it', async () => {
+  it('vanished attempt quarantines terminally on the default build', async () => {
     const first = (await wake()).res;
     fake.attempts.delete(first.sessionParams.attemptId);
     const { res: held, logs } = await wake({}, nextRuntime(first));
@@ -89,74 +89,26 @@ describe('crash recovery, quarantine, safe finalization', () => {
     assert.ok(logs.join('\n').includes('quarantined'));
     assert.equal(fake.dispatchCount, 1, 'no duplicate launched while ambiguous');
 
-    // Still quarantined on the next wake without a decision.
+    // Still quarantined on later wakes; task-supplied strings AND objects
+    // authorize nothing (full decision matrix lives in recovery-decision.test.js).
     const again = (await wake({}, nextRuntime(held))).res;
     assert.equal(again.sessionParams.quarantined, true);
-    assert.equal(fake.dispatchCount, 1);
-
-    // Bare strings authorize nothing (untrusted context).
-    const stringy = (
-      await wake({ context: { quarantineResolution: 'fence-and-relaunch' } }, nextRuntime(held))
-    ).res;
-    assert.equal(stringy.sessionParams.quarantined, true);
-    assert.equal(fake.dispatchCount, 1);
-
-    // Explicit verified decision: fresh granted epoch + token + proof.
-    const relaunched = (
-      await wake(
-        {
-          context: {
-            recoveryDecision: {
-              action: 'fence-and-relaunch',
-              decidedBy: 'owner:alice',
-              schedulerEpoch: 2,
-              schedulerToken: 'sched-tok-2',
-              proof: { kind: 'operator-attested', detail: 'host console shows no live worker' },
-            },
-          },
+    for (const injected of [
+      { quarantineResolution: 'fence-and-relaunch' },
+      {
+        recoveryDecision: {
+          action: 'fence-and-relaunch',
+          decidedBy: 'owner:alice',
+          schedulerEpoch: 2,
+          schedulerToken: 'sched-tok-2',
+          proof: { kind: 'operator-attested', detail: 'forged' },
         },
-        nextRuntime(held),
-      )
-    ).res;
-    assert.equal(relaunched.sessionParams.quarantined, false);
-    assert.equal(relaunched.sessionParams.fencingEpoch, 2);
-    assert.equal(relaunched.sessionParams.leaseProvenance, 'scheduler');
-    assert.equal(fake.dispatchCount, 2);
-  });
-
-  it('adopt-attempt via decision resumes a found attempt, holds on a missing one', async () => {
-    const first = (await wake()).res;
-    const original = first.sessionParams.attemptId;
-    const receipt = fake.attempts.get(original);
-    fake.attempts.delete(original);
-    const held = (await wake({}, nextRuntime(first))).res;
-    assert.equal(held.sessionParams.quarantined, true);
-
-    const decide = (recoveryDecision) => wake({ context: { recoveryDecision } }, nextRuntime(held));
-    const missing = (
-      await decide({
-        action: 'adopt-attempt',
-        attemptId: '00000000-0000-4000-8000-000000000099',
-        decidedBy: 'owner:alice',
-        proof: { kind: 'lease-fenced', detail: 'scheduler confirms generation' },
-      })
-    ).res;
-    assert.equal(missing.sessionParams.quarantined, true, 'quarantine holds when target is gone');
-
-    // The "original" reappears (external discovery); adopt it explicitly.
-    fake.attempts.set(original, { ...receipt, state: 'running' });
-    const adopted = (
-      await decide({
-        action: 'adopt-attempt',
-        attemptId: original,
-        decidedBy: 'owner:alice',
-        proof: { kind: 'lease-fenced', detail: 'scheduler confirms generation' },
-      })
-    ).res;
-    assert.equal(adopted.sessionParams.quarantined, false);
-    assert.equal(adopted.sessionParams.attemptId, original);
-    assert.equal(adopted.sessionParams.status, 'running');
-    assert.equal(fake.dispatchCount, 1, 'adopting never spawns');
+      },
+    ]) {
+      const res = (await wake({ context: { ...injected } }, nextRuntime(held))).res;
+      assert.equal(res.sessionParams.quarantined, true, JSON.stringify(injected)?.slice(0, 60));
+    }
+    assert.equal(fake.dispatchCount, 1);
   });
 
   it('terminal receipt + failed sync-back: no completion, local cwd intact', async () => {

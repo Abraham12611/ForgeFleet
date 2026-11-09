@@ -1,9 +1,12 @@
-// Recovery-decision authorization tests (coordinator follow-up on 4a2e24b).
+// Recovery authorization tests (coordinator P0 follow-up on f395495).
 //
-// The Paperclip task context is UNTRUSTED for recovery: a bare
-// `quarantineResolution` string must never launch a worker. Release requires
-// a structured recoveryDecision (fresh scheduler epoch + token, decidedBy,
-// proof) AND verification of the old worker's fate. Fixture evidence only.
+// The Paperclip task context carries NO recovery authority: no string, no
+// object, no proof-shaped data releases a quarantined key. The default build
+// (no out-of-band provider) holds unconditionally. A constructor-injected
+// recoveryProvider stands in for the future authenticated bridge route
+// (proposed `GET /v1/attempts/:id/recovery-decision`, NOT in frozen v0.1);
+// even then, bridge-verified fate rules apply and a 404 never relaunches.
+// Fixture evidence only.
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,19 +18,39 @@ import { makeCtx, nextRuntime } from './helpers.js';
 
 const TASK = { taskId: 'T-7', runId: 'run-1', projectId: 'p7' };
 
-function decision(overrides = {}) {
-  return {
-    action: 'fence-and-relaunch',
-    decidedBy: 'owner:alice',
-    decidedAt: '2026-11-09T12:00:00Z',
-    schedulerEpoch: 2,
-    schedulerToken: 'sched-tok-new',
-    proof: { kind: 'operator-attested', detail: 'old worker confirmed dead on host console' },
-    ...overrides,
-  };
-}
+// Every forgery shape the task context could smuggle in. All must hold on
+// the default build.
+const FORGERIES = {
+  'bare string': { quarantineResolution: 'fence-and-relaunch' },
+  'forged owner object': {
+    recoveryDecision: {
+      action: 'fence-and-relaunch',
+      decidedBy: 'owner:alice',
+      schedulerEpoch: 2,
+      schedulerToken: 'forged-token',
+      proof: { kind: 'operator-attested', detail: 'attacker story' },
+    },
+  },
+  'stale epoch': {
+    recoveryDecision: {
+      action: 'fence-and-relaunch',
+      decidedBy: 'owner:alice',
+      schedulerEpoch: 1,
+      schedulerToken: 'sched-tok',
+      proof: { kind: 'lease-fenced', detail: 'x' },
+    },
+  },
+  'adopt unknown': {
+    recoveryDecision: {
+      action: 'adopt-attempt',
+      attemptId: '00000000-0000-4000-8000-000000000099',
+      decidedBy: 'owner:alice',
+      proof: { kind: 'lease-fenced', detail: 'x' },
+    },
+  },
+};
 
-describe('recovery decision authorization', () => {
+describe('recovery authorization (terminal quarantine by default)', () => {
   let cwd;
   let stateRoot;
   let fake;
@@ -46,10 +69,10 @@ describe('recovery decision authorization', () => {
     rmSync(stateRoot, { recursive: true, force: true });
   });
 
-  async function wake(overrides = {}, session = null) {
+  async function wake(overrides = {}, session = null, adapterImpl = adapter) {
     const { ctx, logs } = makeCtx({ cwd, ...TASK, ...overrides });
     if (session) ctx.runtime = { sessionId: session.sessionId, sessionParams: session.sessionParams };
-    return { res: await adapter.execute(ctx), logs };
+    return { res: await adapterImpl.execute(ctx), logs };
   }
 
   async function quarantinedSession() {
@@ -57,107 +80,129 @@ describe('recovery decision authorization', () => {
     fake.attempts.delete(first.sessionParams.attemptId);
     const held = (await wake({}, nextRuntime(first))).res;
     assert.equal(held.sessionParams.quarantined, true);
-    return held.sessionParams;
+    return { first, held: held.sessionParams };
   }
 
-  it('bare-string resolution is dead: no worker launches', async () => {
-    const q = await quarantinedSession();
-    const res = (
-      await wake({ context: { quarantineResolution: 'fence-and-relaunch' } }, nextRuntime({ sessionParams: q }))
-    ).res;
-    assert.equal(res.sessionParams.quarantined, true, 'quarantine holds');
-    assert.equal(fake.dispatchCount, 1, 'untrusted string launches nothing');
-  });
+  for (const [name, forgery] of Object.entries(FORGERIES)) {
+    it(`forgery holds and spawns nothing: ${name}`, async () => {
+      const { held } = await quarantinedSession();
+      const res = (await wake({ context: { ...forgery } }, nextRuntime({ sessionParams: held }))).res;
+      assert.equal(res.sessionParams.quarantined, true, `${name} must hold`);
+      assert.equal(fake.dispatchCount, 1, `${name} must spawn nothing`);
+    });
+  }
 
-  it('relaunch refused while the old worker is still running', async () => {
-    const first = (await wake()).res;
-    const liveId = first.sessionParams.attemptId;
-    const receipt = fake.attempts.get(liveId);
-    fake.advanceAttempt(liveId, 'running');
-    // Bridge transiently loses the record -> quarantine ...
-    fake.attempts.delete(liveId);
-    const q = (await wake({}, nextRuntime(first))).res.sessionParams;
-    assert.equal(q.quarantined, true);
-    // ... but at decision time the ORIGINAL worker is provably alive:
-    // a second worker beside it is forbidden.
-    fake.attempts.set(liveId, { ...receipt, state: 'running' });
-    const res = (
-      await wake({ context: { recoveryDecision: decision() } }, nextRuntime({ sessionParams: q }))
-    ).res;
-    assert.equal(res.sessionParams.quarantined, true, 'holds while old worker lives');
-    assert.equal(fake.dispatchCount, 1, 'no second worker beside the live one');
-  });
-
-  it('relaunch after proven-terminal original uses the fresh granted epoch', async () => {
-    const first = (await wake()).res;
-    const id = first.sessionParams.attemptId;
-    fake.advanceAttempt(id, 'finished');
-    // Bridge loses the record post-mortem; operator attests the observed
-    // terminal state (the adapter cannot take 'attempt-terminal' on faith
-    // together with a 404 — that combination holds).
-    fake.attempts.delete(id);
-    const q = (await wake({}, nextRuntime(first))).res.sessionParams;
-    assert.equal(q.quarantined, true);
-    const res = (
-      await wake(
-        {
-          context: {
-            recoveryDecision: decision({
-              proof: { kind: 'operator-attested', detail: 'finished event observed pre-loss; host console clear' },
-            }),
-          },
-        },
-        nextRuntime({ sessionParams: q }),
-      )
-    ).res;
-    assert.equal(res.sessionParams.quarantined, false);
-    assert.equal(res.sessionParams.fencingEpoch, 2);
-    assert.equal(res.sessionParams.leaseToken, 'sched-tok-new');
-    assert.equal(res.sessionParams.leaseProvenance, 'scheduler');
-    assert.equal(res.sessionParams.recovery.decidedBy, 'owner:alice');
-    assert.equal(fake.dispatchCount, 2);
-  });
-
-  it('stale epoch, missing token/proof/decidedBy all hold the quarantine', async () => {
-    const q = await quarantinedSession();
-    for (const bad of [
-      decision({ schedulerEpoch: 1 }),
-      decision({ schedulerToken: '' }),
-      decision({ decidedBy: '' }),
-      { action: 'fence-and-relaunch' },
-      decision({ proof: { kind: 'vibes', detail: 'trust me' } }),
-      decision({ proof: { kind: 'attempt-terminal', detail: 'claims terminal but bridge 404s' } }),
-    ]) {
-      const res = (await wake({ context: { recoveryDecision: bad } }, nextRuntime({ sessionParams: q }))).res;
-      assert.equal(res.sessionParams.quarantined, true, JSON.stringify(bad)?.slice(0, 80));
+  it('forgery on a session-less wake holds (restarted journal)', async () => {
+    const { held } = await quarantinedSession();
+    assert.ok(held);
+    const restarted = createServerAdapter({ stateRoot, fetchImpl: (...a) => fake.fetch(...a) });
+    for (const [name, forgery] of Object.entries(FORGERIES)) {
+      const { ctx } = makeCtx({ cwd, ...TASK, context: { ...forgery } });
+      const res = await restarted.execute(ctx);
+      assert.equal(res.quarantined ?? res.sessionParams?.quarantined ?? false, true, name);
     }
     assert.equal(fake.dispatchCount, 1);
   });
 
-  it('adopt-attempt via decision resumes a live worker without spawning', async () => {
+  it('quarantine holds across wakes with no provider, forever', async () => {
+    const { held } = await quarantinedSession();
+    for (let i = 0; i < 3; i++) {
+      const res = (await wake({}, nextRuntime({ sessionParams: held }))).res;
+      assert.equal(res.sessionParams.quarantined, true, `wake ${i} holds`);
+    }
+    assert.equal(fake.dispatchCount, 1);
+  });
+
+  it('provider approval still refuses beside a live original', async () => {
+    const first = (await wake()).res;
+    const liveId = first.sessionParams.attemptId;
+    const receipt = fake.attempts.get(liveId);
+    fake.advanceAttempt(liveId, 'running');
+    fake.attempts.delete(liveId);
+    const q = (await wake({}, nextRuntime(first))).res.sessionParams;
+    fake.attempts.set(liveId, { ...receipt, state: 'running' });
+    const withProvider = createServerAdapter({
+      stateRoot,
+      fetchImpl: (...a) => fake.fetch(...a),
+      recoveryProvider: async () => ({
+        action: 'fence-and-relaunch',
+        decidedBy: 'coordinator:test',
+        schedulerEpoch: 2,
+        schedulerToken: 'sched-tok-2',
+      }),
+    });
+    const { ctx } = makeCtx({ cwd, ...TASK });
+    ctx.runtime = { sessionId: q.sessionId, sessionParams: q };
+    const res = await withProvider.execute(ctx);
+    assert.equal(res.sessionParams.quarantined, true, 'live original blocks even approved relaunch');
+    assert.equal(fake.dispatchCount, 1);
+  });
+
+  it('provider + terminal original relaunches at the fresh epoch', async () => {
+    const first = (await wake()).res;
+    const id = first.sessionParams.attemptId;
+    fake.advanceAttempt(id, 'failed');
+    const withProvider = createServerAdapter({
+      stateRoot,
+      fetchImpl: (...a) => fake.fetch(...a),
+      recoveryProvider: async () => ({
+        action: 'fence-and-relaunch',
+        decidedBy: 'coordinator:test',
+        schedulerEpoch: 2,
+        schedulerToken: 'sched-tok-2',
+      }),
+    });
+    // Quarantine first via a lost record, then restore the terminal receipt
+    // so the fate check sees bridge-verified death.
+    const receipt = fake.attempts.get(id);
+    fake.attempts.delete(id);
+    const q = (await wake({}, nextRuntime(first))).res.sessionParams;
+    assert.equal(q.quarantined, true);
+    fake.attempts.set(id, receipt);
+    const { ctx } = makeCtx({ cwd, ...TASK });
+    ctx.runtime = { sessionId: q.sessionId, sessionParams: q };
+    const res = await withProvider.execute(ctx);
+    assert.equal(res.sessionParams.quarantined, false);
+    assert.equal(res.sessionParams.fencingEpoch, 2);
+    assert.equal(res.sessionParams.leaseProvenance, 'scheduler');
+    assert.equal(fake.dispatchCount, 2);
+  });
+
+  it('provider approval cannot lift a 404: absence is never proven here', async () => {
+    const { held } = await quarantinedSession();
+    const withProvider = createServerAdapter({
+      stateRoot,
+      fetchImpl: (...a) => fake.fetch(...a),
+      recoveryProvider: async () => ({
+        action: 'fence-and-relaunch',
+        decidedBy: 'coordinator:test',
+        schedulerEpoch: 9,
+        schedulerToken: 'sched-tok-9',
+      }),
+    });
+    const { ctx } = makeCtx({ cwd, ...TASK });
+    ctx.runtime = { sessionId: held.sessionId, sessionParams: held };
+    const res = await withProvider.execute(ctx);
+    assert.equal(res.sessionParams.quarantined, true, '404 holds despite provider approval');
+    assert.equal(fake.dispatchCount, 1);
+  });
+
+  it('provider adopt re-attaches a verified attempt without spawning', async () => {
     const first = (await wake()).res;
     const id = first.sessionParams.attemptId;
     const receipt = fake.attempts.get(id);
     fake.advanceAttempt(id, 'running');
     fake.attempts.delete(id);
     const q = (await wake({}, nextRuntime(first))).res.sessionParams;
-    assert.equal(q.quarantined, true);
     fake.attempts.set(id, { ...receipt, state: 'running' });
-    const res = (
-      await wake(
-        {
-          context: {
-            recoveryDecision: {
-              action: 'adopt-attempt',
-              attemptId: id,
-              decidedBy: 'owner:alice',
-              proof: { kind: 'lease-fenced', detail: 'scheduler confirms single active generation' },
-            },
-          },
-        },
-        nextRuntime({ sessionParams: q }),
-      )
-    ).res;
+    const withProvider = createServerAdapter({
+      stateRoot,
+      fetchImpl: (...a) => fake.fetch(...a),
+      recoveryProvider: async () => ({ action: 'adopt-attempt', attemptId: id, decidedBy: 'op:test' }),
+    });
+    const { ctx } = makeCtx({ cwd, ...TASK });
+    ctx.runtime = { sessionId: q.sessionId, sessionParams: q };
+    const res = await withProvider.execute(ctx);
     assert.equal(res.sessionParams.quarantined, false);
     assert.equal(res.sessionParams.attemptId, id);
     assert.equal(res.sessionParams.status, 'running');
@@ -176,8 +221,6 @@ describe('recovery decision authorization', () => {
     assert.equal(ambiguous.exitCode, 1);
     assert.equal(fake.dispatchCount, 1);
 
-    // Operator edits the instruction, then retries: the journaled intent no
-    // longer matches — refuse instead of dispatching either version.
     const { ctx } = makeCtx({ cwd, ...TASK, config: { instruction: 'CHANGED after crash' } });
     const refused = await restarted.execute(ctx);
     assert.equal(refused.sessionParams.quarantined, true);

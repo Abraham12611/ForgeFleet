@@ -12,7 +12,7 @@
 //   journal/pending/<p>_<t>_<r>.json      in-flight first-wake intent
 //   journal/quarantine/<p>_<t>_<r>.json   ambiguous session awaiting owner
 // Writes are atomic (tmp file + rename). Quarantine records are never
-// auto-cleared: only an explicit recoveryDecision resolves them.
+// auto-cleared: only the out-of-band recovery path resolves them.
 //
 // Durability caveat: the default stateRoot lives under the OS temp dir and
 // survives process crashes, not host reboots or disk loss. Production

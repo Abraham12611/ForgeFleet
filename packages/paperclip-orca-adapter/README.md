@@ -76,16 +76,19 @@ heartbeat.
 5. **Ambiguous fate** (bridge 404 on reconcile, corrupt journal, changed
    input after a crash): the key is QUARANTINED (`status: unknown`,
    `exitCode: null`), never silently cleared — a fresh session could
-   duplicate a still-live worker. The Paperclip task context is UNTRUSTED
-   for recovery, so bare strings authorize nothing. Release requires a
-   structured `context.recoveryDecision`
-   `{action, decidedBy, schedulerEpoch, schedulerToken?, proof:{kind, detail}}`
-   plus bridge-verified old-worker fate: relaunch is refused while the
-   original is live, needs a strictly fresh scheduler epoch + token, and a
-   404 pairs only with `lease-fenced`/`operator-attested` proof; adoption
-   re-attaches a GET-verified attempt and never spawns. Every resolution is
-   written to the audit journal and the new session cursor. Journal re-posts
-   always send the exact original bytes and refuse on any input drift.
+   duplicate a still-live worker. NOTHING in the Paperclip task context can
+   release it: no string, no object, no proof-shaped data (all ignored, all
+   tested). The default build holds terminally; recovery is an explicit
+   out-of-band owner action. An optional constructor-injected
+   `recoveryProvider` (operator wiring only — e.g. a future authenticated
+   bridge `GET /v1/attempts/:id/recovery-decision` route, which is NOT in the
+   frozen v0.1 contract and needs E05 review) may supply a decision, which is
+   STILL gated on bridge-verified fate: relaunch is refused beside a live
+   original and NEVER on a 404 (absence is not proven here — only a terminal
+   receipt, or the future route, lifts that); adoption re-attaches a
+   GET-verified attempt and never spawns. Every resolution is audit-logged.
+   Journal re-posts always send the exact original bytes and refuse on any
+   input drift or tamper.
 6. Operational failures use the pinned `errorMessage` result channel; only
    malformed execution contexts throw (`invalid_context`). `cancel` requires
    `context.cancel.{reason, approvedBy}`; `sendMessage` requires a stable

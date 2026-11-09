@@ -23,9 +23,13 @@
 //                  (sync-back failure returns workspace_finalize=failed and
 //                  reports NO completion, gating dependent work)
 //   ambiguous   -> QUARANTINE (never silent clearSession): the fate of the
-//                  original dispatch is unknown, so only an explicit,
-//                  fate-verified recoveryDecision may fence-and-relaunch
-//                  or adopt. Bare strings authorize nothing.
+//                  original dispatch is unknown. NOTHING in the Paperclip
+//                  task context can release it — no string, no object, no
+//                  proof-shaped data. Release happens only through the
+//                  out-of-band recoveryProvider (constructor-injected, off
+//                  by default), still gated on bridge-verified old-worker
+//                  fate, and a 404/UNKNOWN original NEVER relaunches on this
+//                  adapter's own evidence: 404 is not proof of absence.
 //
 // Crash-after-acceptance: dispatch intent (idempotency key + exact payload)
 // is journaled atomically BEFORE POSTing. On POST failure the staging dir
@@ -97,6 +101,18 @@ function errorResult(errorMessage, sessionParams = null, sessionId = null) {
 }
 
 export function createServerAdapter(options = {}) {
+  // Out-of-band recovery authority. `recoveryProvider`, when present, is a
+  // function the OPERATOR wires at construction (opaque handle, env/file,
+  // or — once the bridge serves it — a client of the proposed authenticated
+  // `GET /v1/attempts/:id/recovery-decision` route, which is NOT part of the
+  // frozen v0.1 contract and must go through E05 contract review first).
+  // It is NEVER read from Paperclip task/config/context input: anything
+  // arriving there is untrusted data. Default null means quarantine is
+  // terminal — the adapter will never self-release, and recovery becomes an
+  // explicit out-of-band owner action (inspect journal/audit, confirm fate
+  // on the host, start a new run or retire the key).
+  const recoveryProvider =
+    typeof options.recoveryProvider === 'function' ? options.recoveryProvider : null;
   const stateRoot = options.stateRoot ?? defaultStateRoot();
   const journal = createJournal(stateRoot);
   const bridge =
@@ -275,7 +291,6 @@ export function createServerAdapter(options = {}) {
 
   // ---- quarantine ----------------------------------------------------------
   const NIL_ATTEMPT = '00000000-0000-4000-8000-000000000000';
-  const PROOF_KINDS = new Set(['attempt-terminal', 'lease-fenced', 'operator-attested']);
 
   async function quarantineSession(t, session, { reason, detail }) {
     const key = journalKeyFor(t.projectId, t.taskId, t.runId);
@@ -307,21 +322,21 @@ export function createServerAdapter(options = {}) {
     await log(
       t,
       `quarantined: ${detail}. Ambiguous worker fate; no duplicate launched. ` +
-        `Release requires a structured context.recoveryDecision ` +
-        `{action, decidedBy, schedulerEpoch, schedulerToken?, proof:{kind, detail}} ` +
-        `with verified old-worker fate; bare strings authorize nothing.`,
+        `Release requires the out-of-band recovery provider (constructor-` +
+        `injected, off by default) with bridge-verified old-worker fate; ` +
+        `task input authorizes nothing.`,
     );
     return toResult(quarantined, { exitCode: null });
   }
 
   // Session-less quarantine notice: no cursor exists to resume, so there is
-  // nothing to return except the hold itself. Paperclip must wake again with
-  // a recoveryDecision to proceed.
+  // nothing to return except the hold itself. Only the out-of-band provider
+  // path can proceed from here.
   async function holdWithoutSession(t, qrec) {
     await log(
       t,
       `quarantined (${qrec?.reason ?? 'unknown'}): ${qrec?.detail ?? 'ambiguous worker fate'}. ` +
-        `No dispatch will occur until a structured context.recoveryDecision resolves this key.`,
+        `No dispatch will occur without an out-of-band recovery provider resolving this key.`,
     );
     return {
       exitCode: null,
@@ -334,8 +349,8 @@ export function createServerAdapter(options = {}) {
     };
   }
 
-  // Synthesize a session cursor from a quarantine record so a session-less
-  // wake carrying a recoveryDecision can be resolved against durable state.
+  // Synthesize a session cursor from a quarantine record so the provider
+  // path can resolve a session-less wake against durable state.
   function recordSessionFromQuarantine(t, qrec) {
     const fencingEpoch =
       Number.isInteger(qrec?.fencingEpoch) && qrec.fencingEpoch >= 1 ? qrec.fencingEpoch : 1;
@@ -365,45 +380,34 @@ export function createServerAdapter(options = {}) {
     };
   }
 
-  // Release a quarantined key. The Paperclip task context is UNTRUSTED for
-  // recovery, so a bare string can never authorize this path: `decision`
-  // must be a structured recoveryDecision, and the old worker's fate is
-  // verified against the bridge before any new dispatch.
-  //
-  // Signature note: cryptographic authorization of recovery decisions is
-  // enforced by the coordinator/policy layer (E07), not by this adapter —
-  // there is no key material here. The adapter enforces the structural gate
-  // (fresh scheduler epoch + token for relaunch, decidedBy + proof always),
-  // refuses to run a second worker beside a live one, and records every
-  // resolution in the audit journal and the new session cursor.
+  // Release a quarantined key. Authority NEVER comes from Paperclip task
+  // input: the decision is obtained ONLY from the out-of-band
+  // recoveryProvider injected at construction (default: none, quarantine
+  // terminal). Even a provider decision is still gated on bridge-verified
+  // old-worker fate — a live original blocks relaunch unconditionally, and
+  // a 404/UNKNOWN original never relaunches on this adapter's own evidence.
   async function resolveRecovery(t, session, qrec, key) {
-    const d = t.recoveryDecision;
     const hold = async (why) => {
       await log(t, `recovery refused (${why}); quarantine holds, no worker launched`);
       return toResult({ ...session, runCount: session.runCount + 1 }, { exitCode: null });
     };
-    if (!d || typeof d !== 'object') return hold('missing recoveryDecision');
+    if (!recoveryProvider) {
+      return hold('no out-of-band recovery provider; quarantine terminal');
+    }
+    let d;
+    try {
+      d = await recoveryProvider({ key, record: qrec, session });
+    } catch {
+      return hold('recovery provider failed; holding');
+    }
+    if (!d || typeof d !== 'object') return hold('provider returned no decision; holding');
     if (d.action !== 'fence-and-relaunch' && d.action !== 'adopt-attempt') {
       return hold(`unknown action '${d?.action ?? ''}'`);
     }
-    if (typeof d.decidedBy !== 'string' || d.decidedBy.length === 0) {
-      return hold('decidedBy actor required');
-    }
-    if (
-      !d.proof ||
-      typeof d.proof !== 'object' ||
-      !PROOF_KINDS.has(d.proof.kind) ||
-      typeof d.proof.detail !== 'string' ||
-      d.proof.detail.length === 0
-    ) {
-      return hold('proof {kind, detail} required');
-    }
-    const auditBase = {
-      action: d.action,
-      decidedBy: d.decidedBy,
-      decidedAt: typeof d.decidedAt === 'string' ? d.decidedAt : null,
-      proof: { kind: d.proof.kind, detail: d.proof.detail },
-    };
+    // decidedBy is an UNAUTHENTICATED audit label, never authority: the
+    // authority is the provider channel itself plus bridge verification.
+    const decidedBy = typeof d.decidedBy === 'string' && d.decidedBy ? d.decidedBy : 'unknown-provider';
+    const auditBase = { action: d.action, decidedBy };
 
     if (d.action === 'adopt-attempt') {
       const target = d.attemptId;
@@ -416,10 +420,12 @@ export function createServerAdapter(options = {}) {
       } catch {
         return hold('adopt fate check failed; holding');
       }
+      // Re-attach only to a bridge-verified attempt: adoption spawns
+      // nothing, so it cannot duplicate — but it must still be real.
       if (receipt === null) return hold(`adopt target ${target} unknown; holding`);
       journal.clearQuarantine(key);
       journal.writeAudit(key, { ...auditBase, attemptId: target, schedulerEpoch: session.fencingEpoch });
-      await log(t, `adopted attempt ${target} after explicit decision by ${d.decidedBy}`);
+      await log(t, `adopted bridge-verified attempt ${target} via out-of-band decision`);
       const adopted = {
         ...session,
         quarantined: false,
@@ -430,8 +436,7 @@ export function createServerAdapter(options = {}) {
     }
 
     // fence-and-relaunch: needs a FRESH granted epoch (strictly above the
-    // fenced generation — the scheduler's monotonic lease is the fencing
-    // proof) plus its token. Anything stale authorizes nothing.
+    // fenced generation) plus its token. Anything stale authorizes nothing.
     const epoch = d.schedulerEpoch;
     if (!Number.isInteger(epoch) || epoch <= session.fencingEpoch) {
       return hold('fresh schedulerEpoch above the fenced generation required');
@@ -439,22 +444,26 @@ export function createServerAdapter(options = {}) {
     if (typeof d.schedulerToken !== 'string' || d.schedulerToken.length === 0) {
       return hold('schedulerToken for the new generation required');
     }
-    // Fate check on the ORIGINAL attempt before any new dispatch.
+    // Fate check on the ORIGINAL attempt before any new dispatch. A 404 or
+    // UNKNOWN original NEVER relaunches here: 404 is not proof of absence,
+    // and only bridge-verified termination (a terminal receipt, or — once
+    // it exists — the authenticated recovery-decision route) can lift that.
+    // Today that means: relaunch requires a terminal original receipt.
     const originalId = session.attemptId;
-    if (originalId && originalId !== NIL_ATTEMPT) {
-      let receipt;
-      try {
-        receipt = await bridge.getAttempt(originalId);
-      } catch {
-        return hold('original fate check failed; holding');
-      }
-      if (receipt !== null && !isTerminalAttemptState(receipt.state)) {
-        return hold(`original attempt ${originalId} is ${receipt.state}; refusing a second worker`);
-      }
-      if (receipt === null && d.proof.kind === 'attempt-terminal') {
-        return hold('proof claims terminal but the bridge has no record; contradiction holds');
-      }
-      // receipt terminal, or 404 + lease-fenced/operator-attested: proceed.
+    if (!originalId || originalId === NIL_ATTEMPT) {
+      return hold('no verifiable original attempt; holding');
+    }
+    let receipt;
+    try {
+      receipt = await bridge.getAttempt(originalId);
+    } catch {
+      return hold('original fate check failed; holding');
+    }
+    if (receipt === null) {
+      return hold(`original attempt ${originalId} unknown; 404 is not proof of absence`);
+    }
+    if (!isTerminalAttemptState(receipt.state)) {
+      return hold(`original attempt ${originalId} is ${receipt.state}; refusing a second worker`);
     }
     const relaunched = await dispatchAttempt(
       { ...t, lease: { fencingEpoch: epoch, leaseToken: d.schedulerToken, provenance: 'scheduler' } },
@@ -467,7 +476,7 @@ export function createServerAdapter(options = {}) {
     await log(
       t,
       `fenced generation ${session.fencingEpoch}; relaunched at epoch ${epoch} ` +
-        `by ${d.decidedBy} (attempt ${relaunched.sessionParams.attemptId})`,
+        `(attempt ${relaunched.sessionParams.attemptId})`,
     );
     return {
       ...relaunched,
@@ -501,8 +510,9 @@ export function createServerAdapter(options = {}) {
         const qrec = journal.readQuarantine(key);
         if (qrec && qrec.reason !== 'intent-changed') {
           // A live ambiguity (unknown attempt, corrupt journal) blocks ALL
-          // fresh wakes: only an explicit recoveryDecision may proceed.
-          if (t.recoveryDecision) {
+          // fresh wakes. resolveRecovery consults ONLY the out-of-band
+          // provider (default: none, holds); task input is never authority.
+          if (recoveryProvider) {
             try {
               return await resolveRecovery(t, recordSessionFromQuarantine(t, qrec), qrec, key);
             } catch (err) {
@@ -569,8 +579,9 @@ export function createServerAdapter(options = {}) {
         }
         if (journal.readQuarantine(key)) {
           // Intent-drift quarantine without pending intent (or any other
-          // leftover): fail closed, decision required.
-          if (t.recoveryDecision) {
+          // leftover): fail closed. Only the out-of-band provider path may
+          // proceed; task input is never authority.
+          if (recoveryProvider) {
             try {
               return await resolveRecovery(
                 t,
@@ -604,7 +615,9 @@ export function createServerAdapter(options = {}) {
         return { exitCode: null, signal: null, timedOut: false, sessionParams: null, clearSession: true };
       }
       if (session.quarantined) {
-        if (t.recoveryDecision) {
+        // Only the out-of-band provider path may proceed; task input — any
+        // string, object, or proof-shaped data — is never authority.
+        if (recoveryProvider) {
           try {
             return await resolveRecovery(t, session, journal.readQuarantine(key), key);
           } catch (err) {
@@ -614,7 +627,8 @@ export function createServerAdapter(options = {}) {
         const record = journal.readQuarantine(key);
         await log(
           t,
-          `session quarantined (${record?.reason ?? 'unknown'}); awaiting structured recoveryDecision`,
+          `session quarantined (${record?.reason ?? 'unknown'}); quarantine terminal without ` +
+            `an out-of-band recovery provider — owner action required`,
         );
         return toResult({ ...session, runCount: session.runCount + 1 }, { exitCode: null });
       }

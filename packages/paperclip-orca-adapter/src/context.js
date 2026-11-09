@@ -84,13 +84,11 @@ export function readExecutionContext(ctx) {
   const cwd = requiredString(context.cwd, 'context.cwd');
 
   const lease = readLease(context);
-  // Recovery input: a STRUCTURED decision object only (see server/index.js).
-  // A bare string here authorizes nothing — the Paperclip task context is
-  // untrusted for recovery, so magic strings cannot launch workers.
-  const recoveryDecision =
-    context.recoveryDecision && typeof context.recoveryDecision === 'object'
-      ? context.recoveryDecision
-      : null;
+  // Recovery input: the task context carries NO recovery authority at all.
+  // Any `recoveryDecision`/`quarantineResolution` field arriving here is
+  // untrusted data and is deliberately dropped, never read. Release of a
+  // quarantined key happens only through the out-of-band recoveryProvider
+  // injected at adapter construction (see server/index.js), or not at all.
   const onLog = typeof ctx.onLog === 'function' ? ctx.onLog : null;
 
   return {
@@ -105,7 +103,6 @@ export function readExecutionContext(ctx) {
     repositoryId: asString(config.repositoryId ?? context.repositoryId),
     artifactMarker: asString(context.artifactMarker),
     lease,
-    recoveryDecision,
     cancel: context.cancel && typeof context.cancel === 'object' ? context.cancel : null,
     message: context.message && typeof context.message === 'object' ? context.message : null,
     agent: ctx.agent && typeof ctx.agent === 'object' ? ctx.agent : null,
