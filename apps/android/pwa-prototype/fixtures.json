@@ -1,0 +1,98 @@
+{
+  "meta": {
+    "label": "FIXTURE — deterministic mock data for the FF-019 360px walkthrough. Not live backend state.",
+    "spec": "docs/02-experience/mobile-app-map.md#mobile-acceptance-walkthrough"
+  },
+  "project": {
+    "id": "demo",
+    "name": "Harbor Pilot",
+    "repo": "example/harbor-pilot",
+    "branch": "develop",
+    "budget": { "spent_usd": 4.2, "ceiling_usd": 25.0 }
+  },
+  "home": {
+    "verified": ["3 tasks verified against acceptance evidence"],
+    "blocked": ["1 decision needs the owner (merge policy)"],
+    "next": ["Answer the merge-policy question in the Inbox"]
+  },
+  "tasks": [
+    {
+      "id": "t1", "title": "Ingest context manifest", "state": "verified",
+      "deps": [], "detail": "Manifest v3 pinned; sources cited in chat.",
+      "attempt": { "id": "att-101", "age_s": 400, "source": "fixture" }
+    },
+    {
+      "id": "t2", "title": "Plan task DAG", "state": "verified",
+      "deps": ["t1"], "detail": "No cycles; readiness validator passed.",
+      "attempt": { "id": "att-102", "age_s": 320, "source": "fixture" }
+    },
+    {
+      "id": "t3", "title": "Dispatch worker A", "state": "running",
+      "deps": ["t2"], "detail": "Worker rebuilding the bridge adapter spike.",
+      "attempt": { "id": "att-103", "age_s": 12, "source": "fixture" }
+    },
+    {
+      "id": "t4", "title": "Review PR #4821", "state": "blocked",
+      "deps": ["t3"], "detail": "Waiting on owner: merge-policy question.",
+      "attempt": null
+    },
+    {
+      "id": "t5", "title": "Reconcile after restart", "state": "failed",
+      "deps": ["t3"], "detail": "Lease fence check failed once; safe retry available.",
+      "attempt": { "id": "att-104", "age_s": 900, "source": "fixture" }
+    }
+  ],
+  "messages": [
+    { "from": "owner", "text": "Goal: get the harbor pilot repo to a reviewed PR on develop.", "citations": [], "delivery": "acknowledged", "age_s": 1800 },
+    { "from": "coordinator", "text": "Plan proposed: 5 tasks, one dependency chain t1 → t2 → t3 → t4. Context manifest v3 used.", "citations": ["context-manifest v3"], "delivery": "acknowledged", "age_s": 1700 },
+    { "from": "worker", "text": "Adapter spike hit an API discrepancy; lead is assessing scope.", "citations": [], "delivery": "acknowledged", "age_s": 300 },
+    { "from": "system", "text": "Sleep mode is OFF. Noncritical questions would queue if enabled.", "citations": [], "delivery": "sent", "age_s": 60 }
+  ],
+  "decision": {
+    "id": "d1",
+    "title": "Allow merge of PR #4821 into develop?",
+    "reason": "Worker requests merge; policy requires owner approval for merges touching the adapter surface.",
+    "blocked_tasks": ["t4"],
+    "choices": ["Approve merge to develop", "Request changes", "Defer until CI is green"],
+    "recommended": "Defer until CI is green",
+    "risk": "Medium: one required check is failing; merging now bypasses the review gate.",
+    "default_on_timeout": "No approval granted on timeout. Dependent tasks stay blocked.",
+    "last_updated_age_s": 240,
+    "source_agent": "reviewer-agent (fixture)"
+  },
+  "pr": {
+    "id": "4821",
+    "title": "Adapter spike: versioned capability probe",
+    "head_sha": "f1xture0",
+    "verdict": "changes-requested",
+    "merge_blocked_reason": "Blocked: 1 of 12 required checks failing, plus 1 unresolved review thread.",
+    "checks": [
+      { "name": "build", "status": "pass" },
+      { "name": "unit", "status": "pass" },
+      { "name": "contract-openapi", "status": "pass" },
+      { "name": "contract-events", "status": "pass" },
+      { "name": "policy-gate", "status": "pass" },
+      { "name": "review-verdict", "status": "pass" },
+      { "name": "secret-scan", "status": "pass" },
+      { "name": "license-check", "status": "pass" },
+      { "name": "link-check", "status": "pass" },
+      { "name": "responsive-360", "status": "pass" },
+      { "name": "recovery-drill", "status": "pass" },
+      { "name": "integration-fake-orca", "status": "fail" }
+    ]
+  },
+  "agents": [
+    { "id": "w-a", "name": "Worker A", "model": "fixture-model", "task": "t3", "state": "busy", "heartbeat_age_s": 9 },
+    { "id": "w-b", "name": "Worker B", "model": "fixture-model", "task": "t5", "state": "retry_wait", "heartbeat_age_s": 75 },
+    { "id": "w-c", "name": "Worker C", "model": "fixture-model", "task": null, "state": "unknown", "heartbeat_age_s": 420 }
+  ],
+  "files": [
+    { "name": "PRD.md", "status": "extracted", "version": "v3" },
+    { "name": "bridge-openapi.yaml", "status": "extracted", "version": "v3" },
+    { "name": "photo.png", "status": "failed", "version": null }
+  ],
+  "sleep": {
+    "enabled": false,
+    "note": "Independent tasks keep running; gated operations still need the owner."
+  }
+}
