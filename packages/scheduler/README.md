@@ -54,6 +54,16 @@ and distributed admission alongside it: feed `aggregateHostCapacity`'s
 dispatch to `selectHost`'s `hostId` and record the lease holder as
 `<hostId>:<attemptId>` so fencing stays per task.
 
+## Status and limits (FF-026)
+
+`HostRegistry` is an **in-memory policy model**, not a deployment: it holds
+no durable rows, performs no Tailscale identity verification, and talks to
+no hosts. Join tokens here are opaque test handles; real enrollment,
+provider-limit enforcement, and cross-host recovery must remain **disabled**
+until verified Tailscale identity, durable leases, and proven recovery
+exist. This package is the v1.1 fixture/policy layer — it is not evidence
+for 200 active agents, measured capacity, or provider pricing.
+
 ## Contract sources (FF-026)
 
 - Capacity model: `docs/03-architecture/scaling-and-recovery.md`
