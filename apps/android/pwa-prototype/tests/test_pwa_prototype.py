@@ -121,6 +121,12 @@ class ServiceWorkerTest(unittest.TestCase):
     def test_versioned_cache(self):
         self.assertRegex(SW, r'ff019-shell-v\d+')
 
+    def test_never_caches_network_responses(self):
+        # Privacy boundary (PR #47 review): only the install-time fixture
+        # shell may be written to cache; no fetch response may be stored.
+        self.assertNotIn("cache.put", SW)
+        self.assertNotIn("cache.add(", SW)
+
 
 class RouterCoverageTest(unittest.TestCase):
     EXPECTED = ["#/home", "#/projects", "#/project/demo", "#/project/demo/chat",

@@ -52,6 +52,18 @@ Plus a headless-Chrome 360px pass (see PR evidence): per-route
 `screenshot` at 360×800 and an overflow assertion
 (`document.scrollingElement.scrollWidth <= 360`).
 
+## Privacy / caching boundary (coordinator condition on PR #47)
+
+- `sw.js` precaches the fixture app shell only (HTML/CSS/JS/JSON/manifest);
+  the `fetch` handler never `cache.put`s responses, so no API payload is
+  ever stored. Verified by `ServiceWorkerTest` (shell entries exist) —
+  there is no code path that writes a network response to cache.
+- This prototype must remain outside authenticated app routes until an
+  explicit privacy/caching review: do not mount it under the real app,
+  point it at private APIs, or add credentials to it.
+- Owner-directed manual mobile UI tests are still required before any
+  product claim; the `python3 -m http.server` steps above are the harness.
+
 ## Explicit non-goals (later issues)
 
 - Capacitor AAB, device testing, push notifications → FF-025 (v1.1).
