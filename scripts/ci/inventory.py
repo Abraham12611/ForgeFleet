@@ -44,18 +44,20 @@ REQUIRED = [
 NODE_ROOTS = [
     "packages/coordinator",
     "packages/scheduler",
+    "packages/events",
     "services/orca-bridge",
     "apps/web",
 ]
 NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
 
 # Planned workstream dirs that do not exist yet: reported, never passing.
+# packages/events graduated here when FF-006 landed tested envelope code;
+# E18/coordinator ack requested on this entry (PR #37).
 FUTURE_MODULES = [
     "packages/policy",
     "packages/messaging",
     "packages/context",
     "packages/telemetry",
-    "packages/events",
 ]
 
 # (label, argv, min_tests): argv runs with cwd=ROOT, must print unittest stats.
