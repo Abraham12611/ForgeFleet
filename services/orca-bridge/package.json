@@ -1,0 +1,14 @@
+{
+  "name": "@forgefleet/orca-bridge",
+  "version": "0.1.0",
+  "description": "ForgeFleet Orca bridge daemon: runtime, dispatch, persistence (FF-006).",
+  "type": "module",
+  "scripts": {
+    "test": "node --test src/persistence/attempt-store.test.ts src/runtime/discovery.test.ts"
+  },
+  "engines": {
+    "node": ">=24.11"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
