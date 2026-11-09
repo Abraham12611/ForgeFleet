@@ -64,8 +64,6 @@ FUTURE_MODULES = [
 PYTHON_SUITES = [
     ("packages/bridge-contracts/tests",
      [sys.executable, "packages/bridge-contracts/tests/test_contract.py"], 32),
-    ("tests/",
-     [sys.executable, "tests/test_ff009_crash_reconciliation.py"], 5),
     ("apps/android/pwa-prototype/tests",
      [sys.executable, "-m", "unittest", "discover",
       "-s", "apps/android/pwa-prototype/tests", "-t", "."], 18),
@@ -75,6 +73,14 @@ PYTHON_SUITES = [
     ("apps/android/tests",
      [sys.executable, "apps/android/tests/test_android_packaging.py"], 7),
 ]
+
+# Minimum tests per tests/test_*.py file; unlisted files floor at 1 so an
+# empty-but-passing file cannot slip through when new test files land.
+TESTS_DIR_FLOORS = {
+    "test_ff009_crash_reconciliation.py": 5,
+    "test_ci_suite_discovery.py": 15,
+}
+TESTS_DIR_DEFAULT_FLOOR = 1
 
 STDERR_TAIL_LINES = 25
 
@@ -88,39 +94,117 @@ def tail(text: str, n: int = STDERR_TAIL_LINES) -> str:
     return "\n".join(lines[-n:])
 
 
-def discover_node_files(root: str) -> list[str]:
-    base = ROOT / root
+def discover_node_files(root: str, base: Path = ROOT) -> list[str]:
+    path = base / root
     found: list[str] = []
     for pattern in NODE_TEST_GLOBS:
-        found.extend(str(p) for p in base.rglob(pattern) if p.is_file())
+        found.extend(str(p) for p in path.rglob(pattern) if p.is_file())
     return sorted(found)
 
 
-def node_suites() -> list[tuple[str, str, str]]:
+def is_vitest_managed(root: str, base: Path = ROOT) -> bool:
+    """True when this suite root owns its *.test.ts via Vitest.
+
+    Vitest files look identical to node:test files by name, so the runner is
+    decided by ownership evidence: a vitest config/workspace file, or a
+    vitest entry in the root package.json devDependencies. Without such
+    evidence (e.g. services/orca-bridge today) *.test.ts stays on node --test.
+    """
+    path = base / root
+    if (not path.is_dir()
+            or next(path.glob("vitest.config.*"), None) is not None
+            or next(path.glob("vitest.workspace.*"), None) is not None):
+        return path.is_dir()
+    pkg = path / "package.json"
+    if pkg.is_file():
+        try:
+            dev = json.loads(pkg.read_text(encoding="utf-8")).get(
+                "devDependencies", {})
+            if isinstance(dev, dict) and "vitest" in dev:
+                return True
+        except (json.JSONDecodeError, OSError):
+            pass
+    return False
+
+
+def split_node_files(root: str, base: Path = ROOT) -> tuple[list, bool]:
+    """Partition a suite's test files by runner.
+
+    Returns (node_test_files, vitest_managed). When vitest_managed, *.test.ts
+    files belong to `npm test` and must never be fed to bare `node --test`.
+    """
+    files = discover_node_files(root, base)
+    if not is_vitest_managed(root, base):
+        return files, False
+    node_files = [f for f in files if not f.endswith(".test.ts")]
+    return node_files, True
+
+
+def node_verdict(returncode: int, output: str, nfiles: int = 0):
+    """Verdict for one `node --test` invocation. Zero tests run is a FAIL."""
+    if returncode != 0:
+        return "FAIL", tail(output)
+    match = re.search(r"[ℹ#] pass (\d+)", output)
+    if match is None:
+        return "FAIL", "unparseable node --test output (fail closed)\n" + tail(output)
+    passed = int(match.group(1))
+    if passed == 0:
+        return "FAIL", f"zero tests executed across {nfiles} file(s) (fail closed)"
+    return "PASS", f"{passed} tests pass across {nfiles} file(s)"
+
+
+def run_vitest_suite(root: str, base: Path = ROOT):
+    """Run a Vitest-managed suite via its own package runner.
+
+    Installs dependencies (ci when a lockfile exists) then runs `npm test`.
+    Exit 0 plus at least one passed test is required; anything else fails.
+    """
+    npm = shutil.which("npm")
+    if npm is None:
+        return "UNCOVERED", "npm not installed on runner"
+    path = base / root
+    lock = path / "package-lock.json"
+    install = [npm, "ci", "--prefix", str(path)] if lock.is_file() else \
+        [npm, "install", "--no-audit", "--no-fund", "--prefix", str(path)]
+    proc = run(install, cwd=ROOT)
+    if proc.returncode != 0:
+        return "FAIL", "dependency install failed\n" + tail(proc.stdout + proc.stderr)
+    proc = run([npm, "test", "--prefix", str(path)], cwd=ROOT)
+    output = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        return "FAIL", tail(output)
+    match = re.search(r"Tests\s+(\d+)\s+passed", output)
+    if match is None:
+        return "FAIL", "unrecognized vitest output (fail closed)\n" + tail(output)
+    if int(match.group(1)) == 0:
+        return "FAIL", "vitest ran zero tests (fail closed)"
+    return "PASS", f"vitest: {match.group(1)} tests passed"
+
+
+def node_suites(base: Path = ROOT) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     node = shutil.which("node")
     for root in NODE_ROOTS:
-        path = ROOT / root
+        path = base / root
         if not path.is_dir():
             rows.append((root, "ABSENT", "not on this branch; uncovered"))
-            continue
-        files = discover_node_files(root)
-        if not files:
-            rows.append((root, "PRESENT-EMPTY",
-                         "dir exists but holds no *.test.{js,mjs,cjs,ts}; fail closed"))
             continue
         if node is None:
             rows.append((root, "UNCOVERED", "Node.js not installed on runner"))
             continue
-        proc = run([node, "--test", *files], cwd=ROOT)
-        if proc.returncode == 0:
-            match = re.search(r"[ℹ#] pass (\d+)", proc.stdout + proc.stderr)
-            detail = f"{match.group(1)} tests pass across {len(files)} file(s)" if match else \
-                f"exit 0 across {len(files)} file(s)"
-            rows.append((root, "PASS", detail))
-        else:
-            detail = tail(proc.stdout + "\n" + proc.stderr)
-            rows.append((root, "FAIL", detail))
+        files, vitest = split_node_files(root, base)
+        if vitest:
+            status, detail = run_vitest_suite(root, base)
+            rows.append((root, status, detail))
+            continue
+        if not files:
+            rows.append((root, "PRESENT-EMPTY",
+                         "dir exists but holds no *.test.{js,mjs,cjs,ts}; fail closed"))
+            continue
+        proc = run([node, "--test", *files], cwd=base)
+        status, detail = node_verdict(proc.returncode,
+                                      proc.stdout + proc.stderr, len(files))
+        rows.append((root, status, detail))
     return rows
 
 
@@ -129,33 +213,48 @@ def parse_unittest_count(output: str) -> "int | None":
     return int(match.group(1)) if match else None
 
 
-def python_suites() -> list[tuple[str, str, str]]:
+def unittest_verdict(output: str, returncode: int, minimum: int):
+    """Verdict for one unittest run. Exit 0 + OK + count floor required."""
+    count = parse_unittest_count(output)
+    ok_line = re.search(r"^OK", output, re.MULTILINE) is not None
+    if returncode == 0 and ok_line and count is not None and count >= minimum:
+        return True, f"{count} tests OK (floor {minimum})"
+    reason = (f"exit={returncode}, ok={ok_line}, "
+              f"ran={count}, floor={minimum}")
+    return False, reason + "\n" + tail(output)
+
+
+def python_suites(base: Path = ROOT) -> list[tuple[str, str, str]]:
     rows: list[tuple[str, str, str]] = []
     for label, argv, minimum in PYTHON_SUITES:
-        proc = run(argv, cwd=ROOT)
-        output = proc.stdout + proc.stderr
-        count = parse_unittest_count(output)
-        ok_line = re.search(r"^OK", output, re.MULTILINE) is not None
-        if proc.returncode == 0 and ok_line and count is not None and count >= minimum:
-            rows.append((label, "PASS", f"{count} tests OK (floor {minimum})"))
-        else:
-            reason = (f"exit={proc.returncode}, ok={ok_line}, "
-                      f"ran={count}, floor={minimum}")
-            rows.append((label, "FAIL", reason + "\n" + tail(output)))
+        proc = run(argv, cwd=base)
+        ok, detail = unittest_verdict(proc.stdout + proc.stderr,
+                                      proc.returncode, minimum)
+        rows.append((label, "PASS" if ok else "FAIL", detail))
+    tests_dir = base / "tests"
+    if tests_dir.is_dir():
+        for case in sorted(tests_dir.glob("test_*.py")):
+            minimum = TESTS_DIR_FLOORS.get(case.name, TESTS_DIR_DEFAULT_FLOOR)
+            proc = run([sys.executable, str(case)], cwd=base)
+            ok, detail = unittest_verdict(proc.stdout + proc.stderr,
+                                          proc.returncode, minimum)
+            rows.append((f"tests/{case.name}", "PASS" if ok else "FAIL", detail))
+    else:
+        rows.append(("tests/", "ABSENT", "directory not present; uncovered"))
     return rows
 
 
-def future_modules() -> list[tuple[str, str, str]]:
-    rows: list[tuple[str, str, str]] = []
-    for root in FUTURE_MODULES:
-        if not (ROOT / root).is_dir():
-            rows.append((root, "UNCOVERED",
-                         "planned workstream; no code on this branch"))
-        else:
-            files = discover_node_files(root)
-            rows.append((root, "PRESENT-UNWIRED" if files else "PRESENT-EMPTY",
-                         f"{len(files)} test file(s); add an explicit suite entry"))
-    return rows
+def module_row(root: str, base: Path = ROOT):
+    """Status for a planned workstream dir: absent is UNCOVERED, but a
+    present dir with no wired suite explicitly FAILS until tests are wired."""
+    if not (base / root).is_dir():
+        return "UNCOVERED", "planned workstream; no code on this branch"
+    return ("FAIL", "UNWIRED: directory exists but no suite is wired; "
+                    "wire its tests or remove the dir (fail closed)")
+
+
+def future_modules(base: Path = ROOT) -> list[tuple[str, str, str]]:
+    return [(root, *module_row(root, base)) for root in FUTURE_MODULES]
 
 
 def check_specs() -> tuple[bool, str]:

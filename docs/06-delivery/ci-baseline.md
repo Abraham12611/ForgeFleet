@@ -37,9 +37,35 @@ stderr (this caused the false `FAIL 'test failed'` rows on the first develop
 run while the suites themselves pass: coordinator 19, scheduler 30,
 orca-bridge 27, web 23). Failures print a bounded stderr tail (25 lines).
 
-Python suites assert exit 0, an `OK` verdict, and a minimum test count, so an
-empty collection cannot pass: bridge-contracts 32, `tests/` 5, PWA 18,
-Play gate 8, Android packaging 7.
+## Runner separation (node:test vs Vitest)
+
+`*.test.ts` files look identical under both runners, so the runner is decided
+per suite root by ownership evidence: a `vitest.config.*` /
+`vitest.workspace.*` file, or a `vitest` entry in that root's
+`package.json` devDependencies, routes the suite's `.test.ts` files to
+`npm install` (or `npm ci` with a lockfile) plus `npm test`. Those files are
+never fed to bare `node --test`. Without such evidence (e.g.
+`services/orca-bridge` today, whose `.test.ts` files import `node:test`),
+`.test.ts` stays on `node --test`. The routing is covered by maintained
+tests in `tests/test_ci_suite_discovery.py`.
+
+## Zero-test and unwired guards
+
+- Any executed suite reporting zero tests fails: node side requires
+  `pass >= 1` in the `node --test` summary; Python suites require exit 0, an
+  `OK` verdict, and a per-suite minimum count (bridge-contracts 32,
+  PWA 18, Play gate 8, Android packaging 7, `tests/test_*.py` files each
+  floored, default 1).
+- A present suite dir with no wired suite explicitly FAILs (`UNWIRED`)
+  until its tests are wired — existing code is never green-uncovered.
+  Absent future modules stay `UNCOVERED`, never passing.
+
+## Watch items (wire when they land)
+
+- Dedicated E05 generator tests beyond the freeze-sync coverage in
+  `test_contract.py`; integration-server test suites under
+  `services/orca-bridge`. Both become required checks on arrival, not
+  silent additions.
 
 ## Anti-false-green rule
 
@@ -69,9 +95,16 @@ FF-001/#31). Never mass-regenerate to silence drift; never disable the gate.
 ## CODEOWNERS and branch protection (repository owner action)
 
 `.github/CODEOWNERS` sets `* @Abraham12611`; CI verifies the file requires
-owner review on every path. Branch rulesets cannot be set by the connector —
-the owner must apply them; until then CI is advisory, not an enforcement
-boundary. Do not claim protection is enabled until the settings show it.
+owner review on every path, but the file alone enforces nothing. Targeted
+enforcement the owner must configure: required PR review with
+code-owner approval, the two `ci-baseline` status checks pinned to the fresh
+head SHA (strict checks — a stale green never merges), no bypass list
+entries for any engineer identity including `ImisiDahunsi4`, no direct pushes
+to `develop`/`main`, and coordinator-only merge with `main` additionally
+requiring owner authorization per #64. Branch rulesets cannot be set by the
+connector — the owner must apply them; until then CI is advisory, not an
+enforcement boundary. Do not claim protection is enabled until the settings
+show it.
 
 Recommended owner commands (replace checks if job names change):
 
