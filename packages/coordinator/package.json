@@ -1,0 +1,12 @@
+{
+  "name": "@forgefleet/coordinator",
+  "version": "0.1.0",
+  "description": "Coordinator task DAG/planner for ForgeFleet (FF-012). Bounded plan proposals, cycle rejection, goal-to-task traceability. Pure logic, zero dependencies.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
