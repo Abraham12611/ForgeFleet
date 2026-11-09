@@ -1,13 +1,27 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   buildEnvelope,
+  CONTRACT_VERSION,
   dedupeKey,
   EVENT_SCHEMA_VERSION,
   isStaleProgress,
   redactForLog,
   validateEnvelope,
 } from "./envelope.ts";
+
+const FIXTURES = join(
+  import.meta.dirname,
+  "..",
+  "..",
+  "..",
+  "packages",
+  "bridge-contracts",
+  "tests",
+  "fixtures",
+);
 
 const BASE = {
   eventType: "attempt.heartbeat",
@@ -31,47 +45,73 @@ describe("buildEnvelope", () => {
     assert.equal(event.taskId, "task_123");
   });
 
-  it("throws on missing required fields", () => {
+  it("does not mutate the caller input", () => {
+    const input = { ...BASE };
+    delete (input as { eventId?: string }).eventId;
+    buildEnvelope(input);
+    assert.ok(!("eventId" in input));
+  });
+
+  it("throws on missing required fields and undeclared event types", () => {
+    assert.throws(() => buildEnvelope({ ...BASE, projectId: "" }));
+    assert.throws(() => buildEnvelope({ ...BASE, occurredAt: "not-a-date" }));
+    assert.throws(() => buildEnvelope({ ...BASE, fencingEpoch: 0 }));
     assert.throws(() =>
-      buildEnvelope({ ...BASE, projectId: "" }),
+      buildEnvelope({ ...BASE, eventType: "attempt.superpower.v9" }),
     );
-    assert.throws(() =>
-      buildEnvelope({ ...BASE, occurredAt: "not-a-date" }),
-    );
-    assert.throws(() =>
-      buildEnvelope({ ...BASE, fencingEpoch: 0 }),
-    );
+  });
+
+  it("pins the frozen contract version", () => {
+    assert.equal(CONTRACT_VERSION, "0.1.0");
   });
 });
 
 describe("validateEnvelope", () => {
-  it("accepts a built envelope as known", () => {
+  it("accepts a built envelope", () => {
     const result = validateEnvelope(buildEnvelope(BASE));
     assert.ok("event" in result);
     if ("event" in result) {
-      assert.equal(result.known, true);
-      assert.equal(result.event.eventType, "attempt.heartbeat");
+      assert.equal(result.event["eventType"], "attempt.heartbeat");
     }
   });
 
-  it("accepts unknown future event types as known:false (forward compat)", () => {
-    const result = validateEnvelope(
-      buildEnvelope({ ...BASE, eventType: "attempt.superpower.v9" }),
+  it("accepts the frozen valid_event fixture", () => {
+    const fixture = JSON.parse(
+      readFileSync(join(FIXTURES, "valid_event.json"), "utf8"),
     );
-    assert.ok("event" in result);
-    if ("event" in result) assert.equal(result.known, false);
+    const result = validateEnvelope(fixture);
+    assert.ok("event" in result, JSON.stringify(result));
   });
 
-  it("rejects wrong schema versions and bad shapes", () => {
-    const badVersion = { ...buildEnvelope(BASE), schemaVersion: "0.2" };
-    const r1 = validateEnvelope(badVersion);
-    assert.ok("errors" in r1);
+  it("accepts minimal envelopes (only required fields)", () => {
+    const result = validateEnvelope({
+      eventId: "e-1",
+      schemaVersion: "0.1",
+      eventType: "task.ready",
+      occurredAt: "2026-11-08T12:00:00.000Z",
+      source: "orca-bridge",
+      projectId: "project_123",
+    });
+    assert.ok("event" in result);
+  });
 
-    const missing: Record<string, unknown> = { ...buildEnvelope(BASE) };
-    delete missing["eventId"];
-    const r2 = validateEnvelope(missing);
-    assert.ok("errors" in r2);
-    if ("errors" in r2) assert.ok(r2.errors.length > 0);
+  it("rejects wrong schema versions, unknown types and unknown fields", () => {
+    const badVersion = { ...buildEnvelope(BASE), schemaVersion: "0.2" };
+    assert.ok("errors" in validateEnvelope(badVersion));
+
+    const badType = { ...buildEnvelope(BASE), eventType: "attempt.warp.v9" };
+    const rType = validateEnvelope(badType);
+    assert.ok("errors" in rType);
+
+    const badField = { ...buildEnvelope(BASE), smuggled: "nope" };
+    const rField = validateEnvelope(badField);
+    assert.ok("errors" in rField);
+    if ("errors" in rField) {
+      assert.ok(rField.errors.some((e) => /contract v0\.1\.0/.test(e)));
+    }
+
+    const badAttempt = { ...buildEnvelope(BASE), attemptId: "not-a-uuid" };
+    assert.ok("errors" in validateEnvelope(badAttempt));
 
     assert.ok("errors" in validateEnvelope(null));
     assert.ok("errors" in validateEnvelope("heartbeat"));

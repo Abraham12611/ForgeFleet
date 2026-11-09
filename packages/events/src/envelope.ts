@@ -1,20 +1,31 @@
 /**
  * E06 — Normalized ForgeFleet event envelope (FF-006).
  *
- * Implements the `docs/05-contracts/events.md` v0.1 envelope: shape
- * validation, `(source, eventId)` dedupe keys, fencing-epoch staleness and
- * secret redaction. Dependency-free; shared by the bridge persistence layer
- * (`services/orca-bridge/src/persistence/`) and future consumers.
+ * Implements the `docs/05-contracts/events.md` v0.1 envelope with validation
+ * pinned to the frozen contract v0.1.0 (`packages/bridge-contracts`,
+ * `schemas/bridge-events.schema.json`, PR #46): required fields, closed
+ * `EventType` enum, `additionalProperties: false`, and optional-field
+ * shapes. `CONTRACT_VERSION` names the contract this validator enforces;
+ * any breaking field change must bump the contract and this module together.
  *
- * Compatibility rule honored here: unknown `eventType` values validate
- * successfully with `known: false` so older clients safely ignore event
- * types added by newer producers.
+ * Also provides `(source, eventId)` dedupe keys, fencing-epoch staleness
+ * and secret redaction for logs.
  */
+
+import type { EventType } from "../../bridge-contracts/generated/bridge.types.ts";
 
 export const EVENT_SCHEMA_VERSION = "0.1";
 
-/** Event families from `docs/05-contracts/events.md`. */
-export const KNOWN_EVENT_TYPES = [
+/** Frozen contract version this validator enforces. */
+export const CONTRACT_VERSION = "0.1.0";
+
+/**
+ * Closed event-type enum mirroring the normative
+ * `bridge-events.schema.json` `EventType` (contract v0.1.0). Unknown types
+ * fail validation: producers must not send undeclared types under v0.1,
+ * and adding one requires a contract version bump.
+ */
+export const EVENT_TYPES: readonly EventType[] = [
   "project.created",
   "project.paused",
   "project.resumed",
@@ -51,15 +62,36 @@ export const KNOWN_EVENT_TYPES = [
   "runtime.capacity.changed",
   "budget.threshold",
   "budget.exhausted",
+];
+
+/** Required envelope fields per the normative schema. */
+const REQUIRED_FIELDS = [
+  "eventId",
+  "schemaVersion",
+  "eventType",
+  "occurredAt",
+  "source",
+  "projectId",
 ] as const;
 
-export type KnownEventType = (typeof KNOWN_EVENT_TYPES)[number];
+/** All allowed top-level fields (`additionalProperties: false`). */
+const ALLOWED_FIELDS = [
+  ...REQUIRED_FIELDS,
+  "receivedAt",
+  "taskId",
+  "attemptId",
+  "correlationId",
+  "fencingEpoch",
+  "actor",
+  "data",
+] as const;
 
 export interface EventActor {
   type: "service" | "human" | "agent";
   id: string;
 }
 
+/** Producer-side complete envelope (defaults filled by `buildEnvelope`). */
 export interface ForgeFleetEvent {
   eventId: string;
   schemaVersion: string;
@@ -91,15 +123,8 @@ export interface BuildEnvelopeInput {
   data?: Record<string, unknown>;
 }
 
-export interface ValidEnvelope {
-  event: ForgeFleetEvent;
-  /** False for event types newer than this module; consume-or-ignore, never reject. */
-  known: boolean;
-}
-
-export interface InvalidEnvelope {
-  errors: string[];
-}
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -107,8 +132,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isIsoDateTime(value: unknown): boolean {
   if (typeof value !== "string" || value.length === 0) return false;
-  const t = Date.parse(value);
-  return Number.isFinite(t);
+  return Number.isFinite(Date.parse(value));
 }
 
 function generateId(): string {
@@ -122,23 +146,28 @@ function generateId(): string {
 }
 
 /**
- * Build a v0.1 envelope, filling `eventId`, `receivedAt`, `correlationId`
- * and `fencingEpoch` defaults. Throws on missing/invalid required fields.
+ * Build a complete v0.1 envelope, filling `eventId`, `receivedAt`,
+ * `correlationId` and `fencingEpoch` defaults. Throws on missing/invalid
+ * required fields.
  */
 export function buildEnvelope(
   input: BuildEnvelopeInput,
   now: () => string = () => new Date().toISOString(),
 ): ForgeFleetEvent {
   const errors: string[] = [];
+  const eventId = input.eventId ?? generateId();
   if (!input.eventType) errors.push("eventType is required");
+  else if (!(EVENT_TYPES as readonly string[]).includes(input.eventType)) {
+    errors.push(`eventType ${input.eventType} is not in contract v0.1.0`);
+  }
   if (!isIsoDateTime(input.occurredAt)) {
     errors.push("occurredAt must be an ISO-8601 date-time");
   }
   if (!input.source) errors.push("source is required");
   if (!input.projectId) errors.push("projectId is required");
-  if (!isRecord(input.actor) || !input.actor.type || !input.actor.id) {
+  if (!isRecord(input.actor) || !input.actor["type"] || !input.actor["id"]) {
     errors.push("actor.type and actor.id are required");
-  } else if (!["service", "human", "agent"].includes(input.actor.type)) {
+  } else if (!["service", "human", "agent"].includes(input.actor["type"] as string)) {
     errors.push("actor.type must be service, human or agent");
   }
   if (
@@ -149,7 +178,7 @@ export function buildEnvelope(
   }
   if (errors.length > 0) throw new Error(errors.join("; "));
   return {
-    eventId: input.eventId ?? generateId(),
+    eventId,
     schemaVersion: EVENT_SCHEMA_VERSION,
     eventType: input.eventType,
     occurredAt: input.occurredAt,
@@ -160,77 +189,94 @@ export function buildEnvelope(
     attemptId: input.attemptId ?? null,
     correlationId: input.correlationId ?? generateId(),
     fencingEpoch: input.fencingEpoch ?? 1,
-    actor: { type: input.actor.type, id: input.actor.id },
+    actor: { type: input.actor["type"] as EventActor["type"], id: input.actor["id"] as string },
     data: input.data ?? {},
   };
 }
 
+export interface InvalidEnvelope {
+  errors: string[];
+}
+
 /**
- * Validate an unknown value against the v0.1 envelope. Returns
- * `{ event, known }` on success; unknown event types succeed with
- * `known: false` per the forward-compatibility rule. Breaking field
- * changes (wrong `schemaVersion`) fail.
+ * Validate an unknown value against the frozen v0.1 envelope schema:
+ * required fields present, closed event-type enum, no unknown top-level
+ * fields, and optional-field shapes (`attemptId` UUID, `fencingEpoch`
+ * integer >= 1, `actor` type/id, `data` object).
  */
 export function validateEnvelope(
   value: unknown,
-): ValidEnvelope | InvalidEnvelope {
+): { event: Record<string, unknown> } | InvalidEnvelope {
   if (!isRecord(value)) return { errors: ["envelope must be an object"] };
   const errors: string[] = [];
-  if (typeof value["eventId"] !== "string" || !value["eventId"]) {
-    errors.push("eventId must be a non-empty string");
+  for (const key of Object.keys(value)) {
+    if (!(ALLOWED_FIELDS as readonly string[]).includes(key)) {
+      errors.push(`unknown field rejected by contract v0.1.0: ${key}`);
+    }
   }
-  if (value["schemaVersion"] !== EVENT_SCHEMA_VERSION) {
+  for (const field of REQUIRED_FIELDS) {
+    if (value[field] === undefined || value[field] === null || value[field] === "") {
+      errors.push(`${field} is required`);
+    }
+  }
+  if (
+    value["schemaVersion"] !== undefined &&
+    value["schemaVersion"] !== EVENT_SCHEMA_VERSION
+  ) {
     errors.push(
       `schemaVersion must be ${EVENT_SCHEMA_VERSION} (breaking changes require migration)`,
     );
   }
-  if (typeof value["eventType"] !== "string" || !value["eventType"]) {
-    errors.push("eventType must be a non-empty string");
+  if (
+    value["eventType"] !== undefined &&
+    !(EVENT_TYPES as readonly string[]).includes(value["eventType"] as string)
+  ) {
+    errors.push(
+      `eventType ${String(value["eventType"])} is not in contract v0.1.0`,
+    );
   }
-  if (!isIsoDateTime(value["occurredAt"])) {
-    errors.push("occurredAt must be an ISO-8601 date-time");
-  }
-  if (!isIsoDateTime(value["receivedAt"])) {
-    errors.push("receivedAt must be an ISO-8601 date-time");
-  }
-  if (typeof value["source"] !== "string" || !value["source"]) {
-    errors.push("source must be a non-empty string");
-  }
-  if (typeof value["projectId"] !== "string" || !value["projectId"]) {
-    errors.push("projectId must be a non-empty string");
-  }
-  for (const field of ["taskId", "attemptId", "correlationId"] as const) {
-    const v = value[field];
-    if (field === "correlationId") {
-      if (typeof v !== "string" || !v) errors.push(`${field} is required`);
-    } else if (v !== null && (typeof v !== "string" || !v)) {
-      errors.push(`${field} must be a string or null`);
+  for (const field of ["occurredAt", "receivedAt"] as const) {
+    if (value[field] !== undefined && !isIsoDateTime(value[field])) {
+      errors.push(`${field} must be an ISO-8601 date-time`);
     }
   }
+  for (const field of ["taskId", "correlationId"] as const) {
+    const v = value[field];
+    if (v !== undefined && v !== null && (typeof v !== "string" || !v)) {
+      errors.push(`${field} must be a non-empty string`);
+    }
+  }
+  const attemptId = value["attemptId"];
   if (
-    !Number.isInteger(value["fencingEpoch"]) ||
-    (value["fencingEpoch"] as number) < 1
+    attemptId !== undefined &&
+    attemptId !== null &&
+    (typeof attemptId !== "string" || !UUID_RE.test(attemptId))
+  ) {
+    errors.push("attemptId must be a UUID");
+  }
+  if (
+    value["fencingEpoch"] !== undefined &&
+    (!Number.isInteger(value["fencingEpoch"]) ||
+      (value["fencingEpoch"] as number) < 1)
   ) {
     errors.push("fencingEpoch must be an integer >= 1");
   }
   const actor = value["actor"];
-  if (
-    !isRecord(actor) ||
-    !["service", "human", "agent"].includes(
-      actor["type"] as string,
-    ) ||
-    typeof actor["id"] !== "string" ||
-    !actor["id"]
-  ) {
-    errors.push("actor must have a valid type and id");
+  if (actor !== undefined) {
+    if (
+      !isRecord(actor) ||
+      !["service", "human", "agent"].includes(actor["type"] as string) ||
+      typeof actor["id"] !== "string" ||
+      !actor["id"]
+    ) {
+      errors.push("actor must have a valid type and id");
+    }
   }
-  if (!isRecord(value["data"])) errors.push("data must be an object");
+  if (value["data"] !== undefined && !isRecord(value["data"])) {
+    errors.push("data must be an object");
+  }
   if (errors.length > 0) return { errors };
-  const event = value as unknown as ForgeFleetEvent;
-  return {
-    event,
-    known: (KNOWN_EVENT_TYPES as readonly string[]).includes(event.eventType),
-  };
+  return { event: value };
 }
 
 /**

@@ -1,113 +1,83 @@
 /**
  * E06 — Durable attempt mapping and idempotency (FF-006).
  *
- * In-memory store implementing the policy/state semantics required by
- * `docs/05-contracts/bridge.openapi.yaml` (createAttempt idempotency),
- * `docs/05-contracts/events.md` (receipt-before-ack, at-least-once outbox),
- * `docs/05-contracts/state-machines.md` (attempt machine, fencing) and
- * `docs/03-architecture/domain-and-data-model.md` (cross-system ID mapping).
+ * SQLite-backed store implementing the policy/state semantics required by
+ * the frozen contract v0.1.0 (`packages/bridge-contracts`, PR #46):
+ * idempotent `createAttempt`, transactional `(source, sourceEventId)`
+ * receipts with an at-least-once outbox, and restart reconciliation that
+ * adopts provable dispatches and never relaunches blindly.
  *
- * Guarantees:
- * - Same `Idempotency-Key` + same request hash returns the same attempt
- *   without a second runtime dispatch, even for concurrent duplicates.
- * - Same key + different request hash is a 409 with no side effect.
- * - At most one non-terminal attempt per task; a replacement requires a
- *   strictly greater fencing epoch and proof the prior attempt is gone.
- * - Runtime event receipts `(source, sourceEventId)` are deduplicated and
- *   applied transactionally with outbox enqueueing (receipt + outbox share
- *   one synchronous critical section — no ack before persistence).
- * - Outbox delivery is at-least-once with exponential backoff and a
- *   dead-letter queue carrying a human-visible reason.
- * - Restart reconciliation adopts provable original dispatches and marks
- *   everything else `unknown`; nothing relaunches blindly.
+ * Durability design (answers coordinator review on PR #37):
+ * - Every state prefix is committed to SQLite (WAL mode, `synchronous=FULL`)
+ *   **before** the runtime launcher is invoked, so a crash between
+ *   "Orca accepted" and "bridge persisted the reply" leaves a durable
+ *   `accepted` row that restart reconciliation reattaches by
+ *   `(paperclipTaskId, leaseToken)` instead of spawning a duplicate.
+ * - `dispatch_requests.idempotency_key` is the PRIMARY KEY and
+ *   `execution_attempts.orca_dispatch_id` is UNIQUE: concurrent duplicates
+ *   collapse at the constraint level even across processes, and all
+ *   check-then-insert sequences run inside `BEGIN IMMEDIATE` transactions.
+ * - Receipts, attempt transitions and outbox enqueueing share one
+ *   transaction: a receipt is never acknowledged without its outbox write.
+ * - Restart = reopen the same database file. The integration tests prove
+ *   this with real files: committed rows survive close/reopen, uncommitted
+ *   transactions do not, and reconciliation reattaches without relaunch.
  *
- * Durability note: this module owns the semantics and transactional
- * boundaries. Snapshot/restore (`snapshot()` / `AttemptStore.restore()`)
- * carries full state across a process restart in tests. The PostgreSQL
- * backing (aligned with Paperclip's schema conventions) is future work
- * with E01/E05; the SQL migration must preserve these exact invariants.
+ * Type shapes (`CreateAttemptRequest`, `AttemptReceipt`, `AttemptState`)
+ * are imported from the frozen generated contract — this module adds no
+ * competing field names. `AttemptReceipt` carries exactly the contract
+ * fields (no `orcaSessionId`, no `deduplicated` flag); internal mapping
+ * columns such as `orca_session_id` are persisted per the domain model but
+ * never serialized into the API receipt.
  */
 
+import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
+import type {
+  AttemptReceipt,
+  AttemptState,
+  CreateAttemptRequest,
+} from "../../../../packages/bridge-contracts/generated/bridge.types.ts";
 
-/** Non-terminal attempt states that hold the task lease. */
-export const ACTIVE_ATTEMPT_STATES = [
-  "requested",
+/** Contract v0.1.0: `IdempotencyKey` is 8–160 chars with no charset rule. */
+const IDEMPOTENCY_KEY_MIN = 8;
+const IDEMPOTENCY_KEY_MAX = 160;
+
+/** Non-terminal attempt states: the task lease is held. */
+const ACTIVE_ATTEMPT_STATES: readonly AttemptState[] = [
   "accepted",
   "dispatching",
   "running",
   "waiting",
   "unknown",
-] as const;
+];
 
 /** Terminal attempt states: the lease is released. */
-export const TERMINAL_ATTEMPT_STATES = ["finished", "failed", "cancelled"] as const;
+const TERMINAL_ATTEMPT_STATES: readonly AttemptState[] = [
+  "finished",
+  "failed",
+  "cancelled",
+];
 
-export type AttemptState =
-  | (typeof ACTIVE_ATTEMPT_STATES)[number]
-  | (typeof TERMINAL_ATTEMPT_STATES)[number];
-
-export interface AttemptLease {
-  fencingEpoch: number;
-  leaseToken: string;
-}
-
-/** Mirrors `CreateAttemptRequest` in `bridge.openapi.yaml` v0.1 draft. */
-export interface CreateAttemptRequest {
-  projectId: string;
-  paperclipTaskId: string;
-  paperclipRunId: string;
-  workerKind: string;
-  taskTitle?: string;
-  instruction?: string;
-  contextManifestId: string;
-  repositoryId?: string;
-  lease: AttemptLease;
-}
+/** Top-level `CreateAttemptRequest` fields per the normative API schema. */
+const CREATE_REQUEST_FIELDS = [
+  "projectId",
+  "paperclipTaskId",
+  "paperclipRunId",
+  "workerKind",
+  "taskTitle",
+  "instruction",
+  "contextManifestId",
+  "repositoryId",
+  "lease",
+] as const;
 
 export interface ExternalDispatchIds {
-  orcaRunId?: string;
-  orcaTaskId?: string;
-  orcaDispatchId?: string;
-  orcaSessionId?: string;
-  worktreeId?: string;
-}
-
-export interface ExecutionAttempt extends ExternalDispatchIds {
-  attemptId: string;
-  projectId: string;
-  paperclipTaskId: string;
-  paperclipRunId: string;
-  workerKind: string;
-  fencingEpoch: number;
-  leaseToken: string;
-  state: AttemptState;
-  errorCode: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-/** `AttemptReceipt` shape from `bridge.openapi.yaml`. */
-export interface AttemptReceipt extends ExternalDispatchIds {
-  attemptId: string;
-  projectId: string;
-  state: AttemptState;
-  observedAt: string;
-  errorCode: string | null;
-  /** True when this response replayed an earlier accepted request. */
-  deduplicated: boolean;
-}
-
-interface DispatchRequestRecord {
-  idempotencyKey: string;
-  requestHash: string;
-  attemptId: string;
-  createdAt: string;
-}
-
-interface EventReceiptRecord {
-  payloadSha256: string;
-  receivedAt: string;
+  orcaRunId?: string | null;
+  orcaTaskId?: string | null;
+  orcaDispatchId?: string | null;
+  orcaSessionId?: string | null;
+  worktreeId?: string | null;
 }
 
 export interface OutboxEntry {
@@ -131,8 +101,14 @@ export interface ObservedDispatch {
 }
 
 export interface ReconcileReport {
-  adopted: string[];
-  markedUnknown: string[];
+  /** Attempts reattached to a provably still-running dispatch. */
+  kept: string[];
+  /** Attempts whose dispatch provably ended; lease released as failed. */
+  releasedTerminal: string[];
+  /** Ambiguous attempts: held as `unknown`, never retried without proof. */
+  heldUnknown: string[];
+  /** Observed dispatches matching no attempt: reported, never adopted. */
+  orphans: string[];
   alreadyTerminal: string[];
 }
 
@@ -141,7 +117,8 @@ export type StoreErrorCode =
   | "idempotency_conflict"
   | "active_lease"
   | "unknown_attempt"
-  | "stale_epoch";
+  | "stale_epoch"
+  | "dispatch_unknown";
 
 export class StoreError extends Error {
   readonly code: StoreErrorCode;
@@ -156,31 +133,38 @@ export class StoreError extends Error {
 }
 
 /** Result of the injected runtime launcher (owned by E03 in production). */
-export interface DispatchResult extends ExternalDispatchIds {
+export interface DispatchResult {
+  orcaRunId?: string | null;
+  orcaTaskId?: string | null;
+  orcaDispatchId?: string | null;
+  orcaSessionId?: string | null;
+  worktreeId?: string | null;
   /** State the runtime accepted the attempt into. */
   state: "dispatching" | "running";
 }
 
-/** Snapshot carried across a process restart. */
-export interface StoreSnapshot {
-  version: 1;
-  attempts: ExecutionAttempt[];
-  dispatchRequests: DispatchRequestRecord[];
-  receipts: [string, EventReceiptRecord][];
-  outbox: OutboxEntry[];
-}
-
 export interface AttemptStoreOptions {
+  /**
+   * Database file path. Real files give crash durability (close + reopen =
+   * process restart); `":memory:"` is for pure unit tests only.
+   */
+  path?: string;
   /** Milliseconds clock; inject a fake in tests. Defaults to Date.now. */
   now?: () => number;
   /**
-   * Runtime launcher. Called at most once per accepted attempt while the
-   * store holds the creation lock — concurrent duplicates never reach it
-   * twice for the same idempotency key. Throwing marks the attempt
-   * `failed` with the launcher error; the dispatch request row is kept so
-   * retries replay deterministically.
+   * Runtime launcher. Invoked at most once per accepted attempt: the
+   * durable `accepted` row (plus idempotency row and outbox entry) and a
+   * single-launch claim commit first, and concurrent duplicates replay the
+   * committed row without reaching the launcher. A throw means unknown
+   * fate (the bridge may have died mid-dispatch): the `accepted` prefix
+   * stays durable and the error propagates, so a same-key retry replays
+   * without relaunching until reconciliation resolves the fate.
    */
-  dispatch?: (attempt: ExecutionAttempt) => Promise<DispatchResult>;
+  dispatch?: (attempt: {
+    attemptId: string;
+    projectId: string;
+    paperclipTaskId: string;
+  }) => Promise<DispatchResult>;
   maxOutboxAttempts?: number;
   outboxBaseDelayMs?: number;
   outboxMaxDelayMs?: number;
@@ -191,14 +175,9 @@ function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((v) => stableStringify(v)).join(",")}]`;
   }
-  const keys = Object.keys(value as Record<string, unknown>).sort();
-  const body = keys
-    .map(
-      (k) =>
-        `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`,
-    )
-    .join(",");
-  return `{${body}}`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(record[k])}`).join(",")}}}`;
 }
 
 function sha256Hex(text: string): string {
@@ -209,51 +188,109 @@ function isActive(state: AttemptState): boolean {
   return (ACTIVE_ATTEMPT_STATES as readonly string[]).includes(state);
 }
 
-const IDEMPOTENCY_KEY_RE = /^[\x21-\x7E]{8,160}$/;
+function isConstraintError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error as NodeJS.ErrnoException).code === "ERR_SQLITE_ERROR" &&
+    /UNIQUE constraint failed|PRIMARY KEY must be unique/i.test(error.message)
+  );
+}
 
-function validateCreateInput(
-  idempotencyKey: string,
-  request: CreateAttemptRequest,
-): string[] {
-  const errors: string[] = [];
-  if (!IDEMPOTENCY_KEY_RE.test(idempotencyKey)) {
-    errors.push("Idempotency-Key must be 8-160 printable ASCII characters");
-  }
-  if (!request.projectId) errors.push("projectId is required");
-  if (!request.paperclipTaskId) errors.push("paperclipTaskId is required");
-  if (!request.paperclipRunId) errors.push("paperclipRunId is required");
-  if (!request.workerKind) errors.push("workerKind is required");
-  if (!request.contextManifestId) errors.push("contextManifestId is required");
-  const lease = request.lease;
-  if (
-    !lease ||
-    !Number.isInteger(lease.fencingEpoch) ||
-    lease.fencingEpoch < 1
-  ) {
-    errors.push("lease.fencingEpoch must be an integer >= 1");
-  }
-  if (!lease || !lease.leaseToken) errors.push("lease.leaseToken is required");
-  return errors;
+const SCHEMA = `
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS execution_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  paperclip_task_id TEXT NOT NULL,
+  paperclip_run_id TEXT NOT NULL,
+  worker_kind TEXT NOT NULL,
+  task_title TEXT,
+  instruction TEXT,
+  context_manifest_id TEXT NOT NULL,
+  repository_id TEXT,
+  fencing_epoch INTEGER NOT NULL,
+  lease_token TEXT NOT NULL,
+  launch_claimed INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL,
+  orca_run_id TEXT,
+  orca_task_id TEXT,
+  orca_dispatch_id TEXT UNIQUE,
+  orca_session_id TEXT,
+  worktree_id TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_task
+  ON execution_attempts(project_id, paperclip_task_id);
+CREATE TABLE IF NOT EXISTS dispatch_requests (
+  idempotency_key TEXT PRIMARY KEY,
+  request_hash TEXT NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES execution_attempts(attempt_id),
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS runtime_event_receipts (
+  source TEXT NOT NULL,
+  source_event_id TEXT NOT NULL,
+  payload_sha256 TEXT NOT NULL,
+  received_at TEXT NOT NULL,
+  PRIMARY KEY (source, source_event_id)
+);
+CREATE TABLE IF NOT EXISTS outbound_events (
+  id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  body TEXT NOT NULL,
+  destination TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  last_error TEXT,
+  delivered_at TEXT,
+  dead_lettered INTEGER NOT NULL DEFAULT 0,
+  dead_letter_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_due
+  ON outbound_events(delivered_at, dead_lettered, next_attempt_at);
+`;
+
+interface AttemptRow {
+  attempt_id: string;
+  project_id: string;
+  paperclip_task_id: string;
+  paperclip_run_id: string;
+  worker_kind: string;
+  task_title: string | null;
+  instruction: string | null;
+  context_manifest_id: string;
+  repository_id: string | null;
+  fencing_epoch: number;
+  lease_token: string;
+  launch_claimed: number;
+  state: AttemptState;
+  orca_run_id: string | null;
+  orca_task_id: string | null;
+  orca_dispatch_id: string | null;
+  orca_session_id: string | null;
+  worktree_id: string | null;
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export class AttemptStore {
+  private readonly db: DatabaseSync;
   private readonly clock: () => number;
   private readonly launcher: (
-    attempt: ExecutionAttempt,
+    attempt: { attemptId: string; projectId: string; paperclipTaskId: string },
   ) => Promise<DispatchResult>;
   private readonly maxOutboxAttempts: number;
   private readonly outboxBaseDelayMs: number;
   private readonly outboxMaxDelayMs: number;
 
-  private attempts = new Map<string, ExecutionAttempt>();
-  private attemptsByTask = new Map<string, string[]>();
-  private dispatchRequests = new Map<string, DispatchRequestRecord>();
-  private receipts = new Map<string, EventReceiptRecord>();
-  private outbox = new Map<string, OutboxEntry>();
-  /** Serializes critical sections; keyed so unrelated work is not blocked. */
-  private tails = new Map<string, Promise<void>>();
-
   constructor(options: AttemptStoreOptions = {}) {
+    this.db = new DatabaseSync(options.path ?? ":memory:");
+    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db.exec("PRAGMA synchronous = FULL;");
+    this.db.exec(SCHEMA);
     this.clock = options.now ?? (() => Date.now());
     this.launcher =
       options.dispatch ??
@@ -263,128 +300,30 @@ export class AttemptStore {
     this.outboxMaxDelayMs = options.outboxMaxDelayMs ?? 5 * 60 * 1000;
   }
 
-  static restore(snapshot: StoreSnapshot, options: AttemptStoreOptions = {}): AttemptStore {
-    if (snapshot.version !== 1) {
-      throw new StoreError(
-        "validation",
-        422,
-        `unsupported snapshot version ${String((snapshot as { version?: unknown }).version)}`,
-      );
-    }
-    const store = new AttemptStore(options);
-    for (const attempt of snapshot.attempts) {
-      store.attempts.set(attempt.attemptId, { ...attempt });
-      const key = store.taskKey(attempt.projectId, attempt.paperclipTaskId);
-      const list = store.attemptsByTask.get(key) ?? [];
-      list.push(attempt.attemptId);
-      store.attemptsByTask.set(key, list);
-    }
-    for (const record of snapshot.dispatchRequests) {
-      store.dispatchRequests.set(record.idempotencyKey, { ...record });
-    }
-    for (const [key, receipt] of snapshot.receipts) {
-      store.receipts.set(key, { ...receipt });
-    }
-    for (const entry of snapshot.outbox) {
-      store.outbox.set(entry.id, { ...entry, body: { ...entry.body } });
-    }
-    return store;
-  }
-
-  snapshot(): StoreSnapshot {
-    return {
-      version: 1,
-      attempts: [...this.attempts.values()].map((a) => ({ ...a })),
-      dispatchRequests: [...this.dispatchRequests.values()].map((r) => ({
-        ...r,
-      })),
-      receipts: [...this.receipts.entries()].map(([k, v]) => [k, { ...v }]),
-      outbox: [...this.outbox.values()].map((e) => ({
-        ...e,
-        body: { ...e.body },
-      })),
-    };
+  /** Release the database handle. Reopen the same path to simulate restart. */
+  close(): void {
+    this.db.close();
   }
 
   private isoNow(): string {
     return new Date(this.clock()).toISOString();
   }
 
-  private taskKey(projectId: string, paperclipTaskId: string): string {
-    return `${projectId}::${paperclipTaskId}`;
-  }
-
-  private async withLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
-    const ordered = [...new Set(keys)].sort();
-    const prevs = ordered.map((k) => this.tails.get(k) ?? Promise.resolve());
-    let release: () => void = () => {};
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    for (const k of ordered) {
-      const prev = this.tails.get(k) ?? Promise.resolve();
-      this.tails.set(
-        k,
-        prev.then(
-          () => current,
-          () => current,
-        ),
-      );
-    }
-    await Promise.allSettled(prevs);
+  /** Run `fn` inside `BEGIN IMMEDIATE … COMMIT` (rollback on throw). */
+  private transact<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE;");
     try {
-      return await fn();
-    } finally {
-      release();
-      for (const k of ordered) {
-        if (this.tails.get(k) === current) this.tails.delete(k);
+      const result = fn();
+      this.db.exec("COMMIT;");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK;");
+      } catch {
+        // Already rolled back by SQLite on constraint failure; ignore.
       }
+      throw error;
     }
-  }
-
-  private toReceipt(
-    attempt: ExecutionAttempt,
-    deduplicated: boolean,
-  ): AttemptReceipt {
-    return {
-      attemptId: attempt.attemptId,
-      projectId: attempt.projectId,
-      state: attempt.state,
-      observedAt: this.isoNow(),
-      orcaRunId: attempt.orcaRunId,
-      orcaTaskId: attempt.orcaTaskId,
-      orcaDispatchId: attempt.orcaDispatchId,
-      orcaSessionId: attempt.orcaSessionId,
-      worktreeId: attempt.worktreeId,
-      errorCode: attempt.errorCode,
-      deduplicated,
-    };
-  }
-
-  private activeAttemptFor(
-    projectId: string,
-    paperclipTaskId: string,
-  ): ExecutionAttempt | null {
-    const ids = this.attemptsByTask.get(
-      this.taskKey(projectId, paperclipTaskId),
-    ) ?? [];
-    for (const id of ids) {
-      const attempt = this.attempts.get(id);
-      if (attempt && isActive(attempt.state)) return attempt;
-    }
-    return null;
-  }
-
-  private maxEpochFor(projectId: string, paperclipTaskId: string): number {
-    const ids = this.attemptsByTask.get(
-      this.taskKey(projectId, paperclipTaskId),
-    ) ?? [];
-    let max = 0;
-    for (const id of ids) {
-      const attempt = this.attempts.get(id);
-      if (attempt && attempt.fencingEpoch > max) max = attempt.fencingEpoch;
-    }
-    return max;
   }
 
   private enqueueOutbound(
@@ -392,155 +331,327 @@ export class AttemptStore {
     body: Record<string, unknown>,
     destination: string,
   ): void {
-    const id = randomUUID();
-    this.outbox.set(id, {
-      id,
-      eventType,
-      body: { ...body },
-      destination,
-      attempts: 0,
-      nextAttemptAt: this.isoNow(),
-      lastError: null,
-      deliveredAt: null,
-      deadLettered: false,
-      deadLetterReason: null,
-    });
+    this.db
+      .prepare(
+        `INSERT INTO outbound_events
+           (id, event_type, body, destination, attempts, next_attempt_at)
+         VALUES (?, ?, ?, ?, 0, ?)`,
+      )
+      .run(
+        randomUUID(),
+        eventType,
+        JSON.stringify(body),
+        destination,
+        this.isoNow(),
+      );
+  }
+
+  private rowToReceipt(row: AttemptRow): AttemptReceipt {
+    return {
+      attemptId: row.attempt_id,
+      projectId: row.project_id,
+      state: row.state,
+      observedAt: this.isoNow(),
+      orcaRunId: row.orca_run_id,
+      orcaTaskId: row.orca_task_id,
+      orcaDispatchId: row.orca_dispatch_id,
+      worktreeId: row.worktree_id,
+      errorCode: row.error_code,
+    };
+  }
+
+  private getAttemptRow(attemptId: string): AttemptRow | undefined {
+    return this.db
+      .prepare(`SELECT * FROM execution_attempts WHERE attempt_id = ?`)
+      .get(attemptId) as AttemptRow | undefined;
+  }
+
+  private activeAttemptRow(
+    projectId: string,
+    paperclipTaskId: string,
+  ): AttemptRow | undefined {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM execution_attempts
+         WHERE project_id = ? AND paperclip_task_id = ?
+         ORDER BY fencing_epoch DESC`,
+      )
+      .all(projectId, paperclipTaskId) as unknown as AttemptRow[];
+    return rows.find((r) => isActive(r.state));
+  }
+
+  private maxEpochFor(projectId: string, paperclipTaskId: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT MAX(fencing_epoch) AS m FROM execution_attempts
+         WHERE project_id = ? AND paperclip_task_id = ?`,
+      )
+      .get(projectId, paperclipTaskId) as { m: number | null };
+    return row.m ?? 0;
+  }
+
+  private validateCreateInput(
+    idempotencyKey: string,
+    request: CreateAttemptRequest,
+  ): string[] {
+    const errors: string[] = [];
+    if (
+      typeof idempotencyKey !== "string" ||
+      idempotencyKey.length < IDEMPOTENCY_KEY_MIN ||
+      idempotencyKey.length > IDEMPOTENCY_KEY_MAX
+    ) {
+      errors.push(
+        `Idempotency-Key must be ${IDEMPOTENCY_KEY_MIN}-${IDEMPOTENCY_KEY_MAX} characters (contract v0.1.0)`,
+      );
+    }
+    const unknown = Object.keys(request).filter(
+      (k) => !(CREATE_REQUEST_FIELDS as readonly string[]).includes(k),
+    );
+    if (unknown.length > 0) {
+      errors.push(
+        `unknown request fields rejected by contract v0.1.0: ${unknown.join(", ")}`,
+      );
+    }
+    for (const field of [
+      "projectId",
+      "paperclipTaskId",
+      "paperclipRunId",
+      "workerKind",
+      "contextManifestId",
+    ] as const) {
+      if (!request[field]) errors.push(`${field} is required`);
+    }
+    const lease = request.lease;
+    if (
+      !lease ||
+      !Number.isInteger(lease.fencingEpoch) ||
+      lease.fencingEpoch < 1
+    ) {
+      errors.push("lease.fencingEpoch must be an integer >= 1");
+    }
+    if (!lease || !lease.leaseToken) {
+      errors.push("lease.leaseToken is required");
+    }
+    return errors;
   }
 
   /**
-   * Create (or replay) an attempt. Concurrent duplicates with the same key
-   * and payload launch the runtime at most once; the same key with a
+   * Create (or replay) an attempt. The durable prefix — attempt row,
+   * idempotency row and `attempt.accepted` outbox entry — commits first;
+   * then exactly one caller wins the single-launch claim and invokes the
+   * runtime launcher. Concurrent duplicates with the same key and payload
+   * replay one attempt and launch at most once; the same key with a
    * different payload fails 409 with no side effect; a held task lease
-   * fails 409 without dispatching.
+   * fails 409 without dispatching. A launcher throw propagates as 502
+   * `dispatch_unknown` with the `accepted` prefix left durable — never a
+   * silent second launch.
    */
   async createAttempt(
     idempotencyKey: string,
     request: CreateAttemptRequest,
-  ): Promise<AttemptReceipt> {
-    const errors = validateCreateInput(idempotencyKey, request);
+  ): Promise<{ receipt: AttemptReceipt; deduplicated: boolean }> {
+    const errors = this.validateCreateInput(idempotencyKey, request);
     if (errors.length > 0) {
       throw new StoreError("validation", 422, errors.join("; "));
     }
     const requestHash = sha256Hex(stableStringify(request));
-    return this.withLocks(
-      [`idem:${idempotencyKey}`, `task:${this.taskKey(request.projectId, request.paperclipTaskId)}`],
-      async () => {
-        const existing = this.dispatchRequests.get(idempotencyKey);
-        if (existing) {
-          if (existing.requestHash !== requestHash) {
-            throw new StoreError(
-              "idempotency_conflict",
-              409,
-              "Idempotency-Key was already used with a different payload",
-            );
-          }
-          const attempt = this.attempts.get(existing.attemptId);
-          if (!attempt) {
-            throw new StoreError(
-              "unknown_attempt",
-              404,
-              "idempotency record points at a missing attempt",
-            );
-          }
-          return this.toReceipt(attempt, true);
-        }
 
-        const holder = this.activeAttemptFor(
-          request.projectId,
-          request.paperclipTaskId,
-        );
-        if (holder) {
+    const prefix = this.transact(() => {
+      const existing = this.db
+        .prepare(`SELECT request_hash, attempt_id FROM dispatch_requests WHERE idempotency_key = ?`)
+        .get(idempotencyKey) as
+        | { request_hash: string; attempt_id: string }
+        | undefined;
+      if (existing) {
+        if (existing.request_hash !== requestHash) {
           throw new StoreError(
-            "active_lease",
+            "idempotency_conflict",
             409,
-            `task already has active attempt ${holder.attemptId} in state ${holder.state}`,
+            "Idempotency-Key was already used with a different payload",
           );
         }
-        if (request.lease.fencingEpoch <= this.maxEpochFor(
-          request.projectId,
-          request.paperclipTaskId,
-        )) {
+        const attempt = this.getAttemptRow(existing.attempt_id);
+        if (!attempt) {
           throw new StoreError(
-            "stale_epoch",
-            409,
-            "lease.fencingEpoch must exceed every prior attempt generation for this task",
+            "unknown_attempt",
+            404,
+            "idempotency record points at a missing attempt",
           );
         }
+        return { attemptId: attempt.attempt_id, created: false as const };
+      }
 
-        const now = this.isoNow();
-        const attempt: ExecutionAttempt = {
-          attemptId: randomUUID(),
-          projectId: request.projectId,
-          paperclipTaskId: request.paperclipTaskId,
-          paperclipRunId: request.paperclipRunId,
-          workerKind: request.workerKind,
-          fencingEpoch: request.lease.fencingEpoch,
-          leaseToken: request.lease.leaseToken,
-          state: "accepted",
-          errorCode: null,
-          createdAt: now,
-          updatedAt: now,
-        };
-        this.attempts.set(attempt.attemptId, attempt);
-        const taskKey = this.taskKey(request.projectId, request.paperclipTaskId);
-        this.attemptsByTask.set(taskKey, [
-          ...(this.attemptsByTask.get(taskKey) ?? []),
-          attempt.attemptId,
-        ]);
-        this.dispatchRequests.set(idempotencyKey, {
-          idempotencyKey,
-          requestHash,
-          attemptId: attempt.attemptId,
-          createdAt: now,
-        });
-        this.enqueueOutbound(
-          "attempt.accepted",
-          { attemptId: attempt.attemptId, paperclipTaskId: attempt.paperclipTaskId },
-          "paperclip-adapter",
+      const holder = this.activeAttemptRow(
+        request.projectId,
+        request.paperclipTaskId,
+      );
+      if (holder) {
+        throw new StoreError(
+          "active_lease",
+          409,
+          `task already has active attempt ${holder.attempt_id} in state ${holder.state}`,
         );
+      }
+      if (
+        request.lease.fencingEpoch <=
+        this.maxEpochFor(request.projectId, request.paperclipTaskId)
+      ) {
+        throw new StoreError(
+          "stale_epoch",
+          409,
+          "lease.fencingEpoch must exceed every prior attempt generation for this task",
+        );
+      }
 
-        let launched: DispatchResult;
-        try {
-          launched = await this.launcher({ ...attempt });
-        } catch (error) {
-          attempt.state = "failed";
-          attempt.errorCode = "dispatch_failed";
-          attempt.updatedAt = this.isoNow();
-          this.enqueueOutbound(
-            "attempt.failed",
-            {
-              attemptId: attempt.attemptId,
-              errorCode: attempt.errorCode,
-              reason: error instanceof Error ? error.message : String(error),
-            },
-            "paperclip-adapter",
+      const now = this.isoNow();
+      const attemptId = randomUUID();
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO execution_attempts
+               (attempt_id, project_id, paperclip_task_id, paperclip_run_id,
+                worker_kind, task_title, instruction, context_manifest_id,
+                repository_id, fencing_epoch, lease_token, state,
+                created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)`,
+          )
+          .run(
+            attemptId,
+            request.projectId,
+            request.paperclipTaskId,
+            request.paperclipRunId,
+            request.workerKind,
+            request.taskTitle ?? null,
+            request.instruction ?? null,
+            request.contextManifestId,
+            request.repositoryId ?? null,
+            request.lease.fencingEpoch,
+            request.lease.leaseToken,
+            now,
+            now,
           );
-          return this.toReceipt(attempt, false);
+        this.db
+          .prepare(
+            `INSERT INTO dispatch_requests
+               (idempotency_key, request_hash, attempt_id, created_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(idempotencyKey, requestHash, attemptId, now);
+      } catch (error) {
+        if (isConstraintError(error)) {
+          // Lost a cross-process race on the UNIQUE key: re-read and replay.
+          const winner = this.db
+            .prepare(`SELECT request_hash, attempt_id FROM dispatch_requests WHERE idempotency_key = ?`)
+            .get(idempotencyKey) as
+            | { request_hash: string; attempt_id: string }
+            | undefined;
+          if (winner && winner.request_hash === requestHash) {
+            return { attemptId: winner.attempt_id, created: false as const };
+          }
+          throw new StoreError(
+            "idempotency_conflict",
+            409,
+            "Idempotency-Key was already used with a different payload",
+          );
         }
-        attempt.orcaRunId = launched.orcaRunId;
-        attempt.orcaTaskId = launched.orcaTaskId;
-        attempt.orcaDispatchId = launched.orcaDispatchId;
-        attempt.orcaSessionId = launched.orcaSessionId;
-        attempt.worktreeId = launched.worktreeId;
-        attempt.state = launched.state;
-        attempt.updatedAt = this.isoNow();
-        return this.toReceipt(attempt, false);
-      },
-    );
+        throw error;
+      }
+      this.enqueueOutbound(
+        "attempt.accepted",
+        { attemptId, paperclipTaskId: request.paperclipTaskId },
+        "paperclip-adapter",
+      );
+      return { attemptId, created: true as const };
+    });
+
+    // Single-launch claim: exactly one caller (even across processes) wins
+    // the right to invoke the runtime launcher for this attempt. Losers
+    // replay the durable row. The claim commits before the launcher runs,
+    // so a crash after the claim leaves an `accepted`, claimed row that
+    // restart reconciliation reattaches instead of relaunching.
+    const claimed = this.transact(() => {
+      const result = this.db
+        .prepare(
+          `UPDATE execution_attempts
+           SET launch_claimed = 1 WHERE attempt_id = ? AND launch_claimed = 0`,
+        )
+        .run(prefix.attemptId);
+      return Number(result.changes) === 1;
+    });
+    if (!claimed) {
+      const attempt = this.getAttemptRow(prefix.attemptId);
+      if (!attempt) {
+        throw new StoreError(
+          "unknown_attempt",
+          404,
+          "idempotency record points at a missing attempt",
+        );
+      }
+      return { receipt: this.rowToReceipt(attempt), deduplicated: true };
+    }
+
+    let launched: DispatchResult;
+    try {
+      launched = await this.launcher({
+        attemptId: prefix.attemptId,
+        projectId: request.projectId,
+        paperclipTaskId: request.paperclipTaskId,
+      });
+    } catch (error) {
+      // Fate unknown (bridge may have died mid-dispatch): the durable
+      // `accepted` prefix stays, the caller sees 502, and a same-key retry
+      // replays without relaunching until reconciliation resolves the fate.
+      throw new StoreError(
+        "dispatch_unknown",
+        502,
+        `launcher fate unknown for attempt ${prefix.attemptId}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    const updated = this.transact(() => {
+      this.db
+        .prepare(
+          `UPDATE execution_attempts
+           SET orca_run_id = ?, orca_task_id = ?, orca_dispatch_id = ?,
+               orca_session_id = ?, worktree_id = ?, state = ?, updated_at = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(
+          launched.orcaRunId ?? null,
+          launched.orcaTaskId ?? null,
+          launched.orcaDispatchId ?? null,
+          launched.orcaSessionId ?? null,
+          launched.worktreeId ?? null,
+          launched.state,
+          this.isoNow(),
+          prefix.attemptId,
+        );
+      return this.getAttemptRow(prefix.attemptId);
+    });
+    if (!updated) {
+      throw new StoreError("unknown_attempt", 404, "attempt vanished");
+    }
+    return { receipt: this.rowToReceipt(updated), deduplicated: !prefix.created };
   }
 
   /** Read an attempt as an API receipt. */
   getAttempt(attemptId: string): AttemptReceipt {
-    const attempt = this.attempts.get(attemptId);
+    const attempt = this.getAttemptRow(attemptId);
     if (!attempt) {
-      throw new StoreError("unknown_attempt", 404, `unknown attempt ${attemptId}`);
+      throw new StoreError(
+        "unknown_attempt",
+        404,
+        `unknown attempt ${attemptId}`,
+      );
     }
-    return this.toReceipt(attempt, false);
+    return this.rowToReceipt(attempt);
   }
 
   /** True when no non-terminal attempt holds the task lease. */
   canDispatch(projectId: string, paperclipTaskId: string): boolean {
-    return this.activeAttemptFor(projectId, paperclipTaskId) === null;
+    return (
+      this.activeAttemptRow(projectId, paperclipTaskId) === undefined
+    );
   }
 
   /**
@@ -552,23 +663,50 @@ export class AttemptStore {
     attemptId: string,
     ids: ExternalDispatchIds,
   ): AttemptReceipt {
-    const attempt = this.attempts.get(attemptId);
-    if (!attempt) {
+    const updated = this.transact(() => {
+      const attempt = this.getAttemptRow(attemptId);
+      if (!attempt) {
+        throw new StoreError(
+          "unknown_attempt",
+          404,
+          `unknown attempt ${attemptId}`,
+        );
+      }
+      this.db
+        .prepare(
+          `UPDATE execution_attempts
+           SET orca_run_id = COALESCE(?, orca_run_id),
+               orca_task_id = COALESCE(?, orca_task_id),
+               orca_dispatch_id = COALESCE(?, orca_dispatch_id),
+               orca_session_id = COALESCE(?, orca_session_id),
+               worktree_id = COALESCE(?, worktree_id),
+               state = CASE WHEN state IN ('accepted') THEN 'dispatching' ELSE state END,
+               updated_at = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(
+          ids.orcaRunId ?? null,
+          ids.orcaTaskId ?? null,
+          ids.orcaDispatchId ?? null,
+          ids.orcaSessionId ?? null,
+          ids.worktreeId ?? null,
+          this.isoNow(),
+          attemptId,
+        );
+      return this.getAttemptRow(attemptId);
+    });
+    if (!updated) {
       throw new StoreError("unknown_attempt", 404, `unknown attempt ${attemptId}`);
     }
-    Object.assign(attempt, ids);
-    if (attempt.state === "accepted" || attempt.state === "requested") {
-      attempt.state = "dispatching";
-    }
-    attempt.updatedAt = this.isoNow();
-    return this.toReceipt(attempt, false);
+    return this.rowToReceipt(updated);
   }
 
   /**
    * Apply one runtime event transactionally: dedupe by
    * `(source, sourceEventId)`, enforce fencing, advance attempt state and
-   * enqueue the normalized outbound event — all in one critical section so
-   * a receipt is never acknowledged without its outbox write.
+   * enqueue the normalized outbound event — all in one `BEGIN IMMEDIATE`
+   * transaction, so a receipt is never acknowledged without its outbox
+   * write.
    */
   applyRuntimeEvent(input: {
     source: string;
@@ -578,51 +716,92 @@ export class AttemptStore {
     eventType: string;
     fencingEpoch: number;
   }): { deduplicated: boolean; applied: boolean; reason: string } {
-    const key = `${input.source}::${input.sourceEventId}`;
-    const seen = this.receipts.get(key);
     const payloadSha = sha256Hex(stableStringify(input.payload));
-    if (seen) {
-      return { deduplicated: true, applied: false, reason: "duplicate receipt" };
-    }
-    const attempt = this.attempts.get(input.attemptId);
-    if (!attempt) {
-      throw new StoreError(
-        "unknown_attempt",
-        404,
-        `unknown attempt ${input.attemptId}`,
+    return this.transact(() => {
+      let duplicate = false;
+      try {
+        this.db
+          .prepare(
+            `INSERT INTO runtime_event_receipts
+               (source, source_event_id, payload_sha256, received_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(input.source, input.sourceEventId, payloadSha, this.isoNow());
+      } catch (error) {
+        if (isConstraintError(error)) duplicate = true;
+        else throw error;
+      }
+      if (duplicate) {
+        return { deduplicated: true, applied: false, reason: "duplicate receipt" };
+      }
+      const attempt = this.getAttemptRow(input.attemptId);
+      if (!attempt) {
+        throw new StoreError(
+          "unknown_attempt",
+          404,
+          `unknown attempt ${input.attemptId}`,
+        );
+      }
+      if (input.fencingEpoch < attempt.fencing_epoch) {
+        return {
+          deduplicated: false,
+          applied: false,
+          reason: "stale fencing epoch",
+        };
+      }
+      const next = nextStateForEvent(attempt.state, input.eventType);
+      if (next === null) {
+        return {
+          deduplicated: false,
+          applied: false,
+          reason: "no transition for event in current state",
+        };
+      }
+      if (next !== attempt.state) {
+        this.db
+          .prepare(
+            `UPDATE execution_attempts SET state = ?, updated_at = ? WHERE attempt_id = ?`,
+          )
+          .run(next, this.isoNow(), input.attemptId);
+      }
+      this.enqueueOutbound(
+        input.eventType,
+        { ...input.payload },
+        "paperclip-adapter",
       );
-    }
-    if (input.fencingEpoch < attempt.fencingEpoch) {
-      this.receipts.set(key, { payloadSha256: payloadSha, receivedAt: this.isoNow() });
-      return { deduplicated: false, applied: false, reason: "stale fencing epoch" };
-    }
-    const next = nextStateForEvent(attempt.state, input.eventType);
-    this.receipts.set(key, { payloadSha256: payloadSha, receivedAt: this.isoNow() });
-    if (next === null) {
-      return { deduplicated: false, applied: false, reason: "no transition for event in current state" };
-    }
-    attempt.state = next;
-    attempt.updatedAt = this.isoNow();
-    this.enqueueOutbound(input.eventType, { ...input.payload }, "paperclip-adapter");
-    return { deduplicated: false, applied: true, reason: "applied" };
+      return { deduplicated: false, applied: true, reason: "applied" };
+    });
   }
 
   /** Mark telemetry-loss: running/dispatching attempts become `unknown`. */
   markUnknown(attemptId: string): AttemptReceipt {
-    const attempt = this.attempts.get(attemptId);
-    if (!attempt) {
+    const updated = this.transact(() => {
+      const attempt = this.getAttemptRow(attemptId);
+      if (!attempt) {
+        throw new StoreError(
+          "unknown_attempt",
+          404,
+          `unknown attempt ${attemptId}`,
+        );
+      }
+      if (attempt.state === "dispatching" || attempt.state === "running") {
+        this.db
+          .prepare(
+            `UPDATE execution_attempts SET state = 'unknown', updated_at = ? WHERE attempt_id = ?`,
+          )
+          .run(this.isoNow(), attemptId);
+        this.enqueueOutbound(
+          "attempt.unknown",
+          { attemptId, fencingEpoch: attempt.fencing_epoch },
+          "paperclip-adapter",
+        );
+      }
+      return this.getAttemptRow(attemptId);
+    });
+    if (!updated) {
       throw new StoreError("unknown_attempt", 404, `unknown attempt ${attemptId}`);
     }
-    if (attempt.state === "dispatching" || attempt.state === "running") {
-      attempt.state = "unknown";
-      attempt.updatedAt = this.isoNow();
-      this.enqueueOutbound(
-        "attempt.unknown",
-        { attemptId, fencingEpoch: attempt.fencingEpoch },
-        "paperclip-adapter",
-      );
-    }
-    return this.toReceipt(attempt, false);
+    return this.rowToReceipt(updated);
   }
 
   /**
@@ -636,104 +815,167 @@ export class AttemptStore {
     outcome: "failed" | "cancelled",
     evidence: string,
   ): AttemptReceipt {
-    const attempt = this.attempts.get(attemptId);
-    if (!attempt) {
-      throw new StoreError("unknown_attempt", 404, `unknown attempt ${attemptId}`);
-    }
     if (!evidence) {
       throw new StoreError("validation", 422, "termination evidence is required");
     }
-    if (!isActive(attempt.state)) {
-      throw new StoreError(
-        "validation",
-        422,
-        `attempt ${attemptId} is already terminal (${attempt.state})`,
+    const updated = this.transact(() => {
+      const attempt = this.getAttemptRow(attemptId);
+      if (!attempt) {
+        throw new StoreError(
+          "unknown_attempt",
+          404,
+          `unknown attempt ${attemptId}`,
+        );
+      }
+      if (!isActive(attempt.state)) {
+        throw new StoreError(
+          "validation",
+          422,
+          `attempt ${attemptId} is already terminal (${attempt.state})`,
+        );
+      }
+      this.db
+        .prepare(
+          `UPDATE execution_attempts
+           SET state = ?, error_code = 'original_terminated', updated_at = ?
+           WHERE attempt_id = ?`,
+        )
+        .run(outcome, this.isoNow(), attemptId);
+      this.enqueueOutbound(
+        outcome === "failed" ? "attempt.failed" : "attempt.cancelled",
+        { attemptId, evidence },
+        "paperclip-adapter",
       );
+      return this.getAttemptRow(attemptId);
+    });
+    if (!updated) {
+      throw new StoreError("unknown_attempt", 404, `unknown attempt ${attemptId}`);
     }
-    attempt.state = outcome;
-    attempt.errorCode = "original_terminated";
-    attempt.updatedAt = this.isoNow();
-    this.enqueueOutbound(
-      outcome === "failed" ? "attempt.failed" : "attempt.cancelled",
-      { attemptId, evidence },
-      "paperclip-adapter",
-    );
-    return this.toReceipt(attempt, false);
+    return this.rowToReceipt(updated);
   }
 
   /**
-   * Boot reconciliation: adopt every provable original dispatch, mark the
-   * rest `unknown`, and never relaunch. Matches first on persisted
-   * `orcaDispatchId`, then on `(paperclipTaskId, leaseToken)` for attempts
-   * whose accepted-launch reply was never persisted (crash in the window).
+   * Boot reconciliation over a read-only runtime inventory. Every active
+   * attempt is categorized like the scheduler's `reconcile()`:
+   * provably-running dispatches are kept (reattached, adopting a
+   * late-observed external ID when the accepted-launch reply was never
+   * persisted); provably-ended dispatches release the lease as failed;
+   * everything ambiguous is held `unknown`; observed dispatches matching
+   * no attempt are reported as orphans and never adopted. Nothing here
+   * relaunches — a retry requires a new idempotency key, a higher fencing
+   * epoch, and prior `confirmTermination` proof.
    */
   reconcileAfterRestart(observed: ObservedDispatch[]): ReconcileReport {
-    const report: ReconcileReport = {
-      adopted: [],
-      markedUnknown: [],
-      alreadyTerminal: [],
-    };
-    const byExternal = new Map(
-      observed.map((o) => [o.externalDispatchId, o]),
-    );
-    for (const attempt of this.attempts.values()) {
-      if (!isActive(attempt.state)) {
-        report.alreadyTerminal.push(attempt.attemptId);
-        continue;
-      }
-      const direct =
-        attempt.orcaDispatchId !== undefined
-          ? byExternal.get(attempt.orcaDispatchId)
-          : undefined;
-      if (direct && direct.state === "running") {
-        attempt.state = "running";
-        attempt.updatedAt = this.isoNow();
-        report.adopted.push(attempt.attemptId);
-        continue;
-      }
-      if (!attempt.orcaDispatchId) {
-        const inferred = observed.find(
-          (o) =>
-            o.state === "running" &&
-            o.paperclipTaskId === attempt.paperclipTaskId &&
-            o.leaseToken === attempt.leaseToken,
-        );
-        if (inferred) {
-          attempt.orcaDispatchId = inferred.externalDispatchId;
-          attempt.state = "running";
-          attempt.updatedAt = this.isoNow();
-          report.adopted.push(attempt.attemptId);
+    return this.transact(() => {
+      const report: ReconcileReport = {
+        kept: [],
+        releasedTerminal: [],
+        heldUnknown: [],
+        orphans: [],
+        alreadyTerminal: [],
+      };
+      const matched = new Set<string>();
+      const rows = this.db
+        .prepare(`SELECT * FROM execution_attempts`)
+        .all() as unknown as AttemptRow[];
+      for (const attempt of rows) {
+        if (!isActive(attempt.state)) {
+          report.alreadyTerminal.push(attempt.attempt_id);
           continue;
         }
+        const direct =
+          attempt.orca_dispatch_id != null
+            ? observed.find(
+                (o) => o.externalDispatchId === attempt.orca_dispatch_id,
+              )
+            : undefined;
+        if (direct) {
+          matched.add(direct.externalDispatchId);
+          if (direct.state === "running") {
+            this.setState(attempt.attempt_id, "running");
+            report.kept.push(attempt.attempt_id);
+            continue;
+          }
+          this.setState(attempt.attempt_id, "failed", "runtime_reported_terminal");
+          this.enqueueOutbound(
+            "attempt.failed",
+            {
+              attemptId: attempt.attempt_id,
+              errorCode: "runtime_reported_terminal",
+            },
+            "paperclip-adapter",
+          );
+          report.releasedTerminal.push(attempt.attempt_id);
+          continue;
+        }
+        if (attempt.orca_dispatch_id == null) {
+          const inferred = observed.find(
+            (o) =>
+              o.state === "running" &&
+              o.paperclipTaskId === attempt.paperclip_task_id &&
+              o.leaseToken === attempt.lease_token,
+          );
+          if (inferred) {
+            matched.add(inferred.externalDispatchId);
+            this.db
+              .prepare(
+                `UPDATE execution_attempts
+                 SET orca_dispatch_id = ?, state = 'running', updated_at = ?
+                 WHERE attempt_id = ?`,
+              )
+              .run(inferred.externalDispatchId, this.isoNow(), attempt.attempt_id);
+            report.kept.push(attempt.attempt_id);
+            continue;
+          }
+        }
+        if (attempt.state !== "unknown") {
+          this.setState(attempt.attempt_id, "unknown");
+        }
+        report.heldUnknown.push(attempt.attempt_id);
       }
-      if (attempt.state !== "unknown") {
-        attempt.state = "unknown";
-        attempt.updatedAt = this.isoNow();
+      for (const o of observed) {
+        if (!matched.has(o.externalDispatchId)) {
+          const known = rows.some((r) => r.orca_dispatch_id === o.externalDispatchId);
+          if (!known) report.orphans.push(o.externalDispatchId);
+        }
       }
-      report.markedUnknown.push(attempt.attemptId);
-    }
-    return report;
+      return report;
+    });
+  }
+
+  private setState(
+    attemptId: string,
+    state: AttemptState,
+    errorCode?: string,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE execution_attempts
+         SET state = ?, error_code = COALESCE(?, error_code), updated_at = ?
+         WHERE attempt_id = ?`,
+      )
+      .run(state, errorCode ?? null, this.isoNow(), attemptId);
   }
 
   /** Claim due, undelivered, non-dead-letter entries for one delivery pass. */
   claimDueOutbound(limit = 50): OutboxEntry[] {
-    const now = this.clock();
-    const due = [...this.outbox.values()]
-      .filter(
-        (e) =>
-          !e.deadLettered &&
-          e.deliveredAt === null &&
-          Date.parse(e.nextAttemptAt) <= now,
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM outbound_events
+         WHERE dead_lettered = 0 AND delivered_at IS NULL AND next_attempt_at <= ?
+         ORDER BY next_attempt_at ASC LIMIT ?`,
       )
-      .sort((a, b) => a.nextAttemptAt.localeCompare(b.nextAttemptAt))
-      .slice(0, limit);
-    return due.map((e) => ({ ...e, body: { ...e.body } }));
+      .all(this.isoNow(), limit) as Record<string, unknown>[];
+    return rows.map(toOutboxEntry);
   }
 
   markDelivered(entryId: string): void {
-    const entry = this.outbox.get(entryId);
-    if (!entry || entry.deliveredAt !== null || entry.deadLettered) return;
-    entry.deliveredAt = this.isoNow();
+    this.db
+      .prepare(
+        `UPDATE outbound_events SET delivered_at = ?
+         WHERE id = ? AND delivered_at IS NULL AND dead_lettered = 0`,
+      )
+      .run(this.isoNow(), entryId);
   }
 
   /**
@@ -741,37 +983,79 @@ export class AttemptStore {
    * `maxOutboxAttempts` dead-letters the entry with a human-visible reason.
    */
   markDeliveryFailed(entryId: string, error: string): void {
-    const entry = this.outbox.get(entryId);
-    if (!entry || entry.deliveredAt !== null || entry.deadLettered) return;
-    entry.attempts += 1;
-    entry.lastError = error;
-    if (entry.attempts >= this.maxOutboxAttempts) {
-      entry.deadLettered = true;
-      entry.deadLetterReason =
-        `gave up after ${entry.attempts} attempts: ${error}`;
-      return;
-    }
-    const delay = Math.min(
-      this.outboxBaseDelayMs * 2 ** (entry.attempts - 1),
-      this.outboxMaxDelayMs,
-    );
-    entry.nextAttemptAt = new Date(this.clock() + delay).toISOString();
+    this.transact(() => {
+      const row = this.db
+        .prepare(`SELECT * FROM outbound_events WHERE id = ?`)
+        .get(entryId) as Record<string, unknown> | undefined;
+      if (!row || row["delivered_at"] !== null || row["dead_lettered"] !== 0) {
+        return;
+      }
+      const attempts = (row["attempts"] as number) + 1;
+      if (attempts >= this.maxOutboxAttempts) {
+        this.db
+          .prepare(
+            `UPDATE outbound_events
+             SET attempts = ?, last_error = ?, dead_lettered = 1, dead_letter_reason = ?
+             WHERE id = ?`,
+          )
+          .run(
+            attempts,
+            error,
+            `gave up after ${attempts} attempts: ${error}`,
+            entryId,
+          );
+        return;
+      }
+      const delay = Math.min(
+        this.outboxBaseDelayMs * 2 ** (attempts - 1),
+        this.outboxMaxDelayMs,
+      );
+      this.db
+        .prepare(
+          `UPDATE outbound_events
+           SET attempts = ?, last_error = ?, next_attempt_at = ? WHERE id = ?`,
+        )
+        .run(
+          attempts,
+          error,
+          new Date(this.clock() + delay).toISOString(),
+          entryId,
+        );
+    });
   }
 
   listDeadLetter(): OutboxEntry[] {
-    return [...this.outbox.values()]
-      .filter((e) => e.deadLettered)
-      .map((e) => ({ ...e, body: { ...e.body } }));
+    const rows = this.db
+      .prepare(`SELECT * FROM outbound_events WHERE dead_lettered = 1`)
+      .all() as Record<string, unknown>[];
+    return rows.map(toOutboxEntry);
   }
 
   /** Test/ops introspection: pending (undelivered, non-dead-letter) count. */
   pendingOutboundCount(): number {
-    let count = 0;
-    for (const e of this.outbox.values()) {
-      if (e.deliveredAt === null && !e.deadLettered) count += 1;
-    }
-    return count;
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM outbound_events
+         WHERE delivered_at IS NULL AND dead_lettered = 0`,
+      )
+      .get() as { n: number };
+    return row.n;
   }
+}
+
+function toOutboxEntry(row: Record<string, unknown>): OutboxEntry {
+  return {
+    id: row["id"] as string,
+    eventType: row["event_type"] as string,
+    body: JSON.parse(row["body"] as string) as Record<string, unknown>,
+    destination: row["destination"] as string,
+    attempts: row["attempts"] as number,
+    nextAttemptAt: row["next_attempt_at"] as string,
+    lastError: row["last_error"] as string | null,
+    deliveredAt: row["delivered_at"] as string | null,
+    deadLettered: (row["dead_lettered"] as number) !== 0,
+    deadLetterReason: row["dead_letter_reason"] as string | null,
+  };
 }
 
 function nextStateForEvent(
@@ -802,3 +1086,5 @@ function nextStateForEvent(
       return null;
   }
 }
+
+export type { AttemptReceipt, AttemptState, CreateAttemptRequest };

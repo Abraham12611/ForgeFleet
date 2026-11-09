@@ -1,0 +1,14 @@
+{
+  "name": "@forgefleet/events",
+  "version": "0.1.0",
+  "description": "Normalized ForgeFleet v0.1 bridge event envelope helpers (FF-006).",
+  "type": "module",
+  "scripts": {
+    "test": "node --test src/envelope.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
