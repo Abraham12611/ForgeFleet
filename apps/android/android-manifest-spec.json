@@ -1,0 +1,34 @@
+{
+  "applicationId": "com.example.forgefleet.placeholder",
+  "versioning": {
+    "versionCodeStrategy": "monotonic integer, +1 per release candidate",
+    "versionNameStrategy": "semver matching the web release being packaged (e.g. 1.1.0-rc.1)"
+  },
+  "sdkPolicy": "Verify the current Google Play target-SDK requirement at build time and record the resolved values in the release PR. No hardcoded SDK level is claimed here.",
+  "permissions": [
+    "android.permission.INTERNET",
+    "android.permission.POST_NOTIFICATIONS"
+  ],
+  "intentFilters": [
+    {
+      "purpose": "custom scheme deep links",
+      "scheme": "forgefleet",
+      "host": null
+    },
+    {
+      "purpose": "Android App Links",
+      "scheme": "https",
+      "host": "app.example.invalid",
+      "autoVerify": true,
+      "note": "PLACEHOLDER host. Replace with the owner-chosen domain before release; the assetlinks.json file must be served from that domain."
+    }
+  ],
+  "assets": {
+    "adaptiveIcon": "REQUIRED before internal track: foreground + background layers, all densities",
+    "splash": "REQUIRED: splash drawable matching web launch screen",
+    "notificationIcon": "REQUIRED: monochrome small icon for push notifications"
+  },
+  "lifecycle": {
+    "note": "Verify background/foreground restore, session expiry surfacing, and offline/reconnect indicators on a real device per on-device-test-plan.md."
+  }
+}
