@@ -1,0 +1,13 @@
+{
+  "applicationId": "__OWNER_TO_DECIDE__",
+  "versionCode": 0,
+  "versionName": "",
+  "aab": "app-release.aab",
+  "privacyPolicyUrl": "",
+  "dataSafetyComplete": false,
+  "appAccessInstructions": "",
+  "targetSdkVersion": 0,
+  "internalTesters": [],
+  "releaseNotes": "",
+  "smokeEvidence": "smoke.json"
+}
