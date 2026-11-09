@@ -41,6 +41,36 @@ services:
           cpus: "1.0"
           memory: 1G
 
+  # FF-022 split-phase edge (opt-in): authenticated public ingress for the
+  # Vercel/Vultr split. Inactive unless explicitly selected with
+  # `docker compose --profile split up -d edge` AFTER the split-compatibility
+  # matrix (infra/split-compatibility-matrix.md) records PASS for S-01..S-07.
+  # Default `up -d db paperclip` never starts it. Never add the bridge here
+  # (single-supervisor rule above); never publish non-loopback ports.
+  edge:
+    image: "${CADDY_IMAGE:?set CADDY_IMAGE to the pinned Caddy release}"
+    profiles:
+      - split
+    restart: unless-stopped
+    depends_on:
+      paperclip:
+        condition: service_healthy
+    ports:
+      # Loopback only. Public 443 reach comes from host firewall/NAT, not compose.
+      - "127.0.0.1:${EDGE_HTTP_PORT:-80}:80"
+      - "127.0.0.1:${EDGE_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./ingress/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      - forge-internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2019/config/ | grep -q apps"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   paperclip:
     image: "${PAPERCLIP_IMAGE:?set PAPERCLIP_IMAGE to the pinned Paperclip release}"
     restart: unless-stopped
@@ -78,3 +108,5 @@ networks:
 volumes:
   pgdata:
   context-store:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,18 @@
+# FF-022: daily backup timer for the canonical backup.sh (FF-005).
+# Runs as root (system unit) so it can read the operator-owned bridge state
+# dir and the root-only postgres env; snapshot dirs are chmod 700/600 by the
+# script. Never touches orca-serve.service.
+[Unit]
+Description=ForgeFleet daily backup (db + context + bridge state)
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/forgefleet/postgres.env
+Environment=BACKUP_DIR=/var/backups/forgefleet
+ExecStart=/opt/forgefleet/scripts/deploy/backup.sh --apply
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+UMask=0077

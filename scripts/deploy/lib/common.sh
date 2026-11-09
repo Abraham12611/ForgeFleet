@@ -115,3 +115,22 @@ restore_bridge_state() {
   tar -xzf "$snap/bridge-state.tgz" -C "$(dirname "$dst")"
   log "bridge state restored to $dst (bridge unit stays fenced)"
 }
+
+# --- FF-022 additions (additive only; canonical helpers above unchanged) ---
+
+die()  { warn "$*"; exit 1; }
+
+# Fail closed listing only env NAMES (values stay in secret storage).
+require_names() {
+  local missing=()
+  for name in "$@"; do
+    [ -n "${!name:-}" ] || missing+=("$name")
+  done
+  [ "${#missing[@]}" -eq 0 ] || die "missing required env names: ${missing[*]}"
+}
+
+# Guard live host mutations behind an explicit flag (dry-run by default).
+confirm_live() {
+  [ "${FORGEFLEET_LIVE_OK:-0}" = "1" ] \
+    || die "refusing live change without FORGEFLEET_LIVE_OK=1 (dry-run by default)"
+}
