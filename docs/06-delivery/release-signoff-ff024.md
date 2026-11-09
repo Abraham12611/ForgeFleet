@@ -40,6 +40,11 @@ from `examples/release-evidence.example.json` is a format example until every
 gate cites a live observation ref. Do not mark v1.0 shipped until the gate
 reports PASS on real evidence with owner approval recorded.
 
+Environment: all tests below were executed on the owner's local MacBook
+(macOS). They validate gate logic only and are not proof of Vultr VPS or
+Orca Linux service compatibility. No VPS, service, or production action was
+taken; manual UI testing is owner-side per #64.
+
 ## Coordinator review (PR #50): offline scope
 
 Per coordinator review, this tool is an **offline, caller-supplied
