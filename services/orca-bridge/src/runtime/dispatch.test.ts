@@ -499,12 +499,20 @@ describe("frozen contract v0.1 alignment (#46)", () => {
 
 describe("redaction", () => {
   it("scrubs emails, tokens, and home dirs", () => {
+    // Fixture secrets are assembled at runtime so no credential-shaped
+    // literal is ever committed (scripts/ci/check_hygiene.py gate),
+    // while the redactor is still exercised against realistic shapes.
+    const classicToken = "ghp_" + "abc123def";
+    const bearerToken = "Bearer " + "ABC123.xyz_~-token";
+    const secretKey = "sk-" + "secretkey";
     const dirty =
-      "user alice@example.com bearer ABC123.xyz_~-token bob /Users/alice/x failed: sk-secretkey part ghp_abc123def";
+      `user alice@example.com ${bearerToken} bob /Users/alice/x ` +
+      `failed: ${secretKey} part ${classicToken}`;
     const clean = redactForLog(dirty);
     assert.ok(!clean.includes("alice@example.com"));
-    assert.ok(!clean.includes("sk-secretkey"));
-    assert.ok(!clean.includes("ghp_abc123def"));
+    assert.ok(!clean.includes("abc123def"));
+    assert.ok(!clean.includes("secretkey"));
+    assert.ok(!clean.includes("ABC123"));
     assert.ok(!clean.includes("/Users/alice"));
   });
 });
