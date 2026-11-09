@@ -1,0 +1,13 @@
+{
+  "contractVersion": "0.1.0",
+  "openapiSpec": "docs/05-contracts/bridge.openapi.yaml",
+  "openapiVersion": "0.1.0",
+  "schemas": {
+    "bridge-api.schema.json": "4d402cf962d0064d958666855fd3ca0ee3cc58e84a1fd69fb6771bbd48896e22",
+    "bridge-events.schema.json": "4960849016a22aa28a139a32bd28fde14df7c56adb7a88546cbd54201c91676a"
+  },
+  "generated": {
+    "generated/bridge.types.ts": "f4d176dbf6c3576facb44777a7109c3b5f78c3cb5a6fb7b1e31af43372098ad3",
+    "src/bridge_contracts/_generated.py": "83b496ee6b291f39318d16c98d13c6ece780fc569306b22a447c65dbd3ec9e72"
+  }
+}

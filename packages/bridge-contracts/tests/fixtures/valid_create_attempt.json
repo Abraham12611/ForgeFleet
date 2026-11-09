@@ -1,0 +1,14 @@
+{
+  "projectId": "project_123",
+  "paperclipTaskId": "task_123",
+  "paperclipRunId": "run_123",
+  "workerKind": "muse",
+  "taskTitle": "Probe installed Orca nonintrusively",
+  "instruction": "List sessions read-only; change nothing.",
+  "contextManifestId": "context-v1",
+  "repositoryId": "sandbox-repo",
+  "lease": {
+    "fencingEpoch": 1,
+    "leaseToken": "lease-token-abc"
+  }
+}

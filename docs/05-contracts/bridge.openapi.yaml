@@ -1,10 +1,14 @@
 openapi: 3.1.0
 info:
-  title: ForgeFleet Orca Bridge API (proposed)
-  version: 0.1.0-draft
+  title: ForgeFleet Orca Bridge API
+  version: 0.1.0
   description: >
-    Specification of ForgeFleet-owned internal bridge API, NOT an existing Orca endpoint.
-    Pending version-specific Orca command verification and external Paperclip adapter implementation.
+    Frozen v0.1 specification of the ForgeFleet-owned internal bridge API.
+    This is NOT an existing Orca endpoint. Orca command behavior remains
+    version-specific and must be verified against the installed Orca runtime;
+    the external Paperclip adapter is implemented against this frozen contract.
+    Breaking changes require a version bump and explicit downstream
+    acknowledgement. Compatible clarifications only within 0.1.x.
 servers:
   - url: http://127.0.0.1:4387
     description: Loopback-only behind authenticated backend proxy
@@ -34,6 +38,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RuntimeCapabilities'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/runtime/sessions:
     get:
       tags: [Runtime]
@@ -48,12 +54,9 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [sessions]
-                properties:
-                  sessions:
-                    type: array
-                    items: {$ref: '#/components/schemas/RuntimeSession'}
+                $ref: '#/components/schemas/RuntimeSessionList'
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/attempts:
     post:
       tags: [Attempts]
@@ -77,6 +80,8 @@ paths:
         '409': {description: Conflicting idempotency key/request or active lease}
         '422': {description: Capability/policy rejected}
         '429': {description: Backpressure or quota exhausted}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/attempts/{attemptId}:
     get:
       tags: [Attempts]
@@ -89,7 +94,9 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AttemptReceipt'}
-        '404': {description: Unknown attempt}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
   /v1/attempts/{attemptId}/cancel:
     post:
       tags: [Attempts]
@@ -104,15 +111,12 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [reason, approvedBy]
-              properties:
-                reason: {type: string}
-                approvedBy: {type: string, description: Validated actor ID with cancel privilege}
+            schema: {$ref: '#/components/schemas/CancelAttemptRequest'}
       responses:
         '202': {description: Cancellation requested; runtime confirmation pending}
-        '403': {description: Operation not permitted}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
   /v1/attempts/{attemptId}/messages:
     post:
       tags: [Messages]
@@ -130,7 +134,9 @@ paths:
             schema: {$ref: '#/components/schemas/SendMessageRequest'}
       responses:
         '202': {description: Queued for authorized delivery}
-        '403': {description: Not authorized}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '409': {description: Attempt not messageable}
   /v1/events:
     get:
@@ -147,7 +153,25 @@ paths:
           content:
             text/event-stream:
               schema: {type: string}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
 components:
+  responses:
+    Unauthorized:
+      description: Missing or invalid service token
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: Authenticated identity lacks scope or policy permission
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: Unknown attempt or resource
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
   securitySchemes:
     serviceToken:
       type: http
@@ -222,6 +246,7 @@ components:
         errorCode: {type: [string, 'null']}
     SendMessageRequest:
       type: object
+      additionalProperties: false
       required: [projectId, threadId, actorId, body]
       properties:
         projectId: {type: string}
@@ -229,3 +254,26 @@ components:
         actorId: {type: string}
         body: {type: string, maxLength: 20000}
         kind: {enum: [question, answer, update, unblock, instruction]}
+    CancelAttemptRequest:
+      type: object
+      additionalProperties: false
+      required: [reason, approvedBy]
+      properties:
+        reason: {type: string, minLength: 1}
+        approvedBy: {type: string, description: Validated actor ID with cancel privilege}
+    RuntimeSessionList:
+      type: object
+      required: [sessions]
+      additionalProperties: false
+      properties:
+        sessions:
+          type: array
+          items: {$ref: '#/components/schemas/RuntimeSession'}
+    Error:
+      type: object
+      required: [errorCode, message]
+      additionalProperties: false
+      properties:
+        errorCode: {type: string, description: Stable machine-readable code, e.g. UNAUTHORIZED, FORBIDDEN, NOT_FOUND, CONFLICT, UNPROCESSABLE, RATE_LIMITED}
+        message: {type: string, description: Human-readable detail without secrets}
+        details: {type: object, description: Optional typed validation failures}

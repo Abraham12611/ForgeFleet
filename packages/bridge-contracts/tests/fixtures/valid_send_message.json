@@ -1,0 +1,7 @@
+{
+  "projectId": "project_123",
+  "threadId": "thread_123",
+  "actorId": "worker:orca-1",
+  "body": "Heartbeat: still reading Orca sessions, no changes made.",
+  "kind": "update"
+}

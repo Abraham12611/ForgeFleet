@@ -1,0 +1,17 @@
+{
+  "reachable": true,
+  "checkedAt": "2026-11-08T12:00:00Z",
+  "cliVersion": "0.0.0-unknown",
+  "commandPath": "/usr/local/bin/orca",
+  "providers": [
+    {
+      "name": "muse",
+      "status": "unknown",
+      "notes": "Version-specific verification pending against installed CLI."
+    },
+    {
+      "name": "devin",
+      "status": "unavailable"
+    }
+  ]
+}
