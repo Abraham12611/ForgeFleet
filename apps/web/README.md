@@ -27,9 +27,11 @@ fallback and local dev proxy.
   same-origin derivation) plus explicit connect-then-poll fallback matching
   the upstream 15s disconnected-poll policy.
 - `src/App.tsx` — status probe + SPA routing shell (`/` `/fleet` catch-all).
-- `vercel.json` — `/api/*` rewrite to the Vultr ingress, SPA fallback to
-  `index.html`. Replace `api.forgefleet.example` with the real owned domain
-  once E17 provisions ingress.
+- `vercel.json` — `/api/*` rewrite (currently a non-routable `.example`
+  placeholder owned by E17/FF-028 ingress work) + SPA fallback to `index.html`.
+  Until E17 substitutes the real staging ingress and E07 clears cross-site
+  session auth, any preview deploy renders the unreachable-backend panel by
+  design — this scaffold is a compile proof, not a functioning preview.
 
 ## What this is not
 
