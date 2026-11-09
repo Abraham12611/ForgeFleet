@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-"""Workstream inventory and integration-report generator (stdlib only).
+"""Workstream suite discovery and integration-report generator (stdlib only).
 
-Prevents false-green CI: every workstream suite the FF-030 issue names is
-either PRESENT (and executed) or explicitly recorded as ABSENT/UNCOVERED.
-A passing run at bootstrap stage therefore reports `SCOPE: PARTIAL`, never
-full integration.
-
-Required paths (missing => exit 1):
-  docs/, SPEC-MANIFEST.json, scripts/check-specs.py,
-  docs/05-contracts/bridge.openapi.yaml, examples/
-
-Optional suites (missing => recorded as uncovered, exit still 0):
-  packages/bridge-contracts contract generator --check (E05)
-  Node node:test suites: packages/{policy,scheduler,messaging,coordinator},
-    services/orca-bridge/src/runtime (E07-E10, E02-E04)
-  Python fixtures: tests/test_*.py (E15)
-  Web Vite install/build/test: apps/web (E12)
+Anti-false-green rules enforced here:
+- Every Node test FILE (*.test.js/.mjs/.cjs/.ts) under a present suite root
+  is enumerated deterministically (sorted) and passed explicitly to
+  `node --test`. Directory paths are never passed: on Node 24 a directory
+  argument does not substitute for explicit test files and hides stderr.
+- A present suite directory containing zero test files is PRESENT-EMPTY and
+  fails the gate (fail closed once milestone code lands).
+- Python suites assert exit 0, an `OK` verdict line, AND a minimum test count,
+  so a silently-empty collection cannot pass.
+- Suite roots that do not exist yet are UNCOVERED, never passing.
+- The report's scope/gap text is generated from detected state; no hardcoded
+  claims about which code exists.
 
 Usage:
   inventory.py [--report PATH] [--prove-fail-closed]
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -39,82 +37,132 @@ REQUIRED = [
     "examples",
 ]
 
-# (workstream, relative path, suite description)
-OPTIONAL_SUITES = [
-    ("E05 contracts", "packages/bridge-contracts", "contract generator --check + tests"),
-    ("E07 policy", "packages/policy", "node:test suite"),
-    ("E08 coordinator", "packages/coordinator", "node:test suite"),
-    ("E09 scheduler", "packages/scheduler", "node:test suite"),
-    ("E10 messaging", "packages/messaging", "node:test suite"),
-    ("E02/E03 runtime", "services/orca-bridge/src/runtime", "node:test suite"),
-    ("E15 fixtures", "tests", "Python fixture suite"),
-    ("E12 web", "apps/web", "Vite install/build/test"),
-]
-
-NODE_SUITE_DIRS = [
-    "packages/policy",
+# Suite roots whose test files are auto-discovered for node --test.
+# packages/bridge-contracts is intentionally absent here: its contract is
+# Python (generate.py --check + unittest suite, run explicitly below), so a
+# Node entry would be a false PRESENT-EMPTY failure, not coverage.
+NODE_ROOTS = [
     "packages/coordinator",
     "packages/scheduler",
-    "packages/messaging",
-    "services/orca-bridge/src/runtime",
+    "services/orca-bridge",
+    "apps/web",
 ]
+NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
+
+# Planned workstream dirs that do not exist yet: reported, never passing.
+FUTURE_MODULES = [
+    "packages/policy",
+    "packages/messaging",
+    "packages/context",
+    "packages/telemetry",
+    "packages/events",
+]
+
+# (label, argv, min_tests): argv runs with cwd=ROOT, must print unittest stats.
+PYTHON_SUITES = [
+    ("packages/bridge-contracts/tests",
+     [sys.executable, "packages/bridge-contracts/tests/test_contract.py"], 32),
+    ("tests/",
+     [sys.executable, "tests/test_ff009_crash_reconciliation.py"], 5),
+    ("apps/android/pwa-prototype/tests",
+     [sys.executable, "-m", "unittest", "discover",
+      "-s", "apps/android/pwa-prototype/tests", "-t", "."], 18),
+    ("apps/android/play-internal/tests",
+     [sys.executable, "-m", "unittest", "discover",
+      "-s", "apps/android/play-internal/tests", "-t", "."], 8),
+    ("apps/android/tests",
+     [sys.executable, "apps/android/tests/test_android_packaging.py"], 7),
+]
+
+STDERR_TAIL_LINES = 25
 
 
 def run(cmd, **kwargs):
     return subprocess.run(cmd, capture_output=True, text=True, **kwargs)
 
 
-def check_specs():
-    proc = run([sys.executable, str(ROOT / "scripts/check-specs.py")], cwd=ROOT)
-    return proc.returncode == 0, (proc.stdout + proc.stderr).strip().splitlines()[-1]
+def tail(text: str, n: int = STDERR_TAIL_LINES) -> str:
+    lines = text.strip().splitlines()
+    return "\n".join(lines[-n:])
 
 
-def node_suites():
-    """Run node:test for each present Node suite dir; return row list."""
-    rows = []
+def discover_node_files(root: str) -> list[str]:
+    base = ROOT / root
+    found: list[str] = []
+    for pattern in NODE_TEST_GLOBS:
+        found.extend(str(p) for p in base.rglob(pattern) if p.is_file())
+    return sorted(found)
+
+
+def node_suites() -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
     node = shutil.which("node")
-    for rel in NODE_SUITE_DIRS:
-        path = ROOT / rel
+    for root in NODE_ROOTS:
+        path = ROOT / root
         if not path.is_dir():
-            rows.append((rel, "ABSENT", "directory not present; uncovered"))
+            rows.append((root, "ABSENT", "not on this branch; uncovered"))
+            continue
+        files = discover_node_files(root)
+        if not files:
+            rows.append((root, "PRESENT-EMPTY",
+                         "dir exists but holds no *.test.{js,mjs,cjs,ts}; fail closed"))
             continue
         if node is None:
-            rows.append((rel, "UNCOVERED", "Node.js not installed on runner"))
+            rows.append((root, "UNCOVERED", "Node.js not installed on runner"))
             continue
-        test_dirs = [d for d in ("test", "tests", "__tests__") if (path / d).is_dir()]
-        test_files = list(path.glob("*.test.js")) + list(path.glob("*.test.mjs"))
-        if not test_dirs and not test_files:
-            rows.append((rel, "PRESENT-NO-TESTS", "dir exists but holds no tests"))
-            continue
-        targets = [str(path / d) for d in test_dirs] + [str(f) for f in test_files]
-        proc = run(["node", "--test", *targets], cwd=ROOT)
-        status = "PASS" if proc.returncode == 0 else "FAIL"
-        tail = (proc.stdout + proc.stderr).strip().splitlines()[-1:]
-        rows.append((rel, status, "; ".join(tail)))
+        proc = run([node, "--test", *files], cwd=ROOT)
+        if proc.returncode == 0:
+            match = re.search(r"[ℹ#] pass (\d+)", proc.stdout + proc.stderr)
+            detail = f"{match.group(1)} tests pass across {len(files)} file(s)" if match else \
+                f"exit 0 across {len(files)} file(s)"
+            rows.append((root, "PASS", detail))
+        else:
+            detail = tail(proc.stdout + "\n" + proc.stderr)
+            rows.append((root, "FAIL", detail))
     return rows
 
 
-def python_fixtures():
-    tests_dir = ROOT / "tests"
-    if not tests_dir.is_dir():
-        return [("tests/", "ABSENT", "directory not present; uncovered")]
-    cases = sorted(tests_dir.glob("test_*.py"))
-    if not cases:
-        return [("tests/", "PRESENT-NO-TESTS", "dir exists but holds no test_*.py")]
-    rows = []
-    for case in cases:
-        proc = run([sys.executable, str(case)], cwd=ROOT)
-        tail = (proc.stdout + proc.stderr).strip().splitlines()[-1:]
-        rows.append((
-            f"tests/{case.name}",
-            "PASS" if proc.returncode == 0 else "FAIL",
-            "; ".join(tail),
-        ))
+def parse_unittest_count(output: str) -> "int | None":
+    match = re.search(r"^Ran (\d+) tests?", output, re.MULTILINE)
+    return int(match.group(1)) if match else None
+
+
+def python_suites() -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for label, argv, minimum in PYTHON_SUITES:
+        proc = run(argv, cwd=ROOT)
+        output = proc.stdout + proc.stderr
+        count = parse_unittest_count(output)
+        ok_line = re.search(r"^OK", output, re.MULTILINE) is not None
+        if proc.returncode == 0 and ok_line and count is not None and count >= minimum:
+            rows.append((label, "PASS", f"{count} tests OK (floor {minimum})"))
+        else:
+            reason = (f"exit={proc.returncode}, ok={ok_line}, "
+                      f"ran={count}, floor={minimum}")
+            rows.append((label, "FAIL", reason + "\n" + tail(output)))
     return rows
+
+
+def future_modules() -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
+    for root in FUTURE_MODULES:
+        if not (ROOT / root).is_dir():
+            rows.append((root, "UNCOVERED",
+                         "planned workstream; no code on this branch"))
+        else:
+            files = discover_node_files(root)
+            rows.append((root, "PRESENT-UNWIRED" if files else "PRESENT-EMPTY",
+                         f"{len(files)} test file(s); add an explicit suite entry"))
+    return rows
+
+
+def check_specs() -> tuple[bool, str]:
+    proc = run([sys.executable, str(ROOT / "scripts/check-specs.py")], cwd=ROOT)
+    lines = (proc.stdout + proc.stderr).strip().splitlines()
+    return proc.returncode == 0, lines[-1] if lines else ""
 
 
 def prove_fail_closed() -> int:
-    """Prove each gate can actually fail (canary trees, never the real tree)."""
     failures: list[str] = []
 
     def gate(script: str, build, expect: str) -> None:
@@ -142,7 +190,11 @@ def prove_fail_closed() -> int:
         )
 
     def bad_token(tmp: Path) -> None:
-        (tmp / "leak.txt").write_text("token = 'ghp_fAKet0ken0123456789abcdef'\n")
+        # Assembled at runtime so this script's own source never contains a
+        # literal token-shaped string; the temp file still presents the full
+        # token to the gate under test.
+        fake = "ghp_" + "fAKet0ken0123456789abcdef"
+        (tmp / "leak.txt").write_text(f"token = '{fake}'\n")
 
     def missing_contract(tmp: Path) -> None:
         (tmp / "examples").mkdir()
@@ -151,7 +203,6 @@ def prove_fail_closed() -> int:
     gate("check_hygiene.py", bad_token, "committed ghp_ token")
     gate("check_contracts.py", missing_contract, "missing contract + fixtures")
 
-    # And the positive control: a fully valid tree passes both gates.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         (root / "examples").mkdir()
@@ -196,6 +247,28 @@ def prove_fail_closed() -> int:
             else:
                 print(f"  control ok: {script} passes on valid tree")
 
+    # Node enumeration canary: a directory path must never stand in for files.
+    with tempfile.TemporaryDirectory() as tmp:
+        suite = Path(tmp) / "suite"
+        (suite / "tests").mkdir(parents=True)
+        (suite / "tests" / "a.test.js").write_text(
+            "const t = require('node:test');\n"
+            "t.test('x', () => {});\n"
+        )
+        node = shutil.which("node")
+        if node is not None:
+            by_dir = run([node, "--test", str(suite / "tests")], cwd=ROOT)
+            by_file = run([node, "--test", str(suite / "tests" / "a.test.js")],
+                          cwd=ROOT)
+            if by_file.returncode != 0:
+                failures.append("node --test cannot run an explicit test file")
+            else:
+                print("  canary ok: explicit file enumeration runs the test")
+                print(f"  note: directory-path invocation exits {by_dir.returncode} "
+                      f"(this is why CI enumerates files, never dirs)")
+        else:
+            print("  note: node unavailable; enumeration canary skipped")
+
     if failures:
         print("Fail-closed proof FAILED:")
         for failure in failures:
@@ -205,49 +278,31 @@ def prove_fail_closed() -> int:
     return 0
 
 
-def build_report(extra_rows: list[tuple[str, str, str]]) -> tuple[str, bool]:
+def build_report() -> tuple[str, bool]:
     missing = [r for r in REQUIRED if not (ROOT / r).exists()]
     ok_specs, specs_detail = check_specs()
-    node_rows = node_suites()
-    py_rows = python_fixtures()
+    rows = node_suites() + python_suites() + future_modules()
 
-    web_dir = ROOT / "apps/web"
-    if not web_dir.is_dir():
-        web_rows = [("apps/web", "ABSENT", "no web app yet; Vite suite uncovered")]
-    else:
-        web_rows = [("apps/web", "PRESENT", "see CI web job for install/build/test")]
-
-    gen = ROOT / "packages/bridge-contracts"
-    if not gen.is_dir():
-        gen_rows = [
-            ("packages/bridge-contracts", "ABSENT",
-             "v0.1 generator --check unavailable; contract YAML gate only")
-        ]
-    else:
-        gen_rows = [("packages/bridge-contracts", "PRESENT", "see CI specs job")]
+    failing = [r for r, s, _ in rows if s in ("FAIL", "PRESENT-EMPTY")]
+    uncovered = [r for r, s, _ in rows if s in ("ABSENT", "UNCOVERED", "PRESENT-UNWIRED")]
+    scope = ("FULL" if not missing and ok_specs and not failing and not uncovered
+             else "PARTIAL (fail-closed: present suites must pass; "
+                  "absent modules uncovered, not passing)")
 
     lines = [
         "# FF-030 CI integration report",
         "",
-        "Generated by `scripts/ci/inventory.py`. Absent suites are UNCOVERED, "
-        "not passing: this report is the anti-false-green record.",
+        "Generated by `scripts/ci/inventory.py` from detected tree state.",
         "",
         "## Scope",
         "",
-    ]
-    absent = (
-        sum(1 for _, s, _ in node_rows if s in ("ABSENT", "UNCOVERED", "PRESENT-NO-TESTS"))
-        + sum(1 for _, s, _ in py_rows if s != "PASS")
-        + (1 if web_dir.is_dir() is False else 0)
-        + (1 if gen.is_dir() is False else 0)
-    )
-    scope = "PARTIAL (bootstrap: specs-only tree)" if absent else "FULL"
-    lines.append(f"SCOPE: {scope} — {absent} suite(s) uncovered or absent.")
-    lines += [
+        f"SCOPE: {scope} — "
+        f"{len(failing)} failing/empty, {len(uncovered)} uncovered.",
         "",
         "## Required baseline",
         "",
-        f"- spec link check (`scripts/check-specs.py`): {'PASS' if ok_specs else 'FAIL'} — {specs_detail}",
+        f"- spec link check (`scripts/check-specs.py`): "
+        f"{'PASS' if ok_specs else 'FAIL'} — {specs_detail}",
         f"- required paths present: {'yes' if not missing else 'NO: ' + ', '.join(missing)}",
         "",
         "## Suites",
@@ -255,30 +310,34 @@ def build_report(extra_rows: list[tuple[str, str, str]]) -> tuple[str, bool]:
         "| Workstream / path | Status | Detail |",
         "|---|---|---|",
     ]
-    for rel, status, detail in gen_rows + node_rows + py_rows + web_rows + extra_rows:
-        lines.append(f"| {rel} | {status} | {detail} |")
+    for rel, status, detail in rows:
+        one_line = " ".join(detail.splitlines()[:3])
+        lines.append(f"| {rel} | {status} | {one_line} |")
     lines += [
         "",
-        "## Known gaps (not failures)",
+        "## Gaps (detected, not asserted)",
         "",
-        "- No `packages/*`, `services/*`, `apps/*`, or `tests/` code exists yet; "
-        "all runtime/policy/planner/scheduler/messaging suites are uncovered by construction.",
-        "- v0.1 contract generator `--check` does not exist yet (E05 Wave 0); "
-        "YAML structural gate stands in.",
-        "- Web Vite suite has no app to build yet (E12 fixtures-only stage).",
+    ]
+    if uncovered:
+        lines.append("- Uncovered (no code yet, not counted as passing): "
+                     + ", ".join(f"`{r}`" for r in uncovered) + ".")
+    if failing:
+        lines.append("- Failing or present-but-empty (must be repaired): "
+                     + ", ".join(f"`{r}`" for r in failing) + ".")
+    if not uncovered and not failing:
+        lines.append("- None: every known suite present and passing.")
+    lines += [
         "- CI runs fake adapters/disposable environments only; no deployment, "
         "no Orca worker starts, no service restarts.",
     ]
-    success = not missing and ok_specs and all(
-        s == "PASS" for _, s, _ in py_rows if s not in ("ABSENT", "PRESENT-NO-TESTS")
-    ) and all(s == "PASS" for _, s, _ in node_rows if s not in ("ABSENT", "UNCOVERED", "PRESENT-NO-TESTS"))
+    success = not missing and ok_specs and not failing
     return "\n".join(lines) + "\n", success
 
 
 def main(argv: list[str]) -> int:
     if "--prove-fail-closed" in argv:
         return prove_fail_closed()
-    report, success = build_report([])
+    report, success = build_report()
     print(report)
     if "--report" in argv:
         out = argv[argv.index("--report") + 1]
