@@ -1,25 +1,43 @@
-# ForgeFleet orca-bridge daemon (private phase). Hardened; loopback only.
+# ForgeFleet orca-bridge daemon (private phase) — systemd USER unit.
 # Reference minimal example: ../example-orca-bridge.service (kept unchanged).
+#
+# CANONICAL SINGLE-SUPERVISOR MODEL (FF-005): the bridge runs ONLY here, as a
+# user service under the operator login UID — the same UID that owns
+# orca-serve.service — and NEVER as a compose service (compose owns db and
+# paperclip only). Rationale: the bridge execs the Orca user-session CLI
+# (ORCA_CLI_COMMAND / orca-ide). Same-UID native execution inherits the login
+# session context with ZERO credential mounts; containerizing it would force
+# mounting the CLI, session bus and home credentials into Docker.
+# Install (operator login user, never root):
+#   systemctl --user enable --now forgefleet-bridge.service
 [Unit]
-Description=ForgeFleet Orca Bridge (private, loopback only)
-After=network-online.target forgefleet-paperclip.service
+Description=ForgeFleet Orca Bridge (private, loopback only, user service)
+After=network-online.target
 Wants=network-online.target
 # Explicitly NOT BoundTo/PartOf orca-serve.service: bridge reads Orca via the
 # version-matched CLI only and must never restart or reconfigure it.
+# Ordering vs the system-managed compose stack (db, paperclip) cannot use
+# After= across the user/system manager boundary, so startup gating is done
+# at runtime by wait-for-paperclip.sh (polls Paperclip health, fails closed).
 
 [Service]
 Type=simple
 ExecStartPre=/opt/forgefleet/scripts/deploy/guard-loopback.sh
+ExecStartPre=/opt/forgefleet/scripts/deploy/wait-for-paperclip.sh
 ExecStart=/usr/bin/env node /opt/forgefleet/services/orca-bridge/dist/index.js
 WorkingDirectory=/opt/forgefleet
-EnvironmentFile=/etc/forgefleet/bridge.env
+EnvironmentFile=%h/.config/forgefleet/bridge.env
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=read-only
+# ProtectHome stays OFF on purpose: this unit runs as the operator user and
+# execs that same user's Orca CLI, which reads/writes the operator HOME
+# (sessions, logs). Same-UID execution adds no new home exposure beyond the
+# operator's own shell. Containment here is the loopback-only bind plus never
+# managing the Orca service — both enforced by guards, not by this sandbox.
 UMask=0077
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

@@ -1,4 +1,6 @@
 # ForgeFleet private Paperclip stack (compose wrapper). Does NOT manage orca-serve.
+# Canonical FF-005 topology: this wrapper owns db + paperclip ONLY. The bridge
+# is the sibling user unit forgefleet-bridge.service, never a compose service.
 [Unit]
 Description=ForgeFleet Paperclip private stack (compose)
 After=network-online.target docker.service

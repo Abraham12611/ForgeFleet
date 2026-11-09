@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Loopback health probe for the private stack (FF-005). Read-only.
 # Checks distinct live/ready states; never touches orca-serve.service.
+# The bridge probe hits the native user unit's loopback listener (the bridge
+# is not a compose service). BRIDGE_HEALTH_PATH is single-sourced with
+# infra/bridge.env.example; PAPERCLIP_HEALTH_PATH with compose.
 set -euo pipefail
 # shellcheck disable=SC1091
 . "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"

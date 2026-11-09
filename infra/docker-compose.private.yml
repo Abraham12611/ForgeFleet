@@ -5,8 +5,16 @@
 # All published ports bind 127.0.0.1 only. Public ingress stays disabled
 # until the auth/realtime gates in docs/03-architecture/infra-deployment.md pass.
 #
+# SINGLE-SUPERVISOR RULE (canonical FF-005 topology): this file owns ONLY the
+# containerized services (db, paperclip). The orca-bridge daemon NEVER runs
+# here — it runs as the systemd user unit
+# infra/systemd/forgefleet-bridge.service under the operator login UID, so it
+# can exec the Orca user-session CLI without mounting home credentials into
+# Docker. Do not re-add a bridge service: deploy scripts and selftest refuse it.
+#
 # Image tags and health paths are TBD until E01 pins the Paperclip release.
 # Required variables fail closed (${VAR:?message}) instead of guessing.
+# PAPERCLIP_HEALTH_PATH is single-sourced with scripts/deploy/healthcheck.sh.
 
 name: forge-private
 
@@ -63,37 +71,6 @@ services:
           cpus: "2.0"
           memory: 2G
 
-  bridge:
-    image: "${BRIDGE_IMAGE:?set BRIDGE_IMAGE to the pinned orca-bridge build}"
-    restart: unless-stopped
-    depends_on:
-      paperclip:
-        condition: service_started
-    env_file:
-      - path: /etc/forgefleet/bridge.env
-        required: true
-    environment:
-      BRIDGE_BIND: "${BRIDGE_BIND:-127.0.0.1:8787}"
-      # Kill switch: 1 pauses all new dispatch, leaves running workers alone.
-      BRIDGE_NO_NEW_DISPATCH: "${BRIDGE_NO_NEW_DISPATCH:-0}"
-    ports:
-      # Loopback only. Never publish the bridge publicly.
-      - "127.0.0.1:${BRIDGE_PORT:-8787}:8787"
-    volumes:
-      - bridge-state:/var/lib/forgefleet/bridge
-    networks:
-      - forge-internal
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8787$${BRIDGE_HEALTH_PATH:-/healthz} | grep -q ok"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: "1.0"
-          memory: 512M
-
 networks:
   forge-internal:
     internal: true
@@ -101,4 +78,3 @@ networks:
 volumes:
   pgdata:
   context-store:
-  bridge-state:

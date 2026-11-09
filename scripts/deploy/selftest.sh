@@ -15,7 +15,7 @@ I="$FF_ROOT/infra"
 # all checks below scan code with trailing comments stripped, so prose that
 # names a forbidden thing cannot trip its own guard.
 OPS="$(find "$D" -name '*.sh' -not -name 'selftest.sh' | sort)"
-no_comments() { sed 's/#.*//'; }
+no_comments() { sed 's/#.*//' "$@"; }
 
 # 1. All scripts parse.
 for f in "$D"/*.sh "$D"/lib/*.sh; do
@@ -84,6 +84,53 @@ for s in deploy-private backup restore rollback-private; do
   grep -q -- '--apply' "$D/$s.sh" && ok "$s.sh gates mutation behind --apply" \
     || bad "$s.sh has no --apply gate"
 done
+
+# 9. Single bridge supervisor (FF-005 canonical topology): the bridge runs
+# ONLY as the systemd user unit, never as a compose service.
+no_comments < "$I/docker-compose.private.yml" | grep -qE '^[[:space:]]{2}bridge:' \
+  && bad "compose defines a bridge service (dual supervisor)" || ok "compose has no bridge service"
+grep -q 'WantedBy=default.target' "$I/systemd/forgefleet-bridge.service" \
+  && ok "bridge unit is a user unit" || bad "bridge unit is not a user unit"
+grep -qE '^User=' "$I/systemd/forgefleet-bridge.service" \
+  && bad "bridge user unit overrides User=" || ok "bridge unit runs as the invoking operator user"
+# Match bridge only as a standalone compose service argument (prose that
+# merely names the bridge next to a plan line must not trip this guard).
+if no_comments $OPS | grep -E 'compose +(-f +[^ ]+ +)?(up|stop)( .*)? bridge([^a-zA-Z_]|$)' | grep -q .; then
+  bad "a deploy script still targets a compose bridge service"
+else
+  ok "no deploy script targets a compose bridge service"
+fi
+# Health-path contract is single-sourced: the compose Paperclip healthcheck
+# and healthcheck.sh read the same variable name, and the native bridge
+# health probe and bridge.env.example share theirs — so a later pin changes
+# one value only.
+if grep -q "PAPERCLIP_HEALTH_PATH" "$I/docker-compose.private.yml" \
+  && grep -q "PAPERCLIP_HEALTH_PATH" "$D/healthcheck.sh"; then
+  ok "health path PAPERCLIP_HEALTH_PATH is single-sourced"
+else
+  bad "health path PAPERCLIP_HEALTH_PATH diverged between compose and healthcheck"
+fi
+if grep -q "BRIDGE_HEALTH_PATH" "$I/bridge.env.example" \
+  && grep -q "BRIDGE_HEALTH_PATH" "$D/healthcheck.sh"; then
+  ok "health path BRIDGE_HEALTH_PATH is single-sourced"
+else
+  bad "health path BRIDGE_HEALTH_PATH diverged between env example and healthcheck"
+fi
+# Backup/restore snapshot exactly the data volume compose defines.
+for v in context-store; do
+  if grep -q "$v" "$I/docker-compose.private.yml" && grep -q "$v" "$D/backup.sh" && grep -q "$v" "$D/restore.sh"; then
+    ok "volume $v reconciled across compose/backup/restore"
+  else
+    bad "volume $v missing in compose/backup/restore"
+  fi
+done
+# No home bind mounts anywhere in compose: the bridge reaches the Orca CLI
+# as the same UID natively, never by mounting home into Docker.
+if grep -E '^[[:space:]]+-.*(\$HOME|/home/|%h|~/)' "$I/docker-compose.private.yml" | grep -q .; then
+  bad "compose bind-mounts a home directory"
+else
+  ok "compose mounts no home directories"
+fi
 
 echo "---"
 echo "selftest: $pass passed, $failed failed (fixture-only, not integration evidence)"

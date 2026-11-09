@@ -19,6 +19,15 @@ if need_cmd systemctl; then
   fi
   # Redact values: print key presence, never environment contents.
   systemctl --user show orca-serve.service -p ExecStart -p User 2>/dev/null | sed 's/=.*ExecStart.*/ExecStart=[redacted-check-manually]/' || true
+  # Same-UID proof: the bridge user unit runs as this login user, so it must
+  # match the user that owns orca-serve.service (else the bridge cannot see that CLI session).
+  orca_user="$(systemctl --user show orca-serve.service -p User 2>/dev/null | sed 's/^User=//')"
+  if [ -n "$orca_user" ] && [ "$orca_user" != "$(id -un)" ]; then
+    warn "login user $(id -un) != orca-serve owner ${orca_user:-<unset>} (enable the bridge unit as ${orca_user:-that user})"
+    fail=1
+  elif [ -n "$orca_user" ]; then
+    log "same-UID confirmed: bridge and orca-serve both owned by $orca_user"
+  fi
 else
   warn "systemctl unavailable; cannot observe orca-serve.service"
   fail=1
@@ -44,13 +53,32 @@ else
   warn "tailscale CLI not found; private admin reach not verified"
 fi
 
-# 4. Container toolchain and scaffold pins.
+# 4. Container toolchain and scaffold pins. The bridge is native (no image).
 need_cmd docker || fail=1
 [ -f "$COMPOSE_FILE" ] && log "compose file present" || { warn "missing $COMPOSE_FILE"; fail=1; }
-env_presence PAPERCLIP_IMAGE BRIDGE_IMAGE POSTGRES_IMAGE || true
-for img in PAPERCLIP_IMAGE BRIDGE_IMAGE POSTGRES_IMAGE; do
+env_presence PAPERCLIP_IMAGE POSTGRES_IMAGE || true
+for img in PAPERCLIP_IMAGE POSTGRES_IMAGE; do
   [ -n "${!img:-}" ] || { warn "$img unset (E01 pin OPEN)"; fail=1; }
 done
+# Single-supervisor regression check: compose must not define a bridge service.
+if sed 's/#.*//' "$COMPOSE_FILE" | grep -qE '^[[:space:]]{2}bridge:'; then
+  warn "compose defines a bridge service (bridge runs as the user unit only)"
+  fail=1
+fi
+# Native bridge entrypoint the user unit will exec.
+if [ -f /opt/forgefleet/services/orca-bridge/dist/index.js ]; then
+  log "bridge entrypoint present"
+else
+  warn "bridge entrypoint missing (build the bridge before enabling the user unit)"
+fi
+# Unprivileged-user proof: the bridge user unit runs as this login UID, which
+# must be the same unprivileged user that owns orca-serve.service — never root.
+if [ "$(id -u)" = "0" ]; then
+  warn "preflight runs as root; the bridge user unit must be enabled as the operator login user"
+  fail=1
+else
+  log "operator user: $(id -un) (uid $(id -u)) — bridge user unit runs as this UID"
+fi
 
 # 5. Secret files must exist with root-only permissions when present.
 for f in /etc/forgefleet/paperclip.env /etc/forgefleet/bridge.env /etc/forgefleet/postgres.env; do

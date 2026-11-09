@@ -17,11 +17,45 @@ disturb it: no restart, no config change, no shared scheduler.
 |---|---|---|
 | PostgreSQL (Paperclip data) | `docker-compose.private.yml` (`db`) | internal compose network only, no published port |
 | Paperclip server + bundled UI (alpha) | `docker-compose.private.yml` (`paperclip`) | loopback `127.0.0.1` only, private/Tailscale reach |
-| `orca-bridge` daemon | `docker-compose.private.yml` (`bridge`) + `systemd/forgefleet-bridge.service` | loopback or Unix socket only, authenticated |
+| `orca-bridge` daemon (native user service) | `systemd/forgefleet-bridge.service` only — never compose | loopback `127.0.0.1:8787`, authenticated |
 | Future public ingress | `ingress/Caddyfile.disabled.example` | **disabled**: do not enable until auth/realtime gates pass |
 
 `example-orca-bridge.service` is the original minimal example and is kept
 unchanged for reference. `systemd/` holds the hardened private-phase units.
+
+## Single bridge process model (canonical FF-005 decision)
+
+The bridge runs **only** as the systemd **user** unit
+`systemd/forgefleet-bridge.service`, under the operator login UID (the same
+unprivileged user that owns `orca-serve.service`). Compose owns `db` and
+`paperclip` only — a `bridge` service in compose is a dual-supervisor bug:
+deploy scripts refuse it and `selftest.sh` fails on it.
+
+Why native instead of a container:
+
+- The bridge execs the Orca user-session CLI (`ORCA_CLI_COMMAND`/`orca-ide`).
+  Same-UID native execution inherits the login session context with zero
+  credential mounts. Containerizing it would force mounting the CLI, the
+  session bus, and home credentials into Docker — the exact exposure the
+  private phase forbids. Compose therefore mounts no home directories
+  (guarded by selftest).
+- Ordering across the user/system manager boundary cannot use `After=`, so
+  the unit gates startup at runtime: `wait-for-paperclip.sh` polls Paperclip
+  health on loopback and fails closed on timeout.
+- Backup/restore mirror exactly what exists: `pg_dump` + `context-store`
+  volume (compose) + the native bridge state dir (`BRIDGE_STATE_DIR`).
+
+Health paths are single-sourced by variable name (`PAPERCLIP_HEALTH_PATH`
+shared by compose and `healthcheck.sh`; `BRIDGE_HEALTH_PATH` shared by
+`bridge.env.example` and `healthcheck.sh`), so pinning the real Paperclip
+image (E01) or the bridge API (#60) changes one value each. Current values
+are placeholders: port `8787` and `/healthz` diverge from later spikes and
+converge when those contracts land.
+
+Coordination note: PR #51 (FF-022) sketches a different topology (bridge in
+compose, port `4387`). This scaffold is the canonical private-phase path per
+coordinator review; #51 rebases onto it after merge rather than landing a
+parallel stack.
 
 ## Isolation guarantees (enforced, not just documented)
 
@@ -60,14 +94,19 @@ evidence: it validates scaffold shape and guards using fixtures only.
 ./scripts/deploy/provision-private.sh
 
 # 2. Copy examples, inject real values out of tree (root-only perms).
+#    paperclip/postgres env lives in /etc (compose); bridge env lives in the
+#    operator home (native user unit). Run deploy as the operator user.
 cp infra/paperclip.env.example /etc/forgefleet/paperclip.env
-cp infra/bridge.env.example /etc/forgefleet/bridge.env
 cp infra/postgres.env.example /etc/forgefleet/postgres.env
-chmod 600 /etc/forgefleet/*.env
+cp infra/bridge.env.example ~/.config/forgefleet/bridge.env
+chmod 600 /etc/forgefleet/*.env ~/.config/forgefleet/bridge.env
 
-# 3. Plan, then apply.
+# 3. Plan, then apply (compose stack only: db + paperclip).
 ./scripts/deploy/deploy-private.sh            # dry-run plan
 ./scripts/deploy/deploy-private.sh --apply    # real deploy
+
+# 4. Enable the bridge user unit (operator login user, never root).
+systemctl --user enable --now forgefleet-bridge.service
 
 # 4. Verify loopback health (distinct live/ready states).
 ./scripts/deploy/healthcheck.sh

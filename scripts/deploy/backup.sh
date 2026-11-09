@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Snapshot PostgreSQL + context store for the private stack (FF-005).
+# Snapshot the private stack's durable state (FF-005).
 # Default is dry-run. --apply writes to BACKUP_DIR with timestamped files.
+# Contents mirror exactly the volumes compose defines plus the native bridge
+# state dir: pg_dump (db service) + context-store volume + bridge host state.
 # Never prints secrets; never touches orca-serve.service.
 set -euo pipefail
 # shellcheck disable=SC1091
@@ -8,9 +10,10 @@ set -euo pipefail
 
 if want_apply --apply "$@"; then APPLY=1; else APPLY=0; fi
 BACKUP_DIR="${BACKUP_DIR:-/var/backups/forgefleet}"
+BRIDGE_STATE_DIR="${BRIDGE_STATE_DIR:-/var/lib/forgefleet/bridge}"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 
-log "backup plan: pg_dump (db service) + context-store volume -> $BACKUP_DIR/$stamp"
+log "backup plan: pg_dump (db service) + context-store volume + bridge state dir -> $BACKUP_DIR/$stamp"
 [ "$APPLY" = 1 ] || { log "dry-run complete: nothing written"; exit 0; }
 
 mkdir -p "$BACKUP_DIR/$stamp"
@@ -22,5 +25,12 @@ chmod 600 "$BACKUP_DIR/$stamp/pg.dump"
 docker run --rm -v forge-private_context-store:/src:ro -v "$BACKUP_DIR/$stamp:/dst" \
   busybox tar -czf "/dst/context.tgz" -C /src .
 chmod 600 "$BACKUP_DIR/$stamp/context.tgz"
+if [ -d "$BRIDGE_STATE_DIR" ]; then
+  tar -czf "$BACKUP_DIR/$stamp/bridge-state.tgz" -C "$(dirname "$BRIDGE_STATE_DIR")" \
+    "$(basename "$BRIDGE_STATE_DIR")"
+  chmod 600 "$BACKUP_DIR/$stamp/bridge-state.tgz"
+else
+  warn "no bridge state at $BRIDGE_STATE_DIR yet — skipping (db + context captured)"
+fi
 ls -l "$BACKUP_DIR/$stamp"
 log "backup applied: $stamp (restore rehearsal: restore.sh --apply in staging first)"
