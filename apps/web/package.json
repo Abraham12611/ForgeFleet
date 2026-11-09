@@ -6,8 +6,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "prebuild": "node scripts/verify-vercel-config.mjs",
     "build": "tsc -b && vite build",
+    "verify:vercel": "node scripts/verify-vercel-config.mjs",
     "preview": "vite preview",
     "test": "vitest run src/lib && node --test src/features/inbox/inbox-policy.test.mjs",
     "typecheck": "tsc -b"

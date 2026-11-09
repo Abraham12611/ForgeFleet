@@ -1,8 +1,11 @@
 // Fail-closed gate for the Vercel preview rewrite (FF-027 review follow-up).
-// Runs as `prebuild`: any `/api/*` rewrite pointing at a placeholder or
-// insecure origin fails the build unless the operator explicitly opts into
-// local-only work with FORGEFLEET_ALLOW_PLACEHOLDER_API=1 (never set in a
-// Vercel project). Dependency-free so it runs anywhere node does.
+// Run as `npm run verify:vercel` in CI/deployment: any `/api/*` rewrite
+// pointing at a placeholder or insecure origin fails validation unless the
+// operator explicitly opts into local-only work with
+// FORGEFLEET_ALLOW_PLACEHOLDER_API=1 (never set in a Vercel project).
+// Kept OUT of `prebuild` deliberately so `npm run build` stays green while
+// deployment validation still fails closed. Dependency-free so it runs
+// anywhere node does.
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
