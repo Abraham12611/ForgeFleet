@@ -1,0 +1,35 @@
+/* E13 fleet screens: same restrained rules as tasks/screens.css, kept
+   inside fleet-owned paths so neither feature depends on the other. */
+
+.ff-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+  max-width: 40rem;
+}
+
+.ff-facts dt {
+  font-weight: 600;
+}
+
+.ff-facts dd {
+  margin: 0;
+}
+
+.ff-banner {
+  border: 1px solid #6b7280;
+  padding: 0.5rem 0.75rem;
+  max-width: 40rem;
+}
+
+.ff-banner-alert {
+  border-width: 2px;
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none;
+    transition: none;
+  }
+}

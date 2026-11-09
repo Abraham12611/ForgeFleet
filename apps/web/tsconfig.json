@@ -4,6 +4,10 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "module": "ESNext",
     "moduleResolution": "bundler",
+    // E13/E14 node:test suites use explicit `.ts` import extensions, which
+    // Node type-stripping requires. Allowed here (noEmit); bundler/vite
+    // resolves them at build/test time.
+    "allowImportingTsExtensions": true,
     "jsx": "react-jsx",
     "strict": true,
     "skipLibCheck": true,
