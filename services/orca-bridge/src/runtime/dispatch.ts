@@ -19,52 +19,70 @@
  * lines. No shell is ever spawned: argv vectors are passed verbatim to the
  * injected runner, so task instructions cannot escape into shell syntax.
  *
- * Blocking notes (see FF-007 / S-02):
- * - E02 (discovery) and E05 (contracts) have no merged implementation yet.
- *   The caller supplies the already-resolved executable (E02's
- *   `resolveOrcaExecutable` owns resolution); this module never resolves,
- *   guesses, or falls through executables.
- * - Durable persistence is E06's `persistence/**`. This module keeps a
- *   volatile `DispatchLedger` plus a narrow snapshot interface E06 can
- *   adopt; a process restart loses un-persisted records by design.
+ * Reconciliation baseline (coordinator review on PR #35):
+ * - Contract #46 (frozen v0.1): `AttemptState`, `AttemptReceipt`,
+ *   `AttemptLease`, and `CancelAttemptRequest` are pinned generated types
+ *   imported below (type-only); this module extends them but never redefines
+ *   them. `StartAttemptInput` carries the frozen `CreateAttemptRequest`
+ *   fields (`contextManifestId`, `lease`) and hashes them into the
+ *   idempotency record.
+ * - Durable ownership #60 (FF-031, OPEN): `DispatchLedger` below is
+ *   explicitly QUARANTINED volatile state. It exists so the mock-only
+ *   library is testable; it must be replaced by E06 durable persistence
+ *   before any live dispatch. A process restart loses un-persisted records
+ *   by design, and no caller may treat a restored-but-unpersisted ledger
+ *   as proof of the original attempt.
+ * - Transport loss (spawn failure, timeout, unreadable reply) is recorded
+ *   as `unknown` with the Orca request id and NEVER retried or cleaned up
+ *   by this module: reconciliation via `request-show` (or the E06 store
+ *   under #60) must prove the original's fate first. No path here can
+ *   spawn a second live worker for one idempotency key.
+ * - The caller supplies the already-resolved executable (E02 owns
+ *   resolution via `resolveOrcaExecutable`); this module never resolves,
+ *   guesses, or falls through executables. Linux G1 evidence (issue #2)
+ *   remains E02's open item.
  * - Exact live receipt field names are unverified (no worker was started:
  *   the operator's Orca service must not be disturbed). Parsers accept the
  *   documented envelope shapes and fail closed to `unknown`/typed errors
- *   on anything else. S-02 must capture one real receipt and tighten these.
+ *   on anything else. Owner-authorized S-02 must capture one real receipt
+ *   and tighten these; G2 stays open until then.
  */
 
 import { createHash, randomUUID } from "node:crypto";
+import type {
+  AttemptLease,
+  AttemptReceipt as ContractAttemptReceipt,
+  AttemptState as ContractAttemptState,
+  CancelAttemptRequest,
+} from "../../../../packages/bridge-contracts/generated/bridge.types.ts";
 
 // ---------------------------------------------------------------------------
-// Public types (subset of docs/05-contracts/bridge.openapi.yaml, v0.1 draft)
+// Public types (pinned by frozen contract v0.1, issue #46 — do not redefine)
 // ---------------------------------------------------------------------------
 
-/** Attempt states from the bridge OpenAPI `AttemptReceipt`. */
-export type AttemptState =
-  | "accepted"
-  | "dispatching"
-  | "running"
-  | "waiting"
-  | "unknown"
-  | "finished"
-  | "failed"
-  | "cancelled";
+/** Attempt states: pinned union from the frozen v0.1 contract. */
+export type AttemptState = ContractAttemptState;
 
-/** Normalized receipt returned for every start/status/cancel call. */
-export interface AttemptReceipt {
-  attemptId: string;
-  projectId: string;
-  state: AttemptState;
-  observedAt: string;
-  orcaRunId: string | null;
-  orcaTaskId: string | null;
+/**
+ * Normalized receipt returned for every start/status/cancel call.
+ * Extends the frozen contract receipt with bridge-internal tracking:
+ * `orcaRequestId` (the `--retry-request` identity used for reconcile) and
+ * `deduplicated` (true when the call was served from the ledger without
+ * running any Orca command). Both are transport metadata, never task truth.
+ */
+export interface AttemptReceipt extends ContractAttemptReceipt {
   orcaDispatchId: string | null;
   orcaRequestId: string | null;
+  orcaRunId: string | null;
+  orcaTaskId: string | null;
   worktreeId: string | null;
   errorCode: string | null;
   /** True when the call was deduplicated and no Orca command ran. */
   deduplicated?: boolean;
 }
+
+/** Re-exported so consumers pin one source for the frozen lease shape. */
+export type { AttemptLease, CancelAttemptRequest };
 
 /** New-worker placement. Fresh isolated worktree only: shared writable
  *  checkouts are forbidden by the negative requirements. */
@@ -77,7 +95,13 @@ export interface WorkerPlacement {
   baseBranch?: string;
 }
 
-/** Input for one idempotent Muse worker start. */
+/**
+ * Input for one idempotent Muse worker start.
+ * Carries the frozen v0.1 `CreateAttemptRequest` identity fields
+ * (`contextManifestId`, `lease`); both are hashed into the idempotency
+ * record so a key reused with different context or fencing conflicts
+ * instead of dispatching (contract case 2, scheduler lease generation).
+ */
 export interface StartAttemptInput {
   projectId: string;
   paperclipTaskId: string;
@@ -87,6 +111,10 @@ export interface StartAttemptInput {
   taskTitle: string;
   /** Scoped task prompt; passed as one argv element, never shelled. */
   instruction: string;
+  /** Immutable context manifest consumed for this attempt (frozen #46). */
+  contextManifestId: string;
+  /** Scheduler fencing lease authorizing this dispatch (frozen #46). */
+  lease: AttemptLease;
   placement: WorkerPlacement;
   /** Bridge idempotency key (OpenAPI: 8..160 chars). */
   idempotencyKey: string;
@@ -174,7 +202,10 @@ export function deriveOrcaRequestId(idempotencyKey: string): string {
 export function hashStartRequest(input: StartAttemptInput): string {
   const canonical = {
     baseBranch: input.placement.baseBranch ?? null,
+    contextManifestId: input.contextManifestId,
+    fencingEpoch: input.lease?.fencingEpoch ?? null,
     instruction: input.instruction,
+    leaseToken: input.lease?.leaseToken ?? null,
     name: input.placement.name ?? null,
     paperclipRunId: input.paperclipRunId,
     paperclipTaskId: input.paperclipTaskId,
@@ -209,12 +240,15 @@ function assertValidStartInput(input: StartAttemptInput): void {
       false,
     );
   }
+  const lease = input.lease ?? ({} as AttemptLease);
   for (const [field, value] of [
     ["projectId", input.projectId],
     ["paperclipTaskId", input.paperclipTaskId],
     ["paperclipRunId", input.paperclipRunId],
     ["taskTitle", input.taskTitle],
     ["instruction", input.instruction],
+    ["contextManifestId", input.contextManifestId],
+    ["lease.leaseToken", lease.leaseToken],
     ["placement.repo", input.placement.repo],
   ] as const) {
     if (!value || !value.trim()) {
@@ -225,6 +259,14 @@ function assertValidStartInput(input: StartAttemptInput): void {
         false,
       );
     }
+  }
+  if (!Number.isInteger(lease.fencingEpoch) || lease.fencingEpoch < 1) {
+    throw new DispatchError(
+      "INVALID_START_REQUEST",
+      "lease.fencingEpoch must be an integer >= 1 (frozen contract #46).",
+      `fencingEpoch=${String(lease.fencingEpoch)}`,
+      false,
+    );
   }
 }
 
@@ -418,13 +460,16 @@ function receiptBase(
 }
 
 // ---------------------------------------------------------------------------
-// Volatile idempotency ledger (E06 owns durable persistence)
+// QUARANTINED volatile idempotency ledger (FF-031 #60: replace with E06
+// durable persistence before any live dispatch; a restart loses records)
 // ---------------------------------------------------------------------------
 
 export interface LedgerRecord {
   attemptId: string;
   requestHash: string;
   projectId: string;
+  /** Scheduler fencing generation authorizing this dispatch. */
+  fencingEpoch: number;
   orcaDispatchId: string | null;
   orcaRequestId: string;
   orcaRunId: string | null;
@@ -510,8 +555,11 @@ export async function startAttempt(
   } catch (err) {
     // Spawn/transport failure: Orca may still have accepted. Record
     // `unknown` with the request id so reconcile can prove the outcome.
+    // Never retry or clean up here: any second action could double-spawn
+    // (F05, #60). Reconciliation must prove the original's fate first.
     const record: LedgerRecord = {
       attemptId,
+      fencingEpoch: input.lease.fencingEpoch,
       orcaDispatchId: null,
       orcaRequestId,
       orcaRunId: null,
@@ -546,6 +594,7 @@ export async function startAttempt(
     );
     const record: LedgerRecord = {
       attemptId,
+      fencingEpoch: input.lease.fencingEpoch,
       orcaDispatchId: null,
       orcaRequestId,
       orcaRunId: null,
@@ -568,6 +617,7 @@ export async function startAttempt(
   if (!ids) {
     const record: LedgerRecord = {
       attemptId,
+      fencingEpoch: input.lease.fencingEpoch,
       orcaDispatchId: null,
       orcaRequestId,
       orcaRunId: null,
@@ -584,6 +634,7 @@ export async function startAttempt(
   }
   const record: LedgerRecord = {
     attemptId,
+    fencingEpoch: input.lease.fencingEpoch,
     orcaDispatchId: ids.orcaDispatchId,
     orcaRequestId: ids.orcaRequestId ?? orcaRequestId,
     orcaRunId: ids.orcaRunId,
@@ -685,6 +736,11 @@ export async function getAttemptStatus(
  * `stop_unknown` (exit 1) and unrecognized receipts raise
  * CANCEL_UNCONFIRMED so the caller inspects via worker-show instead of
  * assuming the agent stopped (verified recovery guide).
+ *
+ * Authorization mirrors the frozen v0.1 `CancelAttemptRequest`: `reason`
+ * and `approvedBy` are required, validated here, and redacted in all
+ * stored detail. The CLI itself carries no identity flag, so these fields
+ * authorize the bridge call (policy layer) rather than the argv.
  */
 export async function cancelAttempt(
   deps: DispatchDeps,
@@ -692,7 +748,16 @@ export async function cancelAttempt(
   projectId: string,
   attemptId: string,
   idempotencyKey: string,
+  cancel: CancelAttemptRequest,
 ): Promise<AttemptReceipt> {
+  if (!cancel.reason?.trim() || !cancel.approvedBy?.trim()) {
+    throw new DispatchError(
+      "INVALID_CANCEL_REQUEST",
+      "Cancel requires non-empty reason and approvedBy (frozen contract #46).",
+      "",
+      false,
+    );
+  }
   const receipt = receiptBase(deps, { projectId }, attemptId, "unknown");
   receipt.orcaDispatchId = orcaDispatchId;
   let raw: CommandResult;

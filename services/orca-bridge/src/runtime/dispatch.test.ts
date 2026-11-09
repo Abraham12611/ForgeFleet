@@ -32,8 +32,10 @@ import {
 
 function baseInput(overrides: Partial<StartAttemptInput> = {}): StartAttemptInput {
   return {
+    contextManifestId: "ctx-manifest-1",
     idempotencyKey: "test-key-0123456789",
     instruction: "Summarize the repo layout. Do not edit anything.",
+    lease: { fencingEpoch: 1, leaseToken: "lease-token-1" },
     paperclipRunId: "run-1",
     paperclipTaskId: "task-1",
     placement: { mode: "new-top-level", repo: "id:repo-1" },
@@ -43,6 +45,8 @@ function baseInput(overrides: Partial<StartAttemptInput> = {}): StartAttemptInpu
     ...overrides,
   };
 }
+
+const cancelAuth = { approvedBy: "owner:abraham", reason: "test cancel" };
 
 interface SeenCall {
   executable: string;
@@ -334,7 +338,7 @@ describe("guarded cancel", () => {
         }),
       },
     ]);
-    const r = await cancelAttempt(deps, "d-1", "p-1", "a-1", "test-key-0123456789");
+    const r = await cancelAttempt(deps, "d-1", "p-1", "a-1", "test-key-0123456789", cancelAuth);
     assert.equal(r.state, "cancelled");
   });
 
@@ -347,7 +351,7 @@ describe("guarded cancel", () => {
       },
     ]);
     await assert.rejects(
-      cancelAttempt(deps, "d-1", "p-1", "a-1", "test-key-0123456789"),
+      cancelAttempt(deps, "d-1", "p-1", "a-1", "test-key-0123456789", cancelAuth),
       (e: unknown) =>
         e instanceof DispatchError && e.code === "CANCEL_UNCONFIRMED",
     );
@@ -410,6 +414,86 @@ describe("reconcileStart", () => {
       await reconcileStart(fakeDeps([], { throwOn: [0] }).deps, "ff-x"),
       "pending",
     );
+  });
+});
+
+describe("frozen contract v0.1 alignment (#46)", () => {
+  it("rejects a missing contextManifestId", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    await assert.rejects(
+      startAttempt(
+        deps,
+        new DispatchLedger(),
+        baseInput({ contextManifestId: "  " }),
+      ),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "INVALID_START_REQUEST",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("rejects fencingEpoch below 1", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    await assert.rejects(
+      startAttempt(
+        deps,
+        new DispatchLedger(),
+        baseInput({ lease: { fencingEpoch: 0, leaseToken: "t" } }),
+      ),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "INVALID_START_REQUEST",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("a new fencing generation under the same key conflicts", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    const ledger = new DispatchLedger();
+    await startAttempt(deps, ledger, baseInput());
+    await assert.rejects(
+      startAttempt(
+        deps,
+        ledger,
+        baseInput({ lease: { fencingEpoch: 2, leaseToken: "lease-token-2" } }),
+      ),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "IDEMPOTENCY_CONFLICT",
+    );
+    assert.equal(calls.length, 1);
+  });
+
+  it("cancel without reason/approvedBy is refused before any command", async () => {
+    const { calls, deps } = fakeDeps([okStart]);
+    await assert.rejects(
+      cancelAttempt(deps, "d-1", "p-1", "a-1", "test-key-0123456789", {
+        approvedBy: "",
+        reason: "",
+      }),
+      (e: unknown) =>
+        e instanceof DispatchError && e.code === "INVALID_CANCEL_REQUEST",
+    );
+    assert.equal(calls.length, 0);
+  });
+
+  it("emitted states stay inside the frozen AttemptState union", async () => {
+    // Tripwire: mirror of the pinned union in
+    // packages/bridge-contracts/generated/bridge.types.ts (contract v0.1.0).
+    const frozen: ReadonlySet<string> = new Set([
+      "accepted",
+      "dispatching",
+      "running",
+      "waiting",
+      "unknown",
+      "finished",
+      "failed",
+      "cancelled",
+    ]);
+    const { deps } = fakeDeps([okStart]);
+    const started = await startAttempt(deps, new DispatchLedger(), baseInput());
+    assert.ok(frozen.has(started.state), `state ${started.state} not in frozen union`);
+    for (const token of ["running", "finished", "failed", "waiting", "nope", undefined]) {
+      assert.ok(frozen.has(mapWorkerStatus(token)), `mapping leaked ${String(token)}`);
+    }
   });
 });
 
