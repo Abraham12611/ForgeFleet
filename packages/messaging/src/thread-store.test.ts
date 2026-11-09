@@ -200,7 +200,7 @@ describe("moderation", () => {
     });
     assert.match(message.body, /\[REDACTED:TOKEN\]/);
     assert.match(message.body, /\[REDACTED:SECRET_VALUE\]/);
-    assert.doesNotMatch(message.body, /ghp_abcdefghijklmnop/);
+    assert.doesNotMatch(message.body, /abcdefghijklmnop/);
   });
 
   it("questions require severity + deadline; labels are validated", () => {
