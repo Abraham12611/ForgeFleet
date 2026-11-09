@@ -847,6 +847,13 @@ store.close();
         const final = verify.getAttempt(ra.attemptId);
         assert.equal(final.state, "running");
         assert.equal(final.orcaDispatchId, winnerExt);
+        // One ledger entry despite two processes: a single attempt.accepted
+        // outbox row for the shared attempt, no duplicate dispatch rows.
+        const accepted = verify
+          .claimDueOutbound(100)
+          .filter((e) => e.eventType === "attempt.accepted");
+        assert.equal(accepted.length, 1);
+        assert.deepEqual(accepted[0]!.body["attemptId"], ra.attemptId);
       } finally {
         verify.close();
       }

@@ -29,6 +29,22 @@
  * fields (no `orcaSessionId`, no `deduplicated` flag); internal mapping
  * columns such as `orca_session_id` are persisted per the domain model but
  * never serialized into the API receipt.
+ *
+ * What this does NOT prove: task-level at-most-one launch is a bridge
+ * ledger guarantee only. It does not imply a live Orca `request-show`
+ * round trip, real worker output, or VPS/Orca runtime compatibility —
+ * all tests here run against injected fake launchers (and two real OS
+ * processes for contention), never against a live Orca service.
+ *
+ * Backup, restore and migration guidance for WAL data:
+ * - Back up with `createBackup()` (WAL checkpoint + file copy), never by
+ *   copying the live `-wal`/`-shm` sidecars mid-write.
+ * - Restore with `restoreFromBackup()`, then always run
+ *   `reconcileAfterRestart()` against a fresh read-only runtime inventory:
+ *   the runtime may have moved on while the backup aged.
+ * - Schema changes must be additive (`CREATE TABLE IF NOT EXISTS`, new
+ *   nullable columns) and keep every invariant in this header; a breaking
+ *   layout change requires a migration script plus a restore test here.
  */
 
 import { DatabaseSync } from "node:sqlite";
