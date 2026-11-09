@@ -1,0 +1,15 @@
+{
+  "name": "@forgefleet/paperclip-orca-adapter",
+  "version": "0.1.0",
+  "description": "ForgeFleet external Paperclip adapter: Task -> Orca worker -> status round trip (FF-008, engineer E04).",
+  "type": "module",
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "main": "./server/index.js",
+  "scripts": {
+    "test": "node --test 'test/*.test.js'",
+    "check-no-push": "node ./check-no-push.mjs"
+  },
+  "license": "MIT"
+}
