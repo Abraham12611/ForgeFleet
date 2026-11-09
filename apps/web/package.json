@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/verify-vercel-config.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run src/lib && node --test src/features/inbox/inbox-policy.test.mjs",

@@ -29,6 +29,18 @@ describe("buildLiveSocketUrl", () => {
       ),
     ).toBe("ws://localhost:5173/api/live");
   });
+
+  it("never builds a mixed-content ws:// socket from an https API base", () => {
+    // Split-origin bases are HTTPS-only (resolveApiBase), so the live socket
+    // is always wss:// even when the page itself was served over plain http.
+    expect(
+      buildLiveSocketUrl(
+        "https://api.example.com/api",
+        "/api/companies/1/events/ws",
+        { host: "localhost:5173", protocol: "http:" } as Location,
+      ),
+    ).toBe("wss://api.example.com/api/companies/1/events/ws");
+  });
 });
 
 describe("connectLive", () => {

@@ -32,6 +32,13 @@ fallback and local dev proxy.
   Until E17 substitutes the real staging ingress and E07 clears cross-site
   session auth, any preview deploy renders the unreachable-backend panel by
   design — this scaffold is a compile proof, not a functioning preview.
+- `scripts/verify-vercel-config.mjs` — fail-closed `prebuild` gate: the build
+  refuses while the rewrite points at a placeholder/insecure origin. Local
+  work sets `FORGEFLEET_ALLOW_PLACEHOLDER_API=1` (never in Vercel env).
+- `VITE_PUBLIC_API_URL` must be a public HTTPS origin. Plain HTTP, IP
+  literals, userinfo and placeholder domains throw; plain-HTTP loopback is
+  allowed only behind the explicit `allowInsecureLocalhost` dev flag, never
+  in a deployed bundle.
 
 ## What this is not
 

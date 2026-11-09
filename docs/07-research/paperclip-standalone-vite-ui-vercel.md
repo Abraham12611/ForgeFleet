@@ -92,7 +92,16 @@ deploy of this scaffold will show the built-in "backend unreachable" state.
 - `vercel.json` placeholder: the rewrite target `https://api.forgefleet.example`
   is a reserved non-routable domain, so no preview can function against it;
   E17 (FF-028) substitutes the real staging ingress. A deployed preview today
-  renders the unreachable-backend panel by design.
+  renders the unreachable-backend panel by design. Enforcement is fail-closed:
+  `scripts/verify-vercel-config.mjs` runs as `prebuild` and refuses the build
+  while the rewrite is a placeholder (bypass `FORGEFLEET_ALLOW_PLACEHOLDER_API=1`
+  is local-only, never set in Vercel).
+- API-base hardening (coordinator follow-up): `resolveApiBase` requires a public
+  HTTPS origin for any cross-origin base — plain HTTP (e.g. `http://api.example.com`,
+  `http://8.8.8.8`), IP literals, userinfo and placeholder domains throw, so session
+  cookies can never be sent over plaintext or blocked as mixed content. Plain-HTTP
+  loopback works only behind the explicit `allowInsecureLocalhost` dev flag. The live
+  socket therefore always upgrades to `wss://` from an HTTPS base (tested).
 - Evidence: `npm test` — 2 files / 10 tests pass (vitest); `npm run build`
   — `tsc -b && vite build` succeeds; env injection verified; bundle contains
   no loopback API default (remaining `localhost` strings are react-router
