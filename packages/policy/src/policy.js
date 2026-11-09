@@ -99,9 +99,14 @@ export const ACTION_CATALOG = Object.freeze({
  * @typedef {object} OwnerApproval - a durable, authenticated owner action
  *   (never a chat utterance).
  * @property {string} grantedBy - must be 'owner'
+ * @property {string} authProof - opaque server-minted reference proving the
+ *   owner authenticated at the integration boundary. The policy engine
+ *   treats it as opaque and requires its presence; minting and verifying
+ *   it is the boundary's job (E16/services), never the caller's.
  * @property {string} action - action this approval covers
- * @property {string} [resourceId]
+ * @property {string} resourceId - immutable ID of the exact approved target
  * @property {string} [targetSha] - exact state hash the owner approved
+ *   (required for SHA-pinned actions: merge.main, deploy.production)
  * @property {number} expiresAt - epoch ms; expired approval grants nothing
  * @property {string} [origin] - approvals originating from 'message' or
  *   'sleep-expiry' are invalid
@@ -147,12 +152,27 @@ function requireOwner(action, actor, approvalClass, reasonCode, reason) {
 }
 
 /**
+ * Actions whose approval must pin the exact current state hash on both
+ * sides (approval and resource). Absent, stale, or mismatched values
+ * reject: the decision reopens against the new state, it never passes.
+ */
+export const SHA_PINNED_ACTIONS = Object.freeze(['merge.main', 'deploy.production']);
+
+/**
  * Validate a durable owner approval against the requested action state.
+ * Fail-closed: every binding is required, never optional.
  * Returns null when valid, otherwise a reasonCode string.
  */
 function ownerApprovalError(approval, action, resource, now) {
   if (!approval) return 'OWNER_APPROVAL_MISSING';
   if (approval.grantedBy !== 'owner') return 'OWNER_APPROVAL_NOT_OWNER';
+  // An approval object alone proves nothing about identity. The server
+  // integration boundary must mint `authProof` (opaque reference) only
+  // after real owner authentication and never accept client-supplied
+  // values. Without it the object is not an approval.
+  if (typeof approval.authProof !== 'string' || approval.authProof.length === 0) {
+    return 'OWNER_APPROVAL_UNAUTHENTICATED';
+  }
   if (approval.action !== action) return 'OWNER_APPROVAL_ACTION_MISMATCH';
   if (approval.origin === 'message' || approval.origin === 'sleep-expiry') {
     return 'OWNER_APPROVAL_BAD_ORIGIN';
@@ -160,17 +180,58 @@ function ownerApprovalError(approval, action, resource, now) {
   if (typeof approval.expiresAt !== 'number' || now >= approval.expiresAt) {
     return 'OWNER_APPROVAL_EXPIRED';
   }
-  if (approval.resourceId !== undefined && approval.resourceId !== resource.id) {
+  // Resource binding: both sides must carry a nonempty immutable ID.
+  if (
+    typeof resource.id !== 'string' || resource.id.length === 0 ||
+    typeof approval.resourceId !== 'string' || approval.resourceId.length === 0
+  ) {
+    return 'OWNER_APPROVAL_TARGET_MISSING';
+  }
+  if (approval.resourceId !== resource.id) {
     return 'OWNER_APPROVAL_TARGET_MISMATCH';
   }
-  if (
-    approval.targetSha !== undefined &&
-    resource.headSha !== undefined &&
-    approval.targetSha !== resource.headSha
-  ) {
-    return 'OWNER_APPROVAL_SHA_MISMATCH';
+  // SHA binding for SHA-pinned actions: both sides must carry the exact
+  // current state hash and agree on it.
+  if (SHA_PINNED_ACTIONS.includes(action)) {
+    if (
+      typeof resource.headSha !== 'string' || resource.headSha.length === 0 ||
+      typeof approval.targetSha !== 'string' || approval.targetSha.length === 0
+    ) {
+      return 'OWNER_APPROVAL_SHA_MISSING';
+    }
+    if (approval.targetSha !== resource.headSha) {
+      return 'OWNER_APPROVAL_SHA_MISMATCH';
+    }
   }
   return null;
+}
+
+/**
+ * Map an approval validation failure to a verdict. Only a missing
+ * approval queues an owner decision; every malformed, unauthenticated,
+ * expired, or mismatched approval denies fail-closed.
+ */
+function approvalFailure(action, actor, approvalClass, reasonCode, context) {
+  if (reasonCode === 'OWNER_APPROVAL_MISSING') {
+    if (context.sleeping === true) {
+      return requireOwner(action, actor, approvalClass, 'SLEEP_QUEUED',
+        'Owner is sleeping: request is queued, never auto-approved.');
+    }
+    return requireOwner(action, actor, approvalClass, 'OWNER_REQUIRED',
+      `Owner approval required for '${action}'.`);
+  }
+  const reasons = {
+    OWNER_APPROVAL_NOT_OWNER: 'Approval was not granted by the owner.',
+    OWNER_APPROVAL_UNAUTHENTICATED: 'Approval carries no server-minted authentication proof; the object alone proves nothing.',
+    OWNER_APPROVAL_ACTION_MISMATCH: 'Approval covers a different action and does not transfer.',
+    OWNER_APPROVAL_BAD_ORIGIN: 'Approval originates from message content or sleep expiry and is invalid.',
+    OWNER_APPROVAL_EXPIRED: 'The owner approval has expired; expiry never grants authority.',
+    OWNER_APPROVAL_TARGET_MISSING: 'Approval or resource lacks the required immutable resource ID binding.',
+    OWNER_APPROVAL_TARGET_MISMATCH: 'The target changed after approval; the decision must be reopened against the new state.',
+    OWNER_APPROVAL_SHA_MISSING: 'Approval or resource lacks the required exact state-hash binding.',
+    OWNER_APPROVAL_SHA_MISMATCH: 'The target changed after approval; the decision must be reopened against the new state.',
+  };
+  return deny(action, actor, approvalClass, reasonCode, reasons[reasonCode] ?? 'Approval invalid.');
 }
 
 /**
@@ -258,6 +319,14 @@ export function authorize(input) {
       break;
     }
     case 'merge.develop': {
+      // Checks are only meaningful bound to an exact head SHA. The
+      // integration boundary (E16) must source `checksPass` from trusted
+      // GitHub check/webhook state at that SHA; policy rejects unbound
+      // inputs rather than assuming provenance.
+      if (typeof resource.headSha !== 'string' || resource.headSha.length === 0) {
+        return deny(action, actor, spec.approvalClass, 'CHECKS_SHA_MISSING',
+          'Merge requires check results bound to an exact PR head SHA.');
+      }
       if (resource.checksPass !== true) {
         return deny(action, actor, spec.approvalClass, 'CHECKS_NOT_PASSING',
           'Required checks are not green at the current head SHA.');
@@ -272,23 +341,11 @@ export function authorize(input) {
     case 'deploy.production':
     case 'budget.increase':
     case 'host.create': {
-      // Owner-only execution with a fresh, SHA-pinned approval.
+      // Owner-only execution with a fresh, fully-bound approval
+      // (identity proof, resource ID, and state hash where pinned).
       const err = ownerApprovalError(context.approval, action, resource, now);
       if (err !== null) {
-        if (err === 'OWNER_APPROVAL_EXPIRED') {
-          return deny(action, actor, spec.approvalClass, err,
-            'The owner approval has expired; expiry never grants authority.');
-        }
-        if (err === 'OWNER_APPROVAL_SHA_MISMATCH' || err === 'OWNER_APPROVAL_TARGET_MISMATCH') {
-          return deny(action, actor, spec.approvalClass, err,
-            'The target changed after approval; the decision must be reopened against the new state.');
-        }
-        if (context.sleeping === true) {
-          return requireOwner(action, actor, spec.approvalClass, 'SLEEP_QUEUED',
-            'Owner is sleeping: request is queued, never auto-approved.');
-        }
-        return requireOwner(action, actor, spec.approvalClass, 'OWNER_REQUIRED',
-          `Owner approval required for '${action}'.`);
+        return approvalFailure(action, actor, spec.approvalClass, err, context);
       }
       break;
     }
@@ -300,12 +357,7 @@ export function authorize(input) {
       }
       const err = ownerApprovalError(context.approval, action, resource, now);
       if (err !== null) {
-        if (err === 'OWNER_APPROVAL_EXPIRED') {
-          return deny(action, actor, spec.approvalClass, err,
-            'The owner approval has expired; expiry never grants authority.');
-        }
-        return requireOwner(action, actor, spec.approvalClass, 'OWNER_REQUIRED',
-          `Owner approval required for '${action}'.`);
+        return approvalFailure(action, actor, spec.approvalClass, err, context);
       }
       break;
     }
@@ -316,8 +368,7 @@ export function authorize(input) {
       }
       const err = ownerApprovalError(context.approval, action, resource, now);
       if (err !== null) {
-        return requireOwner(action, actor, spec.approvalClass, 'OWNER_REQUIRED',
-          `Owner approval required for '${action}'.`);
+        return approvalFailure(action, actor, spec.approvalClass, err, context);
       }
       break;
     }

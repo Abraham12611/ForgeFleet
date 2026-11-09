@@ -16,6 +16,7 @@ import { authorize, allowedActionsFor } from '../src/policy.js';
 const NOW = 1760000000000;
 const FRESH = (overrides = {}) => ({
   grantedBy: 'owner',
+  authProof: 'srv-auth-1',
   action: 'merge.main',
   resourceId: 'pr-1',
   targetSha: 'abc123',
@@ -102,6 +103,70 @@ describe('main merge is owner-only at the exact SHA', () => {
     assert.equal(d.reasonCode, 'OWNER_APPROVAL_SHA_MISMATCH');
   });
 
+  it('missing targetSha on the approval rejects fail-closed', () => {
+    const { targetSha, ...noSha } = FRESH();
+    const d = authorize({
+      actor: actor('owner', { projects: undefined }),
+      action: 'merge.main',
+      resource: main,
+      context: { now: NOW, approval: noSha },
+    });
+    assert.equal(d.verdict, 'deny');
+    assert.equal(d.reasonCode, 'OWNER_APPROVAL_SHA_MISSING');
+  });
+
+  it('missing resourceId on the approval rejects fail-closed', () => {
+    const { resourceId, ...noTarget } = FRESH();
+    const d = authorize({
+      actor: actor('owner', { projects: undefined }),
+      action: 'merge.main',
+      resource: main,
+      context: { now: NOW, approval: noTarget },
+    });
+    assert.equal(d.verdict, 'deny');
+    assert.equal(d.reasonCode, 'OWNER_APPROVAL_TARGET_MISSING');
+  });
+
+  it('missing current SHA on the resource rejects fail-closed', () => {
+    const { headSha, ...noCurrentSha } = main;
+    const d = authorize({
+      actor: actor('owner', { projects: undefined }),
+      action: 'merge.main',
+      resource: noCurrentSha,
+      context: { now: NOW, approval: FRESH() },
+    });
+    assert.equal(d.verdict, 'deny');
+    assert.equal(d.reasonCode, 'OWNER_APPROVAL_SHA_MISSING');
+  });
+
+  it('approval without server-minted auth proof is not an approval', () => {
+    const { authProof, ...noProof } = FRESH();
+    const d = authorize({
+      actor: actor('owner', { projects: undefined }),
+      action: 'merge.main',
+      resource: main,
+      context: { now: NOW, approval: noProof },
+    });
+    assert.equal(d.verdict, 'deny');
+    assert.equal(d.reasonCode, 'OWNER_APPROVAL_UNAUTHENTICATED');
+  });
+
+  it('empty-string bindings reject like missing ones', () => {
+    for (const approval of [
+      FRESH({ targetSha: '' }),
+      FRESH({ resourceId: '' }),
+      FRESH({ authProof: '' }),
+    ]) {
+      const d = authorize({
+        actor: actor('owner', { projects: undefined }),
+        action: 'merge.main',
+        resource: main,
+        context: { now: NOW, approval },
+      });
+      assert.equal(d.verdict, 'deny', JSON.stringify(approval));
+    }
+  });
+
   it('approval for a different action does not transfer', () => {
     const d = authorize({
       actor: actor('owner', { projects: undefined }),
@@ -127,6 +192,18 @@ describe('develop merge keeps independent review and green checks', () => {
   it('coordinator merges only with green checks plus independent reviewer', () => {
     const d = authorize({ actor: actor('coordinator'), action: 'merge.develop', resource: good, context: { now: NOW } });
     assert.equal(d.verdict, 'allow');
+  });
+
+  it('checks unbound to any head SHA are rejected', () => {
+    const { headSha, ...noSha } = good;
+    const d = authorize({
+      actor: actor('coordinator'),
+      action: 'merge.develop',
+      resource: noSha,
+      context: { now: NOW },
+    });
+    assert.equal(d.verdict, 'deny');
+    assert.equal(d.reasonCode, 'CHECKS_SHA_MISSING');
   });
 
   it('coordinator is denied when checks fail', () => {
@@ -252,7 +329,7 @@ describe('privileged operations queue instead of executing', () => {
       resource: { ...resource(), id: 'dep-1', headSha: 'abc123' },
       context: {
         now: NOW,
-        approval: { grantedBy: 'owner', action: 'deploy.production', resourceId: 'dep-1', targetSha: 'abc123', expiresAt: NOW + 1000, origin: 'sleep-expiry' },
+        approval: { grantedBy: 'owner', authProof: 'srv-auth-1', action: 'deploy.production', resourceId: 'dep-1', targetSha: 'abc123', expiresAt: NOW + 1000, origin: 'sleep-expiry' },
       },
     });
     assert.notEqual(d.verdict, 'allow');
