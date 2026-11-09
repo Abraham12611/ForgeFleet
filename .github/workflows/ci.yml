@@ -1,0 +1,80 @@
+# FF-030 CI baseline: real, non-deploying checks on every PR and develop push.
+#
+# Least-privilege: read-only contents, no secrets on untrusted PR jobs, no
+# deployment, no Orca worker starts, no service restarts. Tests use fake
+# adapters / disposable environments only.
+#
+# Action pins are full commit SHAs with their tag noted in the comment, so a
+# tag move cannot silently change what CI runs.
+
+name: ci-baseline
+
+on:
+  pull_request:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-gates:
+    name: specs / contracts / hygiene
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-python v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Spec link check (docs integrity)
+        run: python3 scripts/check-specs.py
+      - name: SPEC-MANIFEST drift check
+        run: python3 scripts/ci/check_manifest.py
+      - name: Contract consistency (fixtures, dup schemas, $refs)
+        run: python3 scripts/ci/check_contracts.py
+      - name: Secret / credential hygiene
+        run: python3 scripts/ci/check_hygiene.py
+      - name: Fail-closed proof (canaries must fail the gates)
+        run: python3 scripts/ci/inventory.py --prove-fail-closed
+
+  suites:
+    name: workstream suites + inventory report
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # actions/setup-node v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "24.x"
+      # actions/setup-python v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Runner tool versions
+        run: node --version && python3 --version
+      - name: Node node:test suites (present dirs only; absent dirs recorded uncovered)
+        run: python3 scripts/ci/inventory.py --report ci-report.md
+      - name: Web Vite suite (only when apps/web exists)
+        run: |
+          if [ -f apps/web/package.json ]; then
+            cd apps/web && npm ci && npm run build && npm test
+          else
+            echo "apps/web absent: Vite suite uncovered (recorded in ci-report.md)"
+          fi
+      # actions/upload-artifact v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: ci-report
+          path: ci-report.md
