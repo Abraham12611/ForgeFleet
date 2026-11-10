@@ -45,8 +45,15 @@ Why native instead of a container:
 - Writable state is the systemd `StateDirectory=forgefleet-bridge`
   (`~/.local/state/forgefleet-bridge`, operator-owned) plus explicit
   `ReadWritePaths` for that path only; `/var/lib` is unusable under
-  `ProtectSystem=strict`. Proven by `tests/test-state-durability.sh`
-  (disposable SQLite WAL write/snapshot/restore roundtrip, unprivileged).
+  `ProtectSystem=strict`. The copyable `bridge.env.example` ships NO
+  `FORGEFLEET_BRIDGE_DATA_DIR` assignment (even an empty one would shadow
+  the unit via `EnvironmentFile`), and the `guard-state-dir.sh`
+  `ExecStartPre` refuses startup unless the value is nonempty and exactly
+  `$STATE_DIRECTORY`. Proven by `tests/test-state-durability.sh`
+  (disposable SQLite WAL write/snapshot/restore roundtrip, unprivileged)
+  and `tests/test-state-dir.sh` (exact-match accept; empty, unset,
+  mismatch, relative, `/var/lib`, missing, and unwritable values refused;
+  unprivileged SQLite WAL roundtrip).
 - The unit execs the Orca CLI resolved by `resolve_orca_cli` (per VPS
   finding #65: validated `ORCA_CLI_COMMAND`, then `~/.local/bin/orca-ide`,
   then the extracted `resources/bin/orca-ide` shim). The Electron GUI

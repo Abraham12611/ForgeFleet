@@ -24,14 +24,22 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/opt/forgefleet/scripts/deploy/guard-loopback.sh
 ExecStartPre=/opt/forgefleet/scripts/deploy/wait-for-paperclip.sh
+# State-dir precedence guard (runs last, closest to start): refuses startup
+# unless FORGEFLEET_BRIDGE_DATA_DIR is nonempty and exactly $STATE_DIRECTORY,
+# so a stale env-file assignment (even an empty one) can never silently
+# relocate SQLite WAL state. See scripts/deploy/guard-state-dir.sh.
+ExecStartPre=/opt/forgefleet/scripts/deploy/guard-state-dir.sh
 # Entrypoint matches the actual server (PR #63: package.json start script
 # `node src/main.ts`, Node >=24 type-stripping, no dist build step).
 ExecStart=/usr/bin/env node src/main.ts
 WorkingDirectory=/opt/forgefleet/services/orca-bridge
 EnvironmentFile=%h/.config/forgefleet/bridge.env
-# Data dir is fixed here (authoritative over the env file): the server
-# defaults to a cwd-relative ./bridge-data, which is wrong under a daemon.
-# This must equal the operator-scripts default ($HOME/.local/state/...).
+# Data dir target: the server defaults to a cwd-relative ./bridge-data,
+# which is wrong under a daemon, so the unit pins it to the StateDirectory.
+# This line alone does NOT win over an env-file assignment, so the
+# guard-state-dir.sh ExecStartPre below enforces nonempty exact equality
+# with $STATE_DIRECTORY and refuses startup otherwise. This must equal the
+# operator-scripts default ($HOME/.local/state/...).
 Environment=FORGEFLEET_BRIDGE_DATA_DIR=%S/forgefleet-bridge
 # Operator-owned writable state (SQLite WAL store included). For user units
 # this creates ~/.local/state/forgefleet-bridge owned by the operator UID and

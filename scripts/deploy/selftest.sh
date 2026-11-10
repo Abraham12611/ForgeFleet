@@ -225,6 +225,27 @@ else
   bad "contract fixture failed"
 fi
 
+# 15. State-dir precedence (systemd EnvironmentFile shadowing fix): the
+# copyable env example must not assign the data dir at all (even empty), the
+# unit must pin it plus enforce it with the startup guard, and the sandbox
+# must stay strict with minimum write paths only.
+if grep -q '^FORGEFLEET_BRIDGE_DATA_DIR=' "$I/bridge.env.example"; then
+  bad "bridge.env.example assigns FORGEFLEET_BRIDGE_DATA_DIR (shadows unit Environment=)"
+else
+  ok "bridge.env.example carries no data-dir assignment"
+fi
+grep -q '^ExecStartPre=/opt/forgefleet/scripts/deploy/guard-state-dir.sh' "$I/systemd/forgefleet-bridge.service" \
+  && ok "bridge unit enforces state dir via guard-state-dir.sh" || bad "bridge unit missing state-dir guard"
+grep -q '^ProtectSystem=strict' "$I/systemd/forgefleet-bridge.service" \
+  && ok "bridge unit keeps ProtectSystem=strict" || bad "bridge unit lost ProtectSystem=strict"
+if [ "$(id -u)" = "0" ]; then
+  ok "state-dir fixture skipped (root; VPS runs unprivileged)"
+elif bash "$D/tests/test-state-dir.sh" >/dev/null 2>&1; then
+  ok "state-dir fixture passed (exact STATE_DIRECTORY + WAL, fallbacks refused)"
+else
+  bad "state-dir fixture failed"
+fi
+
 echo "---"
 echo "selftest: $pass passed, $failed failed (fixture-only, not integration evidence)"
 [ "$failed" -eq 0 ]
