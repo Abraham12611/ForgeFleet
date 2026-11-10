@@ -10,7 +10,7 @@ auth/streaming compatibility matrix live in
 ```bash
 cd apps/web
 npm install
-npm test          # vitest: api-base + live-fallback policy (10 tests)
+npm test          # vitest --no-color (CI-parsable summary) + node --test inbox policy
 npm run build     # tsc + vite build -> dist/
 npm run dev       # :5173, /api proxied to $PAPERCLIP_DEV_API or localhost:3100
 ```
