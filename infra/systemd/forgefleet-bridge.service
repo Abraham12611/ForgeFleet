@@ -24,9 +24,22 @@ Wants=network-online.target
 Type=simple
 ExecStartPre=/opt/forgefleet/scripts/deploy/guard-loopback.sh
 ExecStartPre=/opt/forgefleet/scripts/deploy/wait-for-paperclip.sh
-ExecStart=/usr/bin/env node /opt/forgefleet/services/orca-bridge/dist/index.js
-WorkingDirectory=/opt/forgefleet
+# Entrypoint matches the actual server (PR #63: package.json start script
+# `node src/main.ts`, Node >=24 type-stripping, no dist build step).
+ExecStart=/usr/bin/env node src/main.ts
+WorkingDirectory=/opt/forgefleet/services/orca-bridge
 EnvironmentFile=%h/.config/forgefleet/bridge.env
+# Data dir is fixed here (authoritative over the env file): the server
+# defaults to a cwd-relative ./bridge-data, which is wrong under a daemon.
+# This must equal the operator-scripts default ($HOME/.local/state/...).
+Environment=FORGEFLEET_BRIDGE_DATA_DIR=%S/forgefleet-bridge
+# Operator-owned writable state (SQLite WAL store included). For user units
+# this creates ~/.local/state/forgefleet-bridge owned by the operator UID and
+# exports it as $STATE_DIRECTORY; the directory stays writable under
+# ProtectSystem=strict. /var/lib is intentionally NOT used here.
+StateDirectory=forgefleet-bridge
+# Minimum write paths, explicitly permitted and nothing else.
+ReadWritePaths=%S/forgefleet-bridge
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

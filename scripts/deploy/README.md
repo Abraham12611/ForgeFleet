@@ -15,7 +15,7 @@ scripts as the operator login user (docker group); never under sudo-root, so
 | `rollback-private.sh` | prints plan | reverts compose pins (bridge unit handled out of band) |
 | `wait-for-paperclip.sh` | n/a (unit ExecStartPre) | n/a (fails closed on unhealthy Paperclip) |
 | `selftest.sh` | fixture-only scaffold checks | n/a |
-| `guard-loopback.sh` | refuses non-loopback `BRIDGE_BIND` | n/a (used as systemd `ExecStartPre`) |
+| `guard-loopback.sh` | refuses non-loopback `FORGEFLEET_BRIDGE_HOST` / non-numeric `PORT` | n/a (used as systemd `ExecStartPre`) |
 | `lib/common.sh` | shared guards/helpers | n/a |
 
 Hard rules (also enforced by `selftest.sh`): scripts never reference

@@ -10,9 +10,11 @@ set -euo pipefail
 forbid_orca_target "$@"
 
 paperclip_port="${PAPERCLIP_PORT:-8080}"
-bridge_port="${BRIDGE_PORT:-8787}"
+bridge_host="${FORGEFLEET_BRIDGE_HOST:-127.0.0.1}"
+bridge_port="${PORT:-4387}"
 paperclip_path="${PAPERCLIP_HEALTH_PATH:-/healthz}"
-bridge_path="${BRIDGE_HEALTH_PATH:-/healthz}"
+# Server contract default: unauthenticated /v1/health/live (PR #63 server.ts).
+bridge_path="${BRIDGE_HEALTH_PATH:-/v1/health/live}"
 fail=0
 
 probe() {  # $1 label, $2 url
@@ -30,7 +32,7 @@ probe() {  # $1 label, $2 url
 }
 
 probe paperclip "http://127.0.0.1:${paperclip_port}${paperclip_path}"
-probe bridge "http://127.0.0.1:${bridge_port}${bridge_path}"
+probe bridge "http://${bridge_host}:${bridge_port}${bridge_path}"
 
 if docker ps --format '{{.Names}}' 2>/dev/null | grep -q .; then
   log "compose containers: $(docker ps --format '{{.Names}}:{{.Status}}' 2>/dev/null | tr '\n' ' ')"

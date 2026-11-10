@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Restore a backup snapshot into the private stack (FF-005).
-# Default is dry-run. --apply requires BACKUP_SNAPSHOT=<dir> and refuses
-# unless BRIDGE_NO_NEW_DISPATCH=1 (leases must never resume as runnable).
+# Default is dry-run. --apply requires BACKUP_SNAPSHOT=<dir> and
+# RESTORE_FENCED=1: the operator confirms dispatch is held (no new attempts
+# will be submitted) until post-restore reconciliation passes. The server
+# ignores dispatch-pause env vars and reconciles leases on restart instead
+# (PR #63 reconcileAfterRestart), so after any restore the bridge MUST be
+# restarted and /v1/attempts verified before dispatch resumes.
 # Restores pg.dump + context.tgz (required) and bridge-state.tgz when the
 # snapshot carries it, into exactly the volumes/dirs backup.sh snapshots.
 # Reconcile Orca/GitHub state before re-enabling dispatch. Never touches orca-serve.
@@ -11,15 +15,14 @@ set -euo pipefail
 
 if want_apply --apply "$@"; then APPLY=1; else APPLY=0; fi
 snap="${BACKUP_SNAPSHOT:-}"
-BRIDGE_STATE_DIR="${BRIDGE_STATE_DIR:-/var/lib/forgefleet/bridge}"
 
 log "restore plan: snapshot ${snap:-<unset>} -> db + context-store (+ bridge state when present)"
 [ -n "$snap" ] || { warn "set BACKUP_SNAPSHOT=<timestamped dir>"; exit 2; }
 [ -f "$snap/pg.dump" ] && [ -f "$snap/context.tgz" ] \
   || { warn "snapshot incomplete (need pg.dump + context.tgz)"; exit 2; }
 
-if [ "${BRIDGE_NO_NEW_DISPATCH:-0}" != "1" ]; then
-  warn "refusing restore: set BRIDGE_NO_NEW_DISPATCH=1 first (fence leases)"
+if [ "${RESTORE_FENCED:-0}" != "1" ]; then
+  warn "refusing restore: set RESTORE_FENCED=1 (operator-held dispatch) first"
   exit 2
 fi
 
@@ -29,11 +32,5 @@ docker compose -f "$COMPOSE_FILE" exec -T db \
   psql -U "${POSTGRES_USER:?}" -d "${POSTGRES_DB:?}" < "$snap/pg.dump"
 docker run --rm -v forge-private_context-store:/dst -v "$snap:/src:ro" \
   busybox tar -xzf /src/context.tgz -C /dst
-if [ -f "$snap/bridge-state.tgz" ]; then
-  mkdir -p "$BRIDGE_STATE_DIR"
-  tar -xzf "$snap/bridge-state.tgz" -C "$(dirname "$BRIDGE_STATE_DIR")"
-  log "bridge state restored to $BRIDGE_STATE_DIR (bridge unit stays fenced)"
-else
-  warn "snapshot has no bridge-state.tgz — bridge state left untouched"
-fi
+restore_bridge_state "$snap" || true
 log "restore applied: reconcile Orca/GitHub state, then re-enable dispatch manually"

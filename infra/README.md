@@ -42,15 +42,43 @@ Why native instead of a container:
 - Ordering across the user/system manager boundary cannot use `After=`, so
   the unit gates startup at runtime: `wait-for-paperclip.sh` polls Paperclip
   health on loopback and fails closed on timeout.
+- Writable state is the systemd `StateDirectory=forgefleet-bridge`
+  (`~/.local/state/forgefleet-bridge`, operator-owned) plus explicit
+  `ReadWritePaths` for that path only; `/var/lib` is unusable under
+  `ProtectSystem=strict`. Proven by `tests/test-state-durability.sh`
+  (disposable SQLite WAL write/snapshot/restore roundtrip, unprivileged).
+- The unit execs the Orca CLI resolved by `resolve_orca_cli` (per VPS
+  finding #65: validated `ORCA_CLI_COMMAND`, then `~/.local/bin/orca-ide`,
+  then the extracted `resources/bin/orca-ide` shim). The Electron GUI
+  binary, bare `orca`, and any `--no-sandbox` workaround are refused.
 - Backup/restore mirror exactly what exists: `pg_dump` + `context-store`
-  volume (compose) + the native bridge state dir (`BRIDGE_STATE_DIR`).
+  volume (compose) + the native bridge state dir
+  (`FORGEFLEET_BRIDGE_DATA_DIR`, default `~/.local/state/forgefleet-bridge`).
+
+Server contract (reconciled with PR #63, FF-031): entrypoint
+`node src/main.ts` (package.json start script, Node >=24, no dist build);
+env `FORGEFLEET_BRIDGE_TOKEN` (required), `FORGEFLEET_BRIDGE_HOST`
+(default `127.0.0.1`), `PORT` (default `4387`),
+`FORGEFLEET_BRIDGE_DATA_DIR` (fixed by the unit to the StateDirectory —
+the server's `./bridge-data` default is cwd-relative and wrong under a
+daemon). Liveness `GET /v1/health/live` answers 200 `{ok, contractVersion}`
+**without** a token; every other route requires the Bearer token (401
+otherwise). Proven by `tests/test-bridge-contract.sh`: disposable node stub
+with the exact surface, real `healthcheck.sh` probe, and auth
+positive/negative cases — not regex.
+
+Dispatch fencing is an operator hold, not an env var: the server ignores
+dispatch-pause env vars and reconciles leases on restart
+(`reconcileAfterRestart`, leases held unknown until proven). `restore.sh`
+requires `RESTORE_FENCED=1`; after any restore the bridge must be restarted
+and `/v1/attempts` verified before dispatch resumes; rollback prints the
+same sequence and never issues service-manager verbs itself.
 
 Health paths are single-sourced by variable name (`PAPERCLIP_HEALTH_PATH`
 shared by compose and `healthcheck.sh`; `BRIDGE_HEALTH_PATH` shared by
-`bridge.env.example` and `healthcheck.sh`), so pinning the real Paperclip
-image (E01) or the bridge API (#60) changes one value each. Current values
-are placeholders: port `8787` and `/healthz` diverge from later spikes and
-converge when those contracts land.
+`bridge.env.example` and `healthcheck.sh`, defaulting to the contract
+`/v1/health/live`), so pinning the real Paperclip image (E01) changes one
+value.
 
 Coordination note: PR #51 (FF-022) sketches a different topology (bridge in
 compose, port `4387`). This scaffold is the canonical private-phase path per
@@ -64,11 +92,13 @@ parallel stack.
 2. `scripts/deploy/*.sh` refuse any action matching `orca-serve` and fail
    closed on unknown subcommands. Deploy/rollback scripts require explicit
    `--apply`; the default is plan/dry-run output only.
-3. Bridge binds loopback by default (`BRIDGE_BIND=127.0.0.1:8787`). The systemd
+3. Bridge binds loopback by default (`FORGEFLEET_BRIDGE_HOST=127.0.0.1`,
+   `PORT=4387`). The systemd
    unit's `ExecStartPre` guard refuses to start on a non-loopback bind.
 4. No secrets are committed. `*.env.example` files carry names and safe
    defaults only; real values come from the host secret manager or a
-   root-only `*.env` file that is git-ignored.
+   mode-600 `*.env` file that is git-ignored (`/etc/forgefleet` for
+   compose, `~/.config/forgefleet` for the user-unit bridge env).
 5. Bare `orca` is never invoked on Linux. Preflight resolves
    `ORCA_CLI_COMMAND` first, then a version-matched `orca-ide` binary.
 6. Backups never capture secrets, and restores never resume leases as

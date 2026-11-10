@@ -24,8 +24,9 @@ else
   log "mode: dry-run -- pass --apply to execute"
 fi
 
-# Guard 1: loopback bind.
-BRIDGE_BIND="${BRIDGE_BIND:-127.0.0.1:8787}" "$FF_ROOT/scripts/deploy/guard-loopback.sh"
+# Guard 1: loopback bind (server contract names: FORGEFLEET_BRIDGE_HOST + PORT).
+FORGEFLEET_BRIDGE_HOST="${FORGEFLEET_BRIDGE_HOST:-127.0.0.1}" PORT="${PORT:-4387}" \
+  "$FF_ROOT/scripts/deploy/guard-loopback.sh"
 
 # Guard 2: pinned images, no latest/guessing. The bridge is native (no image).
 fail=0
@@ -48,9 +49,10 @@ if sed 's/#.*//' "$COMPOSE_FILE" | grep -qE '^[[:space:]]{2}bridge:'; then
   exit 2
 fi
 
-# Guard 5: the native bridge entrypoint the user unit will exec must exist.
-[ -f /opt/forgefleet/services/orca-bridge/dist/index.js ] \
-  || { warn "refusing deploy: bridge entrypoint missing (build the bridge before --apply)"; exit 2; }
+# Guard 5: the native bridge entrypoint the user unit will exec must exist
+# (PR #63 contract: src/main.ts, run with Node >=24, no dist build step).
+[ -f /opt/forgefleet/services/orca-bridge/src/main.ts ] \
+  || { warn "refusing deploy: bridge entrypoint missing (check out the bridge sources before --apply)"; exit 2; }
 
 if [ "$APPLY" = 0 ]; then
   log "dry-run complete: no containers started, no Orca state touched"

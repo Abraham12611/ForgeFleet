@@ -17,18 +17,18 @@ log "rollback plan: fence dispatch, snapshot state, revert to previous pins"
 [ -n "${PREV_PAPERCLIP_IMAGE:-}" ] || { warn "PREV_PAPERCLIP_IMAGE unset"; exit 2; }
 
 steps=(
-  "BRIDGE_NO_NEW_DISPATCH=1 fence new dispatch (leave running workers alone)"
+  "operator holds dispatch (no new attempts) until reconciliation passes"
   "backup.sh --apply snapshot of correlated state"
   "PAPERCLIP_IMAGE=$PREV_PAPERCLIP_IMAGE up -d db paperclip"
   "operator reloads the bridge user unit out of band (never from this script)"
+  "bridge restarts and reconciles leases (server reconcileAfterRestart)"
   "healthcheck.sh must pass before re-enabling dispatch"
-  "reconcile Orca/GitHub, then BRIDGE_NO_NEW_DISPATCH=0"
+  "reconcile Orca/GitHub, verify /v1/attempts, then resume dispatch"
 )
 for s in "${steps[@]}"; do log "step: $s"; done
 
 [ "$APPLY" = 1 ] || { log "dry-run complete: nothing reverted"; exit 0; }
 
-export BRIDGE_NO_NEW_DISPATCH=1
 "$FF_ROOT/scripts/deploy/backup.sh" --apply
 PAPERCLIP_IMAGE="$PREV_PAPERCLIP_IMAGE" \
   docker compose -f "$COMPOSE_FILE" up -d db paperclip

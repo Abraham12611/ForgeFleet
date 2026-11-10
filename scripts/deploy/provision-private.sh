@@ -33,14 +33,13 @@ else
   fail=1
 fi
 
-# 2. Resolve the trusted CLI without ever running a bare `orca` on Linux.
-if [ -n "${ORCA_CLI_COMMAND:-}" ]; then
-  log "ORCA_CLI_COMMAND=[set] (value withheld)"
-  command -v "$ORCA_CLI_COMMAND" >/dev/null 2>&1 || { warn "ORCA_CLI_COMMAND not on PATH"; fail=1; }
-elif command -v orca-ide >/dev/null 2>&1; then
-  log "orca-ide found on PATH (version check left to the version-matched CLI guide)"
+# 2. Resolve the trusted CLI wrapper without executing it and without ever
+# touching orca-serve. Order per VPS finding #65; the Electron GUI binary and
+# bare `orca` are refused by the resolver. No --no-sandbox style flags anywhere.
+if cli="$(resolve_orca_cli 2>/dev/null)"; then
+  log "Orca CLI wrapper resolved: $cli (read-only; never invoked with sandbox flags)"
 else
-  warn "no ORCA_CLI_COMMAND and no orca-ide on PATH"
+  warn "no supported Orca CLI wrapper (need ORCA_CLI_COMMAND or a packaged orca-ide shim; GUI binary and bare-orca refused)"
   fail=1
 fi
 
@@ -53,7 +52,17 @@ else
   warn "tailscale CLI not found; private admin reach not verified"
 fi
 
-# 4. Container toolchain and scaffold pins. The bridge is native (no image).
+# 4. Container toolchain, Node floor, and scaffold pins. The bridge is native.
+# Server entrypoint is `node src/main.ts` (PR #63, Node >=24 type-stripping).
+if need_cmd node; then
+  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [ "${node_major:-0}" -ge 24 ] 2>/dev/null \
+    && log "node $(node --version) meets the >=24 server floor" \
+    || warn "node floor unmet (server needs >=24; found ${node_major:-unknown})"
+else
+  warn "node unavailable; bridge entrypoint cannot run here"
+  fail=1
+fi
 need_cmd docker || fail=1
 [ -f "$COMPOSE_FILE" ] && log "compose file present" || { warn "missing $COMPOSE_FILE"; fail=1; }
 env_presence PAPERCLIP_IMAGE POSTGRES_IMAGE || true
@@ -65,11 +74,11 @@ if sed 's/#.*//' "$COMPOSE_FILE" | grep -qE '^[[:space:]]{2}bridge:'; then
   warn "compose defines a bridge service (bridge runs as the user unit only)"
   fail=1
 fi
-# Native bridge entrypoint the user unit will exec.
-if [ -f /opt/forgefleet/services/orca-bridge/dist/index.js ]; then
-  log "bridge entrypoint present"
+# Native bridge entrypoint the user unit will exec (PR #63: src/main.ts).
+if [ -f /opt/forgefleet/services/orca-bridge/src/main.ts ]; then
+  log "bridge entrypoint present (src/main.ts)"
 else
-  warn "bridge entrypoint missing (build the bridge before enabling the user unit)"
+  warn "bridge entrypoint missing (check out the bridge sources before enabling the user unit)"
 fi
 # Unprivileged-user proof: the bridge user unit runs as this login UID, which
 # must be the same unprivileged user that owns orca-serve.service — never root.
@@ -81,7 +90,10 @@ else
 fi
 
 # 5. Secret files must exist with root-only permissions when present.
-for f in /etc/forgefleet/paperclip.env /etc/forgefleet/bridge.env /etc/forgefleet/postgres.env; do
+# paperclip/postgres live in /etc (compose); the bridge env lives in the
+# operator home (native user unit) and is resolved like deploy-private.sh.
+BRIDGE_ENV_FILE="${BRIDGE_ENV_FILE:-$HOME/.config/forgefleet/bridge.env}"
+for f in /etc/forgefleet/paperclip.env /etc/forgefleet/postgres.env "$BRIDGE_ENV_FILE"; do
   if [ -f "$f" ]; then
     perms="$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null || echo '?')"
     log "$f present (mode $perms; values never printed)"

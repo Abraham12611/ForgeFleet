@@ -34,11 +34,15 @@ grep -q 'image: "${[A-Z_]*:?' "$I/docker-compose.private.yml" \
 grep -qiE 'password=|passwd|secret=.+[^:?}]|BEGIN .*PRIVATE KEY' "$I/docker-compose.private.yml" \
   && bad "compose contains secret-looking value" || ok "compose carries no secrets"
 
-# 3. Env examples: names only, no real credentials.
+# 3. Env examples: names only, no real credentials. Bridge names follow the
+# server contract (PR #63 main.ts); the loopback default is enforced by
+# guard-loopback.sh, exercised below.
 grep -rqiE 'BEGIN .*PRIVATE KEY|ghp_|github_pat_|sk-[A-Za-z0-9]{8}' "$I"/*.env.example \
   && bad "env.example contains credential-looking value" || ok "env.examples are credential-free"
-grep -q 'BRIDGE_BIND=127.0.0.1' "$I/bridge.env.example" \
-  && ok "bridge default bind is loopback" || bad "bridge default bind drifted"
+for pin in 'FORGEFLEET_BRIDGE_HOST=127.0.0.1' '^PORT=4387' 'FORGEFLEET_BRIDGE_TOKEN=' 'BRIDGE_HEALTH_PATH=/v1/health/live'; do
+  grep -q "$pin" "$I/bridge.env.example" \
+    && ok "env pins $pin" || bad "env pin missing: $pin"
+done
 
 # 4. Systemd: hardened, guarded, never bound to Orca.
 for u in "$I"/systemd/*.service; do
@@ -50,11 +54,13 @@ done
 grep -q 'guard-loopback' "$I/systemd/forgefleet-bridge.service" \
   && ok "bridge unit runs loopback guard" || bad "bridge unit missing loopback guard"
 
-# 5. Loopback guard behavior (both outcomes).
-BRIDGE_BIND=127.0.0.1:8787 "$D/guard-loopback.sh" >/dev/null \
+# 5. Loopback guard behavior (accept, non-loopback, non-numeric port).
+FORGEFLEET_BRIDGE_HOST=127.0.0.1 PORT=4387 "$D/guard-loopback.sh" >/dev/null \
   && ok "guard accepts loopback" || bad "guard rejects loopback"
-BRIDGE_BIND=0.0.0.0:8787 "$D/guard-loopback.sh" >/dev/null 2>&1 \
+FORGEFLEET_BRIDGE_HOST=0.0.0.0 PORT=4387 "$D/guard-loopback.sh" >/dev/null 2>&1 \
   && bad "guard accepts 0.0.0.0" || ok "guard refuses non-loopback"
+FORGEFLEET_BRIDGE_HOST=127.0.0.1 PORT=notaport "$D/guard-loopback.sh" >/dev/null 2>&1 \
+  && bad "guard accepts non-numeric port" || ok "guard refuses non-numeric port"
 
 # 6. Deploy scripts fail closed without pins/secrets (dry-run default).
 if PAPERCLIP_IMAGE=x BRIDGE_IMAGE=x POSTGRES_IMAGE=x "$D/deploy-private.sh" >/dev/null 2>&1; then
@@ -130,6 +136,93 @@ if grep -E '^[[:space:]]+-.*(\$HOME|/home/|%h|~/)' "$I/docker-compose.private.ym
   bad "compose bind-mounts a home directory"
 else
   ok "compose mounts no home directories"
+fi
+# No /var/lib bridge state: the sandboxed unit cannot write there.
+if grep -rq '/var/lib/forgefleet/bridge' "$I/bridge.env.example" "$D" 2>/dev/null | grep -v selftest; then
+  bad "/var/lib bridge state reference remains"
+else
+  ok "no /var/lib bridge state reference"
+fi
+# Unit owns its state via StateDirectory with minimum write paths.
+grep -q '^StateDirectory=forgefleet-bridge' "$I/systemd/forgefleet-bridge.service" \
+  && ok "bridge unit declares StateDirectory" || bad "bridge unit missing StateDirectory"
+grep -q '^ReadWritePaths=%S/forgefleet-bridge' "$I/systemd/forgefleet-bridge.service" \
+  && ok "bridge unit permits minimum write path" || bad "bridge unit missing ReadWritePaths"
+# Scripts and env example agree on the XDG default.
+grep -q 'local/state/forgefleet-bridge' "$I/bridge.env.example" \
+  && grep -q 'local/state/forgefleet-bridge' "$D/lib/common.sh" \
+  && ok "state default single-sourced (env example + helpers)" \
+  || bad "state default diverged between env example and helpers"
+
+# 10. Executable durability proof (disposable unprivileged fixture, no VPS).
+if [ "$(id -u)" = "0" ]; then
+  ok "durability fixture skipped (root; VPS runs unprivileged)"
+elif bash "$D/tests/test-state-durability.sh" >/dev/null 2>&1; then
+  ok "durability fixture passed (write/snapshot/restore roundtrip)"
+else
+  bad "durability fixture failed"
+fi
+
+# 11. Sandbox safety: no setuid/sandbox workarounds anywhere in scope.
+# Per VPS finding #65 these are forbidden (no --no-sandbox, no chmod 4755,
+# no chown root, no Electron GUI invocation). Comments are stripped; only
+# live code can trip these guards.
+# Patterns are assembled from fragments so this guard cannot match its own
+# source lines (fixed-string search sees only the joined value).
+for pat in '--no-sand'"box" 'disable-setuid-sand'"box" 'chmod 47'"55" 'chown ro'"ot"; do
+  if no_comments "$D"/*.sh "$D"/lib/*.sh "$D"/tests/*.sh "$I"/systemd/*.service 2>/dev/null | grep -qF -- "$pat"; then
+    bad "forbidden sandbox workaround present: $pat"
+  else
+    ok "no $pat in scope"
+  fi
+done
+
+# 12. Orca wrapper resolution proof (fake HOME/PATH fixture, nothing executed).
+if bash "$D/tests/test-orca-resolution.sh" >/dev/null 2>&1; then
+  ok "orca resolution fixture passed (shim selected, GUI/bare refused)"
+else
+  bad "orca resolution fixture failed"
+fi
+
+# 13. Server contract pins (PR #63): exact artifact, env names, health path.
+grep -q '^ExecStart=/usr/bin/env node src/main.ts' "$I/systemd/forgefleet-bridge.service" \
+  && ok "unit entrypoint is node src/main.ts" || bad "unit entrypoint drifted"
+grep -q '^WorkingDirectory=/opt/forgefleet/services/orca-bridge' "$I/systemd/forgefleet-bridge.service" \
+  && ok "unit working dir matches deployed sources" || bad "unit working dir drifted"
+grep -q '^Environment=FORGEFLEET_BRIDGE_DATA_DIR=%S/forgefleet-bridge' "$I/systemd/forgefleet-bridge.service" \
+  && ok "unit fixes data dir to StateDirectory" || bad "unit data dir drifted"
+grep -q 'PORT:-4387' "$D/healthcheck.sh" \
+  && ok "healthcheck defaults to contract port" || bad "healthcheck port drifted"
+# Stale pre-contract names must be gone from live scope (the frozen
+# example-orca-bridge.service reference is exempt). Fragments keep this guard
+# from matching its own source lines.
+stale=0
+for pat in 'BRIDGE_AUTH_SECR'"ET" 'BRIDGE_BIN'"D" 'BRIDGE_POR'"T=" 'BRIDGE_NO_NEW_DISPA'"TCH" 'BRIDGE_STATE_D'"IR" 'dist/index'"js"; do
+  if no_comments "$D"/*.sh "$D"/lib/*.sh "$D"/tests/*.sh \
+      "$I"/systemd/forgefleet-bridge.service "$I"/systemd/forgefleet-paperclip.service \
+      "$I"/bridge.env.example "$I"/docker-compose.private.yml 2>/dev/null \
+      | grep -qF -- "$pat"; then
+    bad "stale contract name present: $pat"; stale=1
+  fi
+done
+[ "$stale" -eq 0 ] && ok "no stale contract names in live scope"
+# Fence specificity: a complete snapshot without RESTORE_FENCED still refuses.
+fence_dir="$(mktemp -d)"
+touch "$fence_dir/pg.dump" "$fence_dir/context.tgz"
+if BACKUP_SNAPSHOT="$fence_dir" "$D/restore.sh" >/dev/null 2>&1; then
+  bad "restore runs without operator fence"
+else
+  ok "restore refuses without operator fence"
+fi
+rm -rf "$fence_dir"
+
+# 14. Bridge contract proof (disposable node stub + real healthcheck probe).
+if ! command -v node >/dev/null 2>&1; then
+  ok "contract fixture skipped (no node; server floor is >=24)"
+elif bash "$D/tests/test-bridge-contract.sh" >/dev/null 2>&1; then
+  ok "contract fixture passed (liveness/auth/healthcheck on contract shape)"
+else
+  bad "contract fixture failed"
 fi
 
 echo "---"
