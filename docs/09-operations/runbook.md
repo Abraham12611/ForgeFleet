@@ -33,6 +33,13 @@ Disable merges, inspect exact head SHA/checks/protection; do not force-merge. Ve
 
 Set global admission to zero; do not indiscriminately kill existing operations that can corrupt state. Evaluate provider token usage, dispatch loops and duplicated attempts. Resume with reduced cap after evidence.
 
+## Incident: suspected secret in project context
+
+1. Quarantine the manifest revision: note its `revision` pin and stop binding new tasks to it; do not delete the revision (attempts cite it as evidence).
+2. Confirm what entered: re-run ingestion of the suspect source through `packages/context` validation/redaction and compare excerpts (`redactions` list) against the stored manifest.
+3. If a raw secret reached an excerpt, rotate the credential first, then land a successor manifest via `addSources`/`bindTask` plus an explicit `refreshEvent` citing the quarantined revision.
+4. Serving stays gated on an E07 policy allow-decision; re-verify scope before workers resume fetches.
+
 ## Incident: security breach
 
 Revoke service/GitHub tokens and disable privileged actions; preserve sanitized logs and audit; isolate bridge network; inform owner; investigate prompt injection and unauthorized access; rotate credentials and restore from known-good artifact if necessary.

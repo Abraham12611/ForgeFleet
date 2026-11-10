@@ -1,0 +1,12 @@
+{
+  "name": "@forgefleet/context",
+  "version": "0.1.0",
+  "description": "Context file ingestion and immutable task-scoped manifests for ForgeFleet (FF-011). Pure logic, zero dependencies.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
