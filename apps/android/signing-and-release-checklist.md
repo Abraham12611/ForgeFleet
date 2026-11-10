@@ -27,6 +27,11 @@ unchecked — check them only with observed console/device output attached.
 
 ## Play submission (owner-gated)
 
+Submission-time policy detail lives in
+`play-internal/INTERNAL_TRACK_CHECKLIST.md` (FF-029) and device evidence in
+`play-internal/SMOKE_PROTOCOL.md`; this checklist covers build prerequisites
+only and does not duplicate them.
+
 - [ ] AAB uploaded to the **internal** track under the owner's Play Console.
 - [ ] Privacy policy, data-safety form, app-access instructions, permission
   declarations, and target-SDK compliance reviewed against **current** Play
