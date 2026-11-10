@@ -26,7 +26,6 @@ import {
   MessageError,
   toContractActor,
   type Actor,
-  type AuthenticatedCaller,
   type DecisionItem,
   type Escalation,
 } from "./types.ts";
@@ -110,16 +109,13 @@ function rowToEscalation(row: EscalationRow): Escalation {
   };
 }
 
-/** Owner answers must arrive on an owner session (or the test harness). */
-function requireOwnerHuman(caller: AuthenticatedCaller): Actor {
-  const { identity, via } = caller;
-  if (via !== "owner-session" && via !== "test-harness") {
-    throw new MessageError(
-      "FORBIDDEN",
-      403,
-      `owner answers require an owner session transport (got ${via}); service tokens and message content are never authority`,
-    );
-  }
+/**
+ * Store-level owner check (role + type only). Transport proof
+ * (owner-session vs service-token) is enforced by the facade, which is
+ * the only layer that sees credentials; the store seam takes plain
+ * identities and never interprets transport strings.
+ */
+function requireOwnerHuman(identity: Actor): Actor {
   if (identity.role !== "owner" || identity.type !== "human") {
     throw new MessageError(
       "FORBIDDEN",
@@ -153,7 +149,7 @@ export class EscalationStore {
     threads: ThreadStore,
     input: {
       threadId: string;
-      caller: AuthenticatedCaller;
+      raisedBy: Actor;
       options: string[];
       evidence: string[];
       severity?: Escalation["severity"];
@@ -171,9 +167,9 @@ export class EscalationStore {
       throw new MessageError("VALIDATION", 400, "escalation requires evidence pointers");
     }
     const createdAt = this.now();
-    // raisedBy is derived from the authenticated caller, never from
-    // message payload: a caller-raised escalation carries caller authority.
-    const raisedBy: Actor = { ...input.caller.identity };
+    // raisedBy arrives from the facade-resolved caller (never from message
+    // payload); the facade is the only layer that sees credentials.
+    const raisedBy: Actor = { ...input.raisedBy };
     const escalation: Escalation = {
       escalationId: this.generateId(),
       threadId: thread.threadId,
@@ -327,8 +323,8 @@ export class EscalationStore {
   }
 
   /** Coordinator resolution: rationale recorded, never an owner approval. */
-  resolveByCoordinator(escalationId: string, caller: AuthenticatedCaller, resolution: string): Escalation {
-    if (caller.identity.role !== "coordinator" && caller.identity.role !== "owner") {
+  resolveByCoordinator(escalationId: string, actor: Actor, resolution: string): Escalation {
+    if (actor.role !== "coordinator" && actor.role !== "owner") {
       throw new MessageError("FORBIDDEN", 403, "only the coordinator (or owner) resolves escalations");
     }
     if (!resolution) throw new MessageError("VALIDATION", 400, "resolution rationale required");
@@ -348,11 +344,11 @@ export class EscalationStore {
    */
   answerDecision(
     decisionId: string,
-    caller: AuthenticatedCaller,
+    actor: Actor,
     answer: string,
     targetSha?: string,
   ): { decision: DecisionItem; reopened?: DecisionItem } {
-    const owner = requireOwnerHuman(caller);
+    const owner = requireOwnerHuman(actor);
     return this.db.transaction(() => {
       const row = this.db.prepare("SELECT * FROM decisions WHERE decision_id = ?").get(decisionId) as DecisionRow | undefined;
       if (!row) throw new MessageError("VALIDATION", 400, `unknown decision: ${decisionId}`);
@@ -407,8 +403,8 @@ export class EscalationStore {
     ]);
   }
 
-  withdrawDecision(decisionId: string, caller: AuthenticatedCaller): DecisionItem {
-    if (caller.identity.role !== "coordinator" && caller.identity.role !== "owner") {
+  withdrawDecision(decisionId: string, actor: Actor): DecisionItem {
+    if (actor.role !== "coordinator" && actor.role !== "owner") {
       throw new MessageError("FORBIDDEN", 403, "only the coordinator (or owner) withdraws decisions");
     }
     return this.db.transaction(() => {

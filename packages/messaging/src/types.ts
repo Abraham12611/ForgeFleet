@@ -90,18 +90,6 @@ export function toContractActor(actor: Actor): ContractActor {
   return { type: actor.type, id: actor.id };
 }
 
-/**
- * Authenticated caller: identity PLUS the transport it arrived on.
- * Message content is never a transport: there is no `via: "message"`,
- * and any such claim is rejected at the facade boundary.
- */
-export type CallerTransport = "service-token" | "owner-session" | "test-harness";
-
-export interface AuthenticatedCaller {
-  identity: Actor;
-  via: CallerTransport;
-}
-
 /** Channel naming from communications.md. */
 export type Channel =
   | `project/general`

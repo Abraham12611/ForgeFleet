@@ -8,13 +8,13 @@ import { normalizeOrcaMessage, planDelivery } from "./router.ts";
 import type { PresencePort } from "./router.ts";
 import { MessagingDb } from "./sqlite.ts";
 import { ThreadStore } from "./thread-store.ts";
-import { MessageError, type Actor, type AuthenticatedCaller } from "./types.ts";
+import { MessageError, type Actor } from "./types.ts";
 
 const WORKER_A: Actor = { type: "agent", id: "worker-a", role: "worker", projects: ["p1"] };
 const WORKER_B: Actor = { type: "agent", id: "worker-b", role: "worker", projects: ["p1"] };
 const OWNER: Actor = { type: "human", id: "owner", role: "owner" };
+const COORD: Actor = { type: "agent", id: "coord-1", role: "coordinator", projects: ["p1"] };
 
-const as = (identity: Actor): AuthenticatedCaller => ({ identity, via: "test-harness" });
 
 const dbs: MessagingDb[] = [];
 const dirs: string[] = [];
@@ -131,10 +131,10 @@ describe("peer routing (Worker A <-> B)", () => {
 describe("escalation and owner decisions", () => {
   it("escalation persists options + evidence for coordinator resolution", () => {
     const { store, escalations } = setup();
-    const coord = as({ type: "agent", id: "coord-1", role: "coordinator", projects: ["p1"] });
+    const coord: Actor = { type: "agent", id: "coord-1", role: "coordinator", projects: ["p1"] };
     const { escalation, decision } = escalations.raiseEscalation(store, {
       threadId: "task/t1",
-      caller: as(WORKER_A),
+      raisedBy: WORKER_A,
       options: ["retry with backoff", "reassign to worker-b"],
       evidence: ["msg:id-1", "ci-log:run-42"],
       severity: "high",
@@ -151,11 +151,11 @@ describe("escalation and owner decisions", () => {
   it("escalation without options or evidence is rejected", () => {
     const { store, escalations } = setup();
     assert.throws(
-      () => escalations.raiseEscalation(store, { threadId: "task/t1", caller: as(WORKER_A), options: [], evidence: ["e"] }),
+      () => escalations.raiseEscalation(store, { threadId: "task/t1", raisedBy: WORKER_A, options: [], evidence: ["e"] }),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 400,
     );
     assert.throws(
-      () => escalations.raiseEscalation(store, { threadId: "task/t1", caller: as(WORKER_A), options: ["o"], evidence: [] }),
+      () => escalations.raiseEscalation(store, { threadId: "task/t1", raisedBy: WORKER_A, options: ["o"], evidence: [] }),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 400,
     );
   });
@@ -164,7 +164,7 @@ describe("escalation and owner decisions", () => {
     const { store, escalations } = setup();
     const { escalation, decision } = escalations.raiseEscalation(store, {
       threadId: "task/t1",
-      caller: as(WORKER_A),
+      raisedBy: WORKER_A,
       options: ["approve deploy", "hold until morning"],
       evidence: ["msg:id-1"],
       ownerOnly: true,
@@ -174,24 +174,26 @@ describe("escalation and owner decisions", () => {
     assert.ok(decision);
     assert.equal(decision.decisionId, escalation.decisionId);
     assert.equal(decision.status, "pending");
-    const { decision: answered } = escalations.answerDecision(decision.decisionId, as(OWNER), "hold until morning");
+    const { decision: answered } = escalations.answerDecision(decision.decisionId, OWNER, "hold until morning");
     assert.equal(answered.status, "answered");
     assert.equal(answered.answeredBy, "owner");
   });
 
-  it("agents cannot answer decisions; service tokens cannot answer either", () => {
+  it("non-owner humans cannot answer decisions (transport proof is facaded)", () => {
+    // The store seam checks role + type only; service-token refusal is
+    // enforced by the facade and covered in mcp.test.ts / auth-boundary.
     const { store, escalations } = setup();
     const { decision } = escalations.raiseEscalation(store, {
-      threadId: "task/t1", caller: as(WORKER_A),
+      threadId: "task/t1", raisedBy: WORKER_A,
       options: ["yes", "no"], evidence: ["e"], ownerOnly: true,
     });
     assert.ok(decision);
     assert.throws(
-      () => escalations.answerDecision(decision.decisionId, as(WORKER_A), "yes"),
+      () => escalations.answerDecision(decision.decisionId, WORKER_A, "yes"),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 403,
     );
     assert.throws(
-      () => escalations.answerDecision(decision.decisionId, { identity: OWNER, via: "service-token" }, "yes"),
+      () => escalations.answerDecision(decision.decisionId, COORD, "yes"),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 403,
     );
     assert.equal(escalations.getDecision(decision.decisionId).status, "pending");
@@ -200,7 +202,7 @@ describe("escalation and owner decisions", () => {
   it("expiry grants nothing; answering an expired decision fails", () => {
     const ctx = setup();
     const { decision } = ctx.escalations.raiseEscalation(ctx.store, {
-      threadId: "task/t1", caller: as(WORKER_A),
+      threadId: "task/t1", raisedBy: WORKER_A,
       options: ["yes", "no"], evidence: ["e"], ownerOnly: true,
       decisionTtlMs: 60_000,
     });
@@ -209,7 +211,7 @@ describe("escalation and owner decisions", () => {
     const expired = ctx.escalations.expireDue();
     assert.ok(expired.includes(decision.decisionId));
     assert.throws(
-      () => ctx.escalations.answerDecision(decision.decisionId, as(OWNER), "yes"),
+      () => ctx.escalations.answerDecision(decision.decisionId, OWNER, "yes"),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 409,
     );
     assert.equal(ctx.escalations.getDecision(decision.decisionId).status, "expired");
@@ -222,7 +224,7 @@ describe("escalation and owner decisions", () => {
       options: ["merge", "wait"], risk: "Head SHA pin.", requestedBy: "coord-1",
       targetSha: "abc123",
     });
-    const { decision: old, reopened } = escalations.answerDecision(decision.decisionId, as(OWNER), "merge", "def456");
+    const { decision: old, reopened } = escalations.answerDecision(decision.decisionId, OWNER, "merge", "def456");
     assert.equal(old.status, "withdrawn");
     assert.ok(reopened);
     assert.equal(reopened!.status, "pending");

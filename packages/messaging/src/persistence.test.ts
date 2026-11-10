@@ -12,15 +12,13 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessagingService } from "./mcp.ts";
+import { BRIDGE_CRED, OWNER_CRED, fakeAuth } from "./test-helpers.ts";
 import { planDelivery } from "./router.ts";
 import { MessagingDb } from "./sqlite.ts";
-import { MessageError, type Actor, type AuthenticatedCaller } from "./types.ts";
+import { MessageError, type Actor } from "./types.ts";
 
 const WORKER_A: Actor = { type: "agent", id: "worker-a", role: "worker", projects: ["p1"] };
 const WORKER_B: Actor = { type: "agent", id: "worker-b", role: "worker", projects: ["p1"] };
-const OWNER: Actor = { type: "human", id: "owner", role: "owner" };
-
-const as = (identity: Actor): AuthenticatedCaller => ({ identity, via: "test-harness" });
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -30,7 +28,7 @@ afterEach(() => {
 function openService(path: string, clock: () => string) {
   let n = 0;
   const db = new MessagingDb(path);
-  const svc = new MessagingService(db, { generateId: () => `id-${++n}`, now: clock });
+  const svc = new MessagingService(db, fakeAuth(), { generateId: () => `id-${++n}`, now: clock });
   return { db, svc };
 }
 
@@ -50,18 +48,19 @@ describe("restart survival", () => {
 
     let first = openService(file, () => clock);
     seedThread(first.svc);
-    const posted = first.svc.send_message(as(WORKER_A), {
-      threadId: "task/t1", kind: "question", body: "API response format?",
+    const posted = first.svc.file_runtime_message({ ...BRIDGE_CRED, workerId: "worker-a" }, {
+      projectId: "p1", taskId: "t1", workerId: "worker-a",
+      kind: "question", body: "API response format?",
       recipientIds: ["worker-b"], severity: "normal",
-      deadlineAt: "2026-11-08T16:00:00.000Z", idempotencyKey: "restart-key-1",
+      deadlineAt: "2026-11-08T16:00:00.000Z", idempotencyKey: "restart-key-1", externalId: "orca:restart-1",
     });
     assert.equal(posted.outcome, "stored");
-    const { escalation, decision } = first.svc.escalationStore.raiseEscalation(first.svc.store, {
-      threadId: "task/t1", caller: as(WORKER_A),
+    const { escalation, decision } = first.svc.raise_escalation(BRIDGE_CRED, {
+      threadId: "task/t1",
       options: ["approve deploy", "hold"], evidence: ["msg:id-1"], ownerOnly: true,
     });
     assert.ok(decision);
-    first.svc.escalationStore.answerDecision(decision.decisionId, as(OWNER), "hold");
+    first.svc.answer_decision(OWNER_CRED, { decisionId: decision.decisionId, answer: "hold" });
     first.db.close();
 
     // --- simulated bridge restart ---
@@ -163,9 +162,10 @@ describe("outbox crash recovery", () => {
     const file = join(dir, "messages.sqlite");
     let first = openService(file, () => "2026-11-08T12:00:00.000Z");
     seedThread(first.svc);
-    first.svc.send_message(as(WORKER_A), {
-      threadId: "task/t1", kind: "update", body: "hello",
-      recipientIds: ["worker-b"], idempotencyKey: "restart-key-4",
+    first.svc.file_runtime_message({ ...BRIDGE_CRED, workerId: "worker-a" }, {
+      projectId: "p1", taskId: "t1", workerId: "worker-a",
+      kind: "update", body: "hello",
+      recipientIds: ["worker-b"], idempotencyKey: "restart-key-4", externalId: "orca:restart-4",
     });
     const claimed = first.db.claimOutbox(10, "2026-11-08T12:00:30.000Z");
     assert.ok(claimed.length >= 1);

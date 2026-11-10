@@ -15,13 +15,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessagingService } from "./mcp.ts";
+import { BRIDGE_CRED, OWNER_CRED, fakeAuth } from "./test-helpers.ts";
 import { MessagingDb } from "./sqlite.ts";
-import type { Actor, AuthenticatedCaller, BridgeEvent, EventType } from "./types.ts";
+import type { BridgeEvent, EventType } from "./types.ts";
 
-const WORKER_A: Actor = { type: "agent", id: "worker-a", role: "worker", projects: ["p1"] };
-const OWNER: Actor = { type: "human", id: "owner", role: "owner" };
-
-const as = (identity: Actor): AuthenticatedCaller => ({ identity, via: "test-harness" });
 
 const EMITTED_TYPES: readonly EventType[] = [
   "message.posted",
@@ -46,7 +43,7 @@ function setup() {
   let clock = "2026-11-08T12:00:00.000Z";
   const db = new MessagingDb(join(dir, "messages.sqlite"));
   dbs.push(db);
-  const svc = new MessagingService(db, { generateId: () => `id-${++n}`, now: () => clock });
+  const svc = new MessagingService(db, fakeAuth(), { generateId: () => `id-${++n}`, now: () => clock });
   svc.store.createThread({
     channel: "task/t1", projectId: "p1", taskId: "t1",
     acl: ["worker-a", "owner"], threadId: "task/t1",
@@ -69,17 +66,18 @@ function assertFrozenEnvelope(event: BridgeEvent): void {
 describe("frozen-contract outbox envelopes (bridge v0.1)", () => {
   it("every emitted event carries the frozen envelope", () => {
     const { svc, db, setClock } = setup();
-    svc.send_message(as(WORKER_A), {
-      threadId: "task/t1", kind: "question", body: "Approve?",
+    svc.file_runtime_message({ ...BRIDGE_CRED, workerId: "worker-a" }, {
+      projectId: "p1", taskId: "t1", workerId: "worker-a",
+      kind: "question", body: "Approve?",
       recipientIds: ["owner"], severity: "normal",
-      deadlineAt: "2026-11-08T16:00:00.000Z", idempotencyKey: "key-env-11",
+      deadlineAt: "2026-11-08T16:00:00.000Z", idempotencyKey: "key-env-11", externalId: "orca:env-11",
     });
-    const { decision } = svc.escalationStore.raiseEscalation(svc.store, {
-      threadId: "task/t1", caller: as(WORKER_A),
+    const { decision } = svc.raise_escalation(BRIDGE_CRED, {
+      threadId: "task/t1",
       options: ["yes", "no"], evidence: ["e"], ownerOnly: true,
     });
     assert.ok(decision);
-    svc.escalationStore.answerDecision(decision.decisionId, as(OWNER), "no");
+    svc.answer_decision(OWNER_CRED, { decisionId: decision.decisionId, answer: "no" });
     const expiring = svc.escalationStore.openDecision({
       projectId: "p1", question: "Stale?", options: ["a"], risk: "r",
       requestedBy: "worker-a", ttlMs: 1,
@@ -89,7 +87,7 @@ describe("frozen-contract outbox envelopes (bridge v0.1)", () => {
     const withdrawn = svc.escalationStore.openDecision({
       projectId: "p1", question: "Drop?", options: ["a"], risk: "r", requestedBy: "worker-a",
     });
-    svc.escalationStore.withdrawDecision(withdrawn.decisionId, as(OWNER));
+    svc.withdraw_decision(OWNER_CRED, { decisionId: withdrawn.decisionId });
 
     const claims = db.claimOutbox(50, "2026-11-08T13:00:00.000Z");
     const seen = new Set(claims.map((c) => c.event.eventType));
