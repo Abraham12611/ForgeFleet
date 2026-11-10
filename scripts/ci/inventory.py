@@ -6,6 +6,13 @@ Anti-false-green rules enforced here:
   is enumerated deterministically (sorted) and passed explicitly to
   `node --test`. Directory paths are never passed: on Node 24 a directory
   argument does not substitute for explicit test files and hides stderr.
+- In a Vitest-managed root, BOTH runners execute: `npm test` for the
+  Vitest-owned *.test.ts files AND `node --test` for the remaining
+  *.test.js/.mjs/.cjs files. Either side failing fails the row; the node
+  files are never skipped by an early continue after the Vitest run.
+- A Vitest-managed root is never UNCOVERED: npm missing on the runner, or
+  a missing package-lock.json (which would force an unreviewed floating
+  `npm install`), is a FAIL, not a green-uncovered row.
 - A present suite directory containing zero test files is PRESENT-EMPTY and
   fails the gate (fail closed once milestone code lands).
 - Python suites assert exit 0, an `OK` verdict line, AND a minimum test count,
@@ -78,7 +85,7 @@ PYTHON_SUITES = [
 # empty-but-passing file cannot slip through when new test files land.
 TESTS_DIR_FLOORS = {
     "test_ff009_crash_reconciliation.py": 5,
-    "test_ci_suite_discovery.py": 15,
+    "test_ci_suite_discovery.py": 21,
 }
 TESTS_DIR_DEFAULT_FLOOR = 1
 
@@ -156,17 +163,27 @@ def node_verdict(returncode: int, output: str, nfiles: int = 0):
 def run_vitest_suite(root: str, base: Path = ROOT):
     """Run a Vitest-managed suite via its own package runner.
 
-    Installs dependencies (ci when a lockfile exists) then runs `npm test`.
-    Exit 0 plus at least one passed test is required; anything else fails.
+    Installs pinned dependencies with `npm ci` (which itself fails when the
+    lockfile has drifted from package.json) then runs `npm test`. Exit 0
+    plus at least one passed test is required; anything else fails.
+
+    Fail-closed denials, never UNCOVERED: the *.test.ts files are present
+    test code, so an uncovered row would hide them behind green CI.
+    - npm missing on the runner -> FAIL.
+    - no package-lock.json in the suite root -> FAIL rather than an
+      unreviewed floating `npm install` pulling unpinned dependencies.
     """
     npm = shutil.which("npm")
     if npm is None:
-        return "UNCOVERED", "npm not installed on runner"
+        return ("FAIL", "npm not installed on runner; present Vitest test "
+                        "code cannot be executed (fail closed)")
     path = base / root
     lock = path / "package-lock.json"
-    install = [npm, "ci", "--prefix", str(path)] if lock.is_file() else \
-        [npm, "install", "--no-audit", "--no-fund", "--prefix", str(path)]
-    proc = run(install, cwd=ROOT)
+    if not lock.is_file():
+        return ("FAIL", f"no package-lock.json in {root}; refusing unreviewed "
+                        "`npm install` — commit a lockfile so CI installs "
+                        "pinned dependencies (fail closed)")
+    proc = run([npm, "ci", "--prefix", str(path)], cwd=ROOT)
     if proc.returncode != 0:
         return "FAIL", "dependency install failed\n" + tail(proc.stdout + proc.stderr)
     proc = run([npm, "test", "--prefix", str(path)], cwd=ROOT)
@@ -194,8 +211,22 @@ def node_suites(base: Path = ROOT) -> list[tuple[str, str, str]]:
             continue
         files, vitest = split_node_files(root, base)
         if vitest:
-            status, detail = run_vitest_suite(root, base)
-            rows.append((root, status, detail))
+            # Mixed-runner root: the Vitest suite AND any node:test files
+            # (*.test.js/.mjs/.cjs) both execute, each with its own
+            # nonzero-test check. Either side failing fails the row; the
+            # node files are never skipped by an early continue here.
+            v_status, v_detail = run_vitest_suite(root, base)
+            runners = [(f"vitest: {v_detail}", v_status)]
+            if files:
+                proc = run([node, "--test", *files], cwd=base)
+                n_status, n_detail = node_verdict(
+                    proc.returncode, proc.stdout + proc.stderr, len(files))
+                runners.append((f"node: {n_detail}", n_status))
+            else:
+                runners.append(("node: no *.test.{js,mjs,cjs} files", "PASS"))
+            status = ("PASS" if all(s == "PASS" for _, s in runners)
+                      else "FAIL")
+            rows.append((root, status, "; ".join(d for d, _ in runners)))
             continue
         if not files:
             rows.append((root, "PRESENT-EMPTY",
@@ -369,6 +400,51 @@ def prove_fail_closed() -> int:
                       f"(this is why CI enumerates files, never dirs)")
         else:
             print("  note: node unavailable; enumeration canary skipped")
+
+    # Mixed-runner canary: in a Vitest-managed root, a FAILING node:test
+    # file (*.test.mjs) must fail the inventory row even when the Vitest
+    # side passes. Regression guard: node_suites() used to `continue` right
+    # after run_vitest_suite(), silently skipping these node files.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        mixed = base / "mixed"
+        (mixed / "src").mkdir(parents=True)
+        (mixed / "vitest.config.js").write_text("export default {};\n")
+        (mixed / "src" / "a.test.ts").write_text(
+            "import { test } from 'vitest';\ntest('x', () => {});\n")
+        (mixed / "src" / "b.test.mjs").write_text(
+            "import test from 'node:test';\n"
+            "test('canary boom', () => { "
+            "throw new Error('mixed-runner canary failure'); });\n"
+        )
+        node = shutil.which("node")
+        files, vitest = split_node_files("mixed", base)
+        if node is None:
+            print("  note: node unavailable; mixed-runner canary skipped")
+        elif (not vitest
+                or files != [str(mixed / "src" / "b.test.mjs")]):
+            failures.append("mixed-runner split misroutes vitest/node files")
+        else:
+            real_vitest = globals()["run_vitest_suite"]
+            real_roots = globals()["NODE_ROOTS"]
+            globals()["run_vitest_suite"] = (
+                lambda *a, **k: ("PASS", "stubbed vitest pass"))
+            globals()["NODE_ROOTS"] = ["mixed"]
+            try:
+                rows = node_suites(base)
+            finally:
+                globals()["run_vitest_suite"] = real_vitest
+                globals()["NODE_ROOTS"] = real_roots
+            if len(rows) != 1 or rows[0][1] != "FAIL":
+                failures.append(
+                    "mixed-root failing node test did NOT fail inventory "
+                    "(node files skipped?)")
+            elif "canary" not in rows[0][2]:
+                failures.append(
+                    "mixed-root failure detail hides the node side")
+            else:
+                print("  canary ok: mixed-root failing node test "
+                      "fails inventory")
 
     if failures:
         print("Fail-closed proof FAILED:")

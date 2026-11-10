@@ -43,10 +43,26 @@ orca-bridge 27, web 23). Failures print a bounded stderr tail (25 lines).
 per suite root by ownership evidence: a `vitest.config.*` /
 `vitest.workspace.*` file, or a `vitest` entry in that root's
 `package.json` devDependencies, routes the suite's `.test.ts` files to
-`npm install` (or `npm ci` with a lockfile) plus `npm test`. Those files are
-never fed to bare `node --test`. Without such evidence (e.g.
-`services/orca-bridge` today, whose `.test.ts` files import `node:test`),
-`.test.ts` stays on `node --test`. The routing is covered by maintained
+`npm ci` plus `npm test`. Those files are never fed to bare `node --test`.
+Without such evidence (e.g. `services/orca-bridge` today, whose `.test.ts`
+files import `node:test`), `.test.ts` stays on `node --test`.
+
+Mixed roots run BOTH runners: a Vitest-managed root still executes its
+remaining `*.test.js/.mjs/.cjs` files via `node --test`, each runner with
+its own nonzero-test check, and either side failing fails the row. The
+node files are never skipped by an early `continue` after the Vitest run
+(this blind spot would have silently unchecked `apps/web`'s
+`inbox-policy.test.mjs` fixture once the Vite starter lands). A synthetic
+regression case (Vitest root with `a.test.ts` plus a failing `b.test.mjs`)
+must fail the inventory; it is enforced both as a unit test and as a
+`--prove-fail-closed` canary.
+
+Fail-closed dependency rules for the Vitest path: npm missing on the runner
+is a FAIL, never an `UNCOVERED` row hiding present test code behind green
+CI. A Vitest-managed root without a `package-lock.json` is likewise a FAIL
+— CI refuses an unreviewed floating `npm install` and installs only pinned
+dependencies via `npm ci`, which itself fails when the lockfile has drifted
+from `package.json`. The routing and both denials are covered by maintained
 tests in `tests/test_ci_suite_discovery.py`.
 
 ## Zero-test and unwired guards
@@ -77,8 +93,10 @@ exits nonzero if any required baseline path (`docs/`, `SPEC-MANIFEST.json`,
 
 ## Standing in for not-yet-existing suites
 
-- `packages/{policy,messaging,context,telemetry,events}`: no code yet,
+- `packages/{policy,messaging,context,telemetry}`: no code yet,
   listed UNCOVERED by detection, not by hardcoded text.
+  (`packages/events` graduated to `NODE_ROOTS` when FF-006/#37 landed
+  tested envelope code; its `envelope.test.ts` runs via `node --test`.)
 - Web Vite build: active only when `apps/web/package.json` lands; the
   existing `inbox-policy.test.mjs` already runs via inventory.
 - PWA count note: E20 documented 19 tests but the committed prototype suite

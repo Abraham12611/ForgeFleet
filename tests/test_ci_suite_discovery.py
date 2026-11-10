@@ -7,9 +7,11 @@ fed to bare node --test, zero-test runs fail, present-but-unwired dirs fail.
 Run:  python3 tests/test_ci_suite_discovery.py   (from repo root)
 """
 import importlib.util
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 CI_DIR = Path(__file__).resolve().parent.parent / "scripts" / "ci"
 
@@ -33,6 +35,38 @@ NODE_TEST = (
     "const t = require('node:test');\n"
     "t.test('x', () => {});\n"
 )
+
+NODE_TEST_MJS_PASS = (
+    "import test from 'node:test';\n"
+    "test('ok', () => {});\n"
+)
+
+NODE_TEST_MJS_FAIL = (
+    "import test from 'node:test';\n"
+    "test('canary boom', () => { "
+    "throw new Error('mixed-runner canary failure'); });\n"
+)
+
+MIXED_TREE_PASS = {
+    "mixed/vitest.config.js": "export default {};\n",
+    "mixed/src/a.test.ts": "import { test } from 'vitest';\n",
+    "mixed/src/b.test.mjs": NODE_TEST_MJS_PASS,
+}
+
+MIXED_TREE_FAIL = {
+    "mixed/vitest.config.js": "export default {};\n",
+    "mixed/src/a.test.ts": "import { test } from 'vitest';\n",
+    "mixed/src/b.test.mjs": NODE_TEST_MJS_FAIL,
+}
+
+
+def run_mixed_suites(base, vitest_result):
+    """Run node_suites() against a single synthetic 'mixed' root with a
+    stubbed Vitest side; the node side always executes for real."""
+    with mock.patch.object(inventory, "NODE_ROOTS", ["mixed"]), \
+         mock.patch.object(inventory, "run_vitest_suite",
+                           return_value=vitest_result):
+        return inventory.node_suites(base)
 
 
 class TestDeterministicEnumeration(unittest.TestCase):
@@ -139,6 +173,85 @@ class TestVerdicts(unittest.TestCase):
         base = make_tree({"other/f.txt": "x\n"})
         status, _ = inventory.module_row("packages/policy", base)
         self.assertEqual(status, "UNCOVERED")
+
+
+@unittest.skipUnless(shutil.which("node"), "node --test required")
+class TestMixedRunnerRoots(unittest.TestCase):
+    """A Vitest-managed root must run BOTH runners: `npm test` for the
+    Vitest-owned *.test.ts files AND `node --test` for the remaining
+    *.test.js/.mjs/.cjs files. Either side failing fails the row."""
+
+    def test_failing_node_test_fails_despite_vitest_pass(self):
+        base = make_tree(MIXED_TREE_FAIL)
+        rows = run_mixed_suites(base, ("PASS", "stubbed vitest pass"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], "mixed")
+        self.assertEqual(rows[0][1], "FAIL")
+        self.assertIn("vitest:", rows[0][2])
+        self.assertIn("node:", rows[0][2])
+        self.assertIn("canary", rows[0][2])
+
+    def test_failing_vitest_fails_despite_node_pass(self):
+        base = make_tree(MIXED_TREE_PASS)
+        rows = run_mixed_suites(base, ("FAIL", "stubbed vitest failure"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "FAIL")
+
+    def test_both_passing_passes(self):
+        base = make_tree(MIXED_TREE_PASS)
+        rows = run_mixed_suites(base, ("PASS", "stubbed vitest pass"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "PASS")
+        self.assertIn("vitest:", rows[0][2])
+        self.assertIn("node:", rows[0][2])
+
+    def test_vitest_only_root_mirrors_vitest_verdict(self):
+        base = make_tree({
+            "mixed/vitest.config.js": "export default {};\n",
+            "mixed/src/a.test.ts": "import { test } from 'vitest';\n",
+        })
+        rows = run_mixed_suites(base, ("PASS", "stubbed vitest pass"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "PASS")
+
+
+class TestVitestFailClosed(unittest.TestCase):
+    def test_npm_missing_fails_not_uncovered(self):
+        base = make_tree({
+            "web/vitest.config.js": "export default {};\n",
+            "web/src/a.test.ts": "import { test } from 'vitest';\n",
+        })
+        real_which = shutil.which
+        with mock.patch.object(
+                inventory.shutil, "which",
+                side_effect=lambda name: None if name == "npm"
+                else real_which(name)):
+            status, detail = inventory.run_vitest_suite("web", base)
+        self.assertEqual(status, "FAIL")
+        self.assertIn("npm", detail)
+
+    def test_missing_lockfile_refuses_install(self):
+        base = make_tree({
+            "web/vitest.config.js": "export default {};\n",
+            "web/package.json": '{"devDependencies": {"vitest": "^3.0.0"}}',
+            "web/src/a.test.ts": "import { test } from 'vitest';\n",
+        })
+        real_which = shutil.which
+        calls: list = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            raise AssertionError("must not shell out without a lockfile")
+
+        with mock.patch.object(
+                inventory.shutil, "which",
+                side_effect=lambda name: "/fake/npm" if name == "npm"
+                else real_which(name)), \
+             mock.patch.object(inventory, "run", side_effect=fake_run):
+            status, detail = inventory.run_vitest_suite("web", base)
+        self.assertEqual(status, "FAIL")
+        self.assertEqual(calls, [])
+        self.assertIn("package-lock", detail)
 
 
 if __name__ == "__main__":
