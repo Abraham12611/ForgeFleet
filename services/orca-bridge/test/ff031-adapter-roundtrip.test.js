@@ -174,10 +174,13 @@ test("bridge restart preserves the finished attempt; retried first wake replays 
   assert.equal(fake.dispatchCount, 1);
 });
 
-test("unknown session cursor forces a fresh session instead of guessing", async () => {
+test("unknown session cursor quarantines instead of guessing (clearSession retired)", async () => {
   const adapter = makeAdapter();
   const out = await adapter.execute(ctx({ stale: true }));
-  assert.equal(out.clearSession, true);
+  assert.equal(out.clearSession, undefined);
+  assert.equal(out.quarantined, true);
+  assert.equal(out.sessionParams, null);
+  assert.equal(fake.dispatchCount, 0);
 });
 
 test("task binding guard refuses a cursor replayed against another task", async () => {
@@ -186,6 +189,8 @@ test("task binding guard refuses a cursor replayed against another task", async 
   const other = ctx(first.sessionParams);
   other.context = { ...other.context, taskId: "paperclip-task-8" };
   const out = await adapter.execute(other);
-  assert.equal(out.clearSession, true);
+  assert.equal(out.clearSession, undefined);
+  assert.equal(out.bindingMismatch, true);
+  assert.equal(out.sessionParams, first.sessionParams);
   assert.equal(fake.dispatchCount, 1);
 });
