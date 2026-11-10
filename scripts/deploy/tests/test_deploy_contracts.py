@@ -88,23 +88,25 @@ class DeployContracts(unittest.TestCase):
         self.assertTrue(routes)
         for r in routes:
             self.assertNotIn("8787", r)
+            self.assertNotIn("4387", r)
             self.assertNotIn("bridge", r)
 
     @unittest.skipUnless(CADDY, "caddy binary absent (set CADDY_BIN)")
     def test_caddy_validate_real_toolchain(self):
         p = sh(CADDY, "validate", "--config", str(INFRA / "ingress" / "Caddyfile"),
-               "--adapter", "caddyfile", env_extra={"EDGE_BIND": ":80"})
+               "--adapter", "caddyfile")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("Valid configuration", p.stderr + p.stdout)
 
     @unittest.skipUnless(CADDY, "caddy binary absent (set CADDY_BIN)")
     def test_caddy_adapt_no_bridge_upstream(self):
         p = sh(CADDY, "adapt", "--config", str(INFRA / "ingress" / "Caddyfile"),
-               "--adapter", "caddyfile", env_extra={"EDGE_BIND": ":80"})
+               "--adapter", "caddyfile")
         self.assertEqual(p.returncode, 0, p.stderr)
         doc = json.loads(p.stdout)
         blob = json.dumps(doc)
-        self.assertNotRegex(blob, r'"dial": "[^"]*(8787|bridge)')
+        self.assertNotRegex(blob, r'"dial": ?"[^"]*(8787|4387|bridge)')
+        self.assertRegex(blob, r'"dial": ?"paperclip:8080"')
         self.assertIn("/auth/verify", blob)
         self.assertIn("404", blob)
 

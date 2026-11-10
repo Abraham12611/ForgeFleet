@@ -33,11 +33,11 @@ check "compose has NO bridge service"       "! sed 's/#.*//' '$COMPOSE' | grep -
 check "compose ports are loopback-only"     "! grep -E '^[[:space:]]+- +\"' '$COMPOSE' | grep -v '127.0.0.1'"
 check "db publishes NO ports"               "! sed 's/#.*//' '$COMPOSE' | awk '/^  db:/,/^  [a-z]/' | grep -qE '^[[:space:]]+ports:'"
 check "edge is split-profile opt-in"        "grep -A3 'edge:' '$COMPOSE' | grep -q 'profiles:'"
-check "bridge default bind is loopback"     "grep -q 'BRIDGE_BIND=127.0.0.1' '$BRIDGE_ENV'"
-check "guard accepts loopback"              "BRIDGE_BIND=127.0.0.1:8787 '$GUARD' >/dev/null"
-check "guard refuses non-loopback"          "! BRIDGE_BIND=0.0.0.0:8787 '$GUARD' >/dev/null 2>&1"
+check "bridge default bind is loopback"     "grep -q 'FORGEFLEET_BRIDGE_HOST=127.0.0.1' '$BRIDGE_ENV'"
+check "guard accepts loopback"              "FORGEFLEET_BRIDGE_HOST=127.0.0.1 PORT=4387 '$GUARD' >/dev/null"
+check "guard refuses non-loopback"          "! FORGEFLEET_BRIDGE_HOST=0.0.0.0 PORT=4387 '$GUARD' >/dev/null 2>&1"
 check "edge 404s bridge paths"              "grep -q 'handle /v1/' '$CADDY' && grep -q 'handle /bridge/' '$CADDY'"
-check "edge never proxies bridge"           "! grep -E 'reverse_proxy.*(8787|orca-bridge|bridge:)' '$CADDY'"
+check "edge never proxies bridge"           "! grep -E 'reverse_proxy.*(8787|4387|orca-bridge|bridge:)' '$CADDY'"
 check "edge requires auth on /api"          "grep -A4 'handle /api/' '$CADDY' | grep -q forward_auth"
 check "vercel env has only public URL"      "python3 '$FF_ROOT/scripts/deploy/lib/check_vercel_env.py' '$VERCEL'"
 check "vercel exposes only public URL"      "grep -q 'VITE_PUBLIC_API_URL' '$VERCEL'"
@@ -47,11 +47,13 @@ check "no committed token values"           "! grep -rE 'ghp_[A-Za-z0-9]{20,}|xo
 CADDY_BIN="${CADDY_BIN:-$(command -v caddy || true)}"
 if [ -n "$CADDY_BIN" ]; then
   check "caddy validate passes (real toolchain)" \
-    "EDGE_BIND=':80' '$CADDY_BIN' validate --config '$CADDY' --adapter caddyfile >/dev/null 2>&1"
+    "'$CADDY_BIN' validate --config '$CADDY' --adapter caddyfile >/dev/null 2>&1"
   check "adapted config dials no bridge upstream" \
-    "! EDGE_BIND=':80' '$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -E '\"dial\": \"[^\"]*(8787|bridge)'"
+    "! '$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -E '\"dial\": ?\"[^\"]*(8787|4387|bridge)'"
+  check "adapted config dials canonical paperclip" \
+    "'$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -qE '\"dial\": ?\"paperclip:8080\"'"
   check "adapted config keeps 404s + auth verify" \
-    "EDGE_BIND=':80' '$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -qE 'status_code.: ?404' && EDGE_BIND=':80' '$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -q '/auth/verify'"
+    "'$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -qE 'status_code.: ?404' && '$CADDY_BIN' adapt --config '$CADDY' --adapter caddyfile 2>/dev/null | grep -q '/auth/verify'"
   log "ingress validation: REAL caddy ($($CADDY_BIN version 2>/dev/null || echo unknown))"
 else
   warn "caddy binary absent (set CADDY_BIN): static shape checks only — NOT full validation"

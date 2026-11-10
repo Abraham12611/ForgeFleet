@@ -41,8 +41,8 @@ log "rollback plan compatible (no changes made)"
 [ "$APPLY" = 0 ] && { [ "$CHECK" = 1 ] || log "dry-run: pass --apply to execute backend steps"; exit 0; }
 
 confirm_live
-[ "${BRIDGE_NO_NEW_DISPATCH:-0}" = "1" ] \
-  || { warn "set BRIDGE_NO_NEW_DISPATCH=1 before --apply (pause new dispatch first)"; exit 2; }
+[ "${RESTORE_FENCED:-0}" = "1" ] \
+  || { warn "set RESTORE_FENCED=1 before --apply (operator-held dispatch first)"; exit 2; }
 if [ "$COMPONENT" != "frontend" ]; then
   if [ -f "$TARGET" ]; then
     BACKUP_SNAPSHOT="$(dirname "$TARGET")" "$FF_ROOT/scripts/deploy/restore.sh" --apply

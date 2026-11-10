@@ -14,7 +14,7 @@ row is OPEN/FAIL, releases use the private single-origin stack
 | S-05 | Streaming/reconnect (E12) | 15-min SSE/WebSocket session + reconnect with `Last-Event-ID` | no gaps, resume exact | OPEN |
 | S-06 | Uploads (E12) | 25 MB upload + preview/download via Vercel | limits enforced, no secret in browser bundle | OPEN |
 | S-07 | Preview isolation (E17) | preview build with staging env | cannot reach production DB or mutate production | OPEN |
-| S-08 | No open bridge (E17) | `verify-split.sh` (real `caddy validate` + adapt) + canonical guards | bridge loopback-only (user unit + `guard-loopback.sh`), edge 404s `/v1/*`, no `8787` upstream in adapted JSON | PASS (static + real-caddy; no live ingress) |
+| S-08 | No open bridge (E17) | `verify-split.sh` (real `caddy validate` + adapt) + canonical guards | bridge loopback-only (user unit + `guard-loopback.sh`), edge 404s `/v1/*`, no bridge upstream (`8787`/`4387`) in adapted JSON | PASS (static + real-caddy; no live ingress) |
 | S-09 | Restore rehearsal (E17) | `verify-restore.sh` on canonical `backup.sh`/`restore.sh` fixture mode | byte-identical restore, manifest sha256 OK, leases fenced | PASS (fixture) |
 
 `deploy-split.sh --apply` additionally enforces S-01…S-07 mechanically: it
@@ -25,5 +25,6 @@ validation + fixture rehearsal only** — see `verify-split.sh` output
 (`caddy validate`: Valid configuration) and `verify-restore.sh` output.
 Live Vultr/Vercel evidence requires E01 pins and owner-approved preview
 URLs, tracked as follow-up. Issue #60 owns the integrated bridge API; the
-openapi `4387` server URL vs the canonical host bind `8787` is an E05/E06
-follow-up, not resolved here.
+canonical bridge bind is `FORGEFLEET_BRIDGE_HOST:PORT` (default
+`127.0.0.1:4387`, PR #63, landed via #45). Any residual openapi/compose
+port-mapping question is an E05/E06 follow-up, not resolved here.

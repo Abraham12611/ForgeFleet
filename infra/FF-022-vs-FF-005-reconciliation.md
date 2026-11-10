@@ -6,6 +6,20 @@ implementations in PR #45 (FF-005, canonical private scaffold) and PR #51
 This file is that written comparison plus the decision record. PR #51 is
 stacked on PR #45: behavior files it overlaps are merged, not duplicated.
 
+## Rebase note (2026-11-13, onto `develop` @ `a662274`)
+
+PR #45 squash-merged as `a662274` with its review repair included: the
+canonical bind is now `FORGEFLEET_BRIDGE_HOST`/`PORT` (default
+`127.0.0.1:4387`, PR #63), fencing is the `RESTORE_FENCED=1` operator hold,
+and bridge-state snapshot/restore live in `lib/common.sh` helpers
+(`snapshot_bridge_state` / `restore_bridge_state`, operator-owned user state
+dir — never `/var/lib`). This branch was rebased onto `a662274` and its
+scripts adapted to consume those canonical names/helpers; the live-path
+behavior of the canonical scripts is unchanged (FF-022 still only adds
+manifest verification, fixture rehearsal modes, and the opt-in `edge`
+profile). The dimension table below describes the pre-merge #45 base and is
+kept as the decision history.
+
 ## Verdict
 
 **PR #45 is the canonical scaffold.** PR #51 keeps zero parallel
@@ -34,6 +48,43 @@ fixture rehearsal modes, and the opt-in `edge` profile.
 | Frontend | none (private phase) | `vercel/vercel.json` | **Kept** (new, no conflict): preview-safe static config, no secrets |
 | Validation | `selftest.sh` (31 fixture checks) | grep-only `verify-split.sh` | `selftest.sh` untouched and **run inside** the FF-022 suite; `verify-split.sh` now prefers **real `caddy validate` + adapted-JSON assertions** |
 
+## Integration-blocker follow-up (coordinator comment 2026-11-09 12:25 UTC)
+
+The coordinator added a blocker: the FF-005 bridge unit needs a writable
+unprivileged SQLite state path and the actual CLI wrapper, and this branch
+must stay stacked until #45 is repaired/merged. Reconciliation against the
+verifiable sources (read-only; no contract edits — E05/E06 own contracts,
+#60 owns integration):
+
+- **Actual #63 server env API** (`services/orca-bridge/src/main.ts` on the
+  FF-031 branch): `FORGEFLEET_BRIDGE_TOKEN` (required),
+  `FORGEFLEET_BRIDGE_HOST` (default `127.0.0.1`), `PORT` (default `4387`),
+  `FORGEFLEET_BRIDGE_DATA_DIR` (default `./bridge-data`), unauthenticated
+  `GET /v1/health/live`. These names do **not** match #45's
+  `bridge.env.example` (`BRIDGE_BIND`/`BRIDGE_AUTH_SECRET`/`BRIDGE_PORT`) —
+  confirming the coordinator's contract-mismatch finding. The rename belongs
+  to the #45 repair (its author), not to this stacked PR: no #45-owned file
+  is edited here for it. This PR's scripts consume only the canonical
+  `BRIDGE_BIND`/`BRIDGE_STATE_DIR`/`BRIDGE_NO_NEW_DISPATCH` names and will be
+  adapted on rebase after #45's repair lands.
+- **State path**: `backup.sh`/`restore.sh` already tolerate a missing state
+  dir and manifest only present artifacts, so a #45 move to an operator-owned
+  user state dir (systemd `StateDirectory`/XDG) will not break them; the move
+  itself is #45's repair. `backup.service` runs as root and reads whichever
+  path the canonical env names.
+- **Linux wrapper**: verified
+  `/opt/orca/squashfs-root/resources/bin/orca-ide` (v1.4.251, issue #65).
+  No FF-022 file hardcodes an Orca path; `provision-private.sh` wrapper
+  resolution is #45's repair.
+- **This PR's own fix from the same review**: `infra/ingress/Caddyfile`
+  upstreams corrected from the stale `paperclip-api:3000` to the canonical
+  `paperclip:8080` (tracks `PAPERCLIP_PORT` default; E01 owns the pin), and
+  the dubious `{$EDGE_BIND::80}` site address replaced with hardcoded `:80`
+  (loopback-only; public TLS at the host boundary post-approval). Revalidated
+  with real `caddy validate` + `caddy adapt` (`"dial":"paperclip:8080"`,
+  zero bridge upstreams). The `/auth/verify` forward-auth target remains an
+  explicit E07-to-implement assumption — split stays shut until S-01…S-07.
+
 ## What the reviewer asked, and where it is answered
 
 1. *One authoritative path + reconciled supervisor/credential/port/volume/
@@ -53,6 +104,8 @@ fixture rehearsal modes, and the opt-in `edge` profile.
    while split gates are OPEN. The bridge user unit and `orca-serve.service`
    are never managed by any script in this PR.
 6. *Issue #60 owns the integrated bridge API* — untouched: no bridge API,
-   adapter, or contract file is modified here. The openapi `127.0.0.1:4387`
-   server URL (E05-owned) vs the canonical `8787` host bind is recorded as a
-   follow-up for E05/E06, not resolved unilaterally.
+   adapter, or contract file is modified here. The canonical bridge bind is
+   now `FORGEFLEET_BRIDGE_HOST:PORT` (default `127.0.0.1:4387`, PR #63,
+   landed via the #45 merge); any residual openapi/compose port-mapping
+   question is recorded as a follow-up for E05/E06, not resolved
+   unilaterally.

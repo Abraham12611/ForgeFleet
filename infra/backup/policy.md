@@ -6,7 +6,7 @@ split phase; it does not replace them.
 
 - **Cadence:** `systemd/backup.timer` (daily) runs `backup.sh --apply` with
   `BACKUP_DIR=/var/backups/forgefleet`, plus a manual snapshot before every
-  release/rollback (`BRIDGE_NO_NEW_DISPATCH` fencing applies to restores and
+  release/rollback (`RESTORE_FENCED=1` operator hold applies to restores and
   rollbacks, not to snapshot-taking).
 - **Contents:** PostgreSQL logical dump (`pg.dump`), context-store tarball
   (`context.tgz`), native bridge-state tarball when present, and
@@ -17,9 +17,10 @@ split phase; it does not replace them.
   the script. Snapshots contain production data: encrypt at rest, never
   attach to PRs, never copy into agent contexts or screenshots.
 - **Restore rule (unchanged):** `restore.sh --apply` requires
-  `BACKUP_SNAPSHOT=<dir>` **and** `BRIDGE_NO_NEW_DISPATCH=1`. Restored state
-  never resumes leases as runnable: reconcile Orca/GitHub state before
-  re-enabling dispatch (see runbook disaster-recovery section).
+  `BACKUP_SNAPSHOT=<dir>` **and** `RESTORE_FENCED=1`. Restored state
+  never resumes leases as runnable: restart the bridge, verify
+  `/v1/attempts`, and reconcile Orca/GitHub state before re-enabling
+  dispatch (see runbook disaster-recovery section).
 - **Rehearsal:** `verify-restore.sh` exercises the fixture modes
   (`backup.sh --fixture`, `restore.sh --manifest/--target-dir`) into an
   isolated dir and diffs every file. The release gate requires a passing
