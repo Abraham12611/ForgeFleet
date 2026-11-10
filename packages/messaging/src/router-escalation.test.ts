@@ -134,7 +134,7 @@ describe("escalation and owner decisions", () => {
     const coord = as({ type: "agent", id: "coord-1", role: "coordinator", projects: ["p1"] });
     const { escalation, decision } = escalations.raiseEscalation(store, {
       threadId: "task/t1",
-      raisedBy: WORKER_A,
+      caller: as(WORKER_A),
       options: ["retry with backoff", "reassign to worker-b"],
       evidence: ["msg:id-1", "ci-log:run-42"],
       severity: "high",
@@ -151,11 +151,11 @@ describe("escalation and owner decisions", () => {
   it("escalation without options or evidence is rejected", () => {
     const { store, escalations } = setup();
     assert.throws(
-      () => escalations.raiseEscalation(store, { threadId: "task/t1", raisedBy: WORKER_A, options: [], evidence: ["e"] }),
+      () => escalations.raiseEscalation(store, { threadId: "task/t1", caller: as(WORKER_A), options: [], evidence: ["e"] }),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 400,
     );
     assert.throws(
-      () => escalations.raiseEscalation(store, { threadId: "task/t1", raisedBy: WORKER_A, options: ["o"], evidence: [] }),
+      () => escalations.raiseEscalation(store, { threadId: "task/t1", caller: as(WORKER_A), options: ["o"], evidence: [] }),
       (e: unknown) => e instanceof MessageError && e.httpStatus === 400,
     );
   });
@@ -164,7 +164,7 @@ describe("escalation and owner decisions", () => {
     const { store, escalations } = setup();
     const { escalation, decision } = escalations.raiseEscalation(store, {
       threadId: "task/t1",
-      raisedBy: WORKER_A,
+      caller: as(WORKER_A),
       options: ["approve deploy", "hold until morning"],
       evidence: ["msg:id-1"],
       ownerOnly: true,
@@ -182,7 +182,7 @@ describe("escalation and owner decisions", () => {
   it("agents cannot answer decisions; service tokens cannot answer either", () => {
     const { store, escalations } = setup();
     const { decision } = escalations.raiseEscalation(store, {
-      threadId: "task/t1", raisedBy: WORKER_A,
+      threadId: "task/t1", caller: as(WORKER_A),
       options: ["yes", "no"], evidence: ["e"], ownerOnly: true,
     });
     assert.ok(decision);
@@ -200,7 +200,7 @@ describe("escalation and owner decisions", () => {
   it("expiry grants nothing; answering an expired decision fails", () => {
     const ctx = setup();
     const { decision } = ctx.escalations.raiseEscalation(ctx.store, {
-      threadId: "task/t1", raisedBy: WORKER_A,
+      threadId: "task/t1", caller: as(WORKER_A),
       options: ["yes", "no"], evidence: ["e"], ownerOnly: true,
       decisionTtlMs: 60_000,
     });

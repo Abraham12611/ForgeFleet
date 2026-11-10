@@ -57,7 +57,7 @@ describe("restart survival", () => {
     });
     assert.equal(posted.outcome, "stored");
     const { escalation, decision } = first.svc.escalationStore.raiseEscalation(first.svc.store, {
-      threadId: "task/t1", raisedBy: WORKER_A,
+      threadId: "task/t1", caller: as(WORKER_A),
       options: ["approve deploy", "hold"], evidence: ["msg:id-1"], ownerOnly: true,
     });
     assert.ok(decision);

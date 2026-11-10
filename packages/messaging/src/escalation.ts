@@ -153,7 +153,7 @@ export class EscalationStore {
     threads: ThreadStore,
     input: {
       threadId: string;
-      raisedBy: Actor;
+      caller: AuthenticatedCaller;
       options: string[];
       evidence: string[];
       severity?: Escalation["severity"];
@@ -171,12 +171,15 @@ export class EscalationStore {
       throw new MessageError("VALIDATION", 400, "escalation requires evidence pointers");
     }
     const createdAt = this.now();
+    // raisedBy is derived from the authenticated caller, never from
+    // message payload: a caller-raised escalation carries caller authority.
+    const raisedBy: Actor = { ...input.caller.identity };
     const escalation: Escalation = {
       escalationId: this.generateId(),
       threadId: thread.threadId,
       projectId: thread.projectId,
       taskId: thread.taskId,
-      raisedBy: { ...input.raisedBy },
+      raisedBy,
       options: [...input.options],
       evidence: [...input.evidence],
       severity: input.severity ?? "normal",
@@ -219,7 +222,7 @@ export class EscalationStore {
           question: `Escalation ${escalation.escalationId} needs an owner decision`,
           options: escalation.options,
           risk: input.risk ?? "Owner-only call; no safe default applied.",
-          requestedBy: input.raisedBy.id,
+          requestedBy: raisedBy.id,
           ttlMs: input.decisionTtlMs,
           createdAt,
         });

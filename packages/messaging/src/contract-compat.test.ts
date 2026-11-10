@@ -75,7 +75,7 @@ describe("frozen-contract outbox envelopes (bridge v0.1)", () => {
       deadlineAt: "2026-11-08T16:00:00.000Z", idempotencyKey: "key-env-11",
     });
     const { decision } = svc.escalationStore.raiseEscalation(svc.store, {
-      threadId: "task/t1", raisedBy: WORKER_A,
+      threadId: "task/t1", caller: as(WORKER_A),
       options: ["yes", "no"], evidence: ["e"], ownerOnly: true,
     });
     assert.ok(decision);
