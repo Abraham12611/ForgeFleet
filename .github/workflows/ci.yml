@@ -70,6 +70,12 @@ jobs:
           python-version: "3.12"
       - name: Runner tool versions
         run: node --version && python3 --version
+      # FF-018 merge gate (PR #58, coordinator direction): its tsc typecheck
+      # must be mandatory in CI alongside node --test (covered via NODE_ROOTS
+      # discovery below). Pinned install only (npm ci + committed lockfile).
+      - name: Merge-gate typecheck (integrations/github)
+        run: |
+          cd integrations/github && npm ci && npm run typecheck
       - name: Node node:test suites (present dirs only; absent dirs recorded uncovered)
         run: python3 scripts/ci/inventory.py --report ci-report.md
       - name: Web Vite suite (only when apps/web exists)

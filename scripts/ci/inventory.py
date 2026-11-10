@@ -47,6 +47,10 @@ NODE_ROOTS = [
     "packages/events",
     "services/orca-bridge",
     "apps/web",
+    # E16/FF-018 merge gate (PR #58, coordinator direction): its node:test
+    # suite must be mandatory in CI; the gate cannot protect itself if its
+    # tests are optional. Coordinate root-list changes with E18 (#67).
+    "integrations/github",
 ]
 NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
 
