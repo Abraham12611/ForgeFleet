@@ -4,15 +4,16 @@
 coordinator review on #63. This branch contains **integration-owned files
 only** (bridge HTTP server, fake backend, extras DB, finalization and
 cross-process tests, docs, additive CI job). It consumes the canonical
-E04/E06/E03/E04 modules by path and stays red until the coordinator's
-merge sequence lands in order: #33 (policy), #37 (SQLite WAL attempts),
-#35 (dispatch v2), #34 (journaled adapter). Contract version is locked at
+E06/E03/E04 modules by path. #37 (SQLite WAL attempts) and #35
+(dispatch v2) are merged into `develop`; the branch stays red until the
+coordinator's remaining sequence lands: #33 (policy), #34 (journaled
+adapter). Contract version is locked at
 **0.1.0** (`packages/bridge-contracts/CONTRACT-VERSION`); no schema change
 is made or needed by this assembly.
 
 ## 1. Assembled seams (this branch: new files only)
 
-| File(s) | Owner | Depends on (canonical, unmerged) |
+| File(s) | Owner | Depends on (canonical; #37/#35 merged, #33/#34 pending) |
 |---|---|---|
 | `services/orca-bridge/src/server.ts` — authenticated HTTP server | E01 integration | #37 `AttemptStore` (SQLite), #33 `authorize`, #35 argv/status/cancel, E02 discovery (merged) |
 | `services/orca-bridge/src/main.ts` — env daemon entry (real spawn; fake + test hooks only via explicit env) | E01 integration | server |

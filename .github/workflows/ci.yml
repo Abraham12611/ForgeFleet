@@ -126,9 +126,9 @@ jobs:
         run: bash scripts/deploy/selftest.sh
 
   # FF-031 additive gate: assembled bridge round trip on the fake backend.
-  # Integration-owned paths only; requires the canonical #33/#37/#35/#34
-  # modules on the branch under test, so this job stays red until the
-  # coordinator's merge sequence lands. All I/O is loopback + tmp dirs.
+  # Integration-owned paths only; #37/#35 are merged into develop, so this
+  # job stays red only on the pending canonical #33 (policy) / #34 (adapter)
+  # modules. All I/O is loopback + tmp dirs.
   bridge-integration:
     name: bridge round trip (FF-031, fake backend)
     runs-on: ubuntu-latest
