@@ -17,7 +17,10 @@ Anti-false-green rules enforced here:
   fails the gate (fail closed once milestone code lands).
 - Python suites assert exit 0, an `OK` verdict line, AND a minimum test count,
   so a silently-empty collection cannot pass.
-- Suite roots that do not exist yet are UNCOVERED, never passing.
+- Suite roots that do not exist yet are UNCOVERED, never passing, except
+  roots in MANDATORY_NODE_ROOTS (security packages): absent fails the gate.
+- A mandatory-suite canary proves present passes while zero-file and
+  removed states fail, so green always means the tests executed.
 - The report's scope/gap text is generated from detected state; no hardcoded
   claims about which code exists.
 
@@ -52,6 +55,9 @@ NODE_ROOTS = [
     "packages/coordinator",
     "packages/scheduler",
     "packages/events",
+    # FF-004 (PR #33): security package; CI must execute its tests, never
+    # report green without them. Coordinate root-list changes with E18 (#67).
+    "packages/policy",
     "packages/messaging",
     # E11/FF-011 context ingestion (PR #36, coordinator direction): its
     # node:test suite must be mandatory in CI; present-but-unwired must
@@ -73,8 +79,18 @@ NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
 # escalation code; E10 owns the entry, E15/coordinator ack requested.
 # packages/context graduated here when FF-011 landed tested ingestion and
 # manifest code; E11 owns the entry, E18/coordinator ack requested.
-FUTURE_MODULES = [
+# packages/policy graduates here now that FF-004 lands tested policy code;
+# E18/#67 ack requested on this entry (PR #33).
+
+# Suite roots that must be present with tests: absent fails the gate
+# (non-mandatory absent roots stay UNCOVERED). packages/policy is a
+# security package: CI must execute its tests, never report green
+# without them.
+MANDATORY_NODE_ROOTS = [
     "packages/policy",
+]
+
+FUTURE_MODULES = [
     "packages/telemetry",
 ]
 
@@ -215,7 +231,11 @@ def node_suites(base: Path = ROOT) -> list[tuple[str, str, str]]:
     for root in NODE_ROOTS:
         path = base / root
         if not path.is_dir():
-            rows.append((root, "ABSENT", "not on this branch; uncovered"))
+            if root in MANDATORY_NODE_ROOTS:
+                rows.append((root, "FAIL",
+                             "mandatory suite missing from tree; fail closed"))
+            else:
+                rows.append((root, "ABSENT", "not on this branch; uncovered"))
             continue
         if node is None:
             rows.append((root, "UNCOVERED", "Node.js not installed on runner"))
@@ -456,6 +476,41 @@ def prove_fail_closed() -> int:
             else:
                 print("  canary ok: mixed-root failing node test "
                       "fails inventory")
+
+    # Mandatory-suite canary (FF-004, PR #33): packages/policy is a security
+    # package, so CI must execute its tests. Present must PASS; zero test
+    # files or a removed suite must fail the gate, never report green.
+    if shutil.which("node") is not None:
+        with tempfile.TemporaryDirectory() as tmp:
+            anchor = Path(tmp)
+            shutil.copytree(ROOT / "packages/policy",
+                            anchor / "packages" / "policy")
+            present = {r: s for r, s, _ in node_suites(anchor)}
+            if present.get("packages/policy") != "PASS":
+                failures.append(
+                    "mandatory packages/policy suite did not PASS when present")
+            else:
+                print("  canary ok: mandatory packages/policy suite "
+                      "executes and passes")
+            for victim in discover_node_files("packages/policy", anchor):
+                Path(victim).unlink()
+            zero = {r: s for r, s, _ in node_suites(anchor)}
+            if zero.get("packages/policy") not in ("FAIL", "PRESENT-EMPTY"):
+                failures.append(
+                    "mandatory packages/policy suite stayed green with "
+                    "zero test files")
+            else:
+                print("  canary ok: mandatory suite with zero test files "
+                      "fails the gate")
+            shutil.rmtree(anchor / "packages" / "policy")
+            gone = {r: s for r, s, _ in node_suites(anchor)}
+            if gone.get("packages/policy") != "FAIL":
+                failures.append(
+                    "mandatory packages/policy suite stayed green when removed")
+            else:
+                print("  canary ok: removed mandatory suite fails the gate")
+    else:
+        print("  note: node unavailable; mandatory-suite canary skipped")
 
     if failures:
         print("Fail-closed proof FAILED:")

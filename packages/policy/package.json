@@ -1,0 +1,12 @@
+{
+  "name": "@forgefleet/policy",
+  "version": "0.1.0",
+  "description": "Deterministic least-privilege authorization for ForgeFleet (FF-004). Pure logic, zero dependencies.",
+  "type": "module",
+  "main": "src/policy.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
