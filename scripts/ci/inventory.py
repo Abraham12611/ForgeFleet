@@ -53,6 +53,10 @@ NODE_ROOTS = [
     "packages/scheduler",
     "packages/events",
     "packages/messaging",
+    # E11/FF-011 context ingestion (PR #36, coordinator direction): its
+    # node:test suite must be mandatory in CI; present-but-unwired must
+    # never read as green. Coordinate root-list changes with E18 (#67).
+    "packages/context",
     "services/orca-bridge",
     "apps/web",
     # E16/FF-018 merge gate (PR #58, coordinator direction): its node:test
@@ -67,9 +71,10 @@ NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
 # E18/coordinator ack requested on this entry (PR #37).
 # packages/messaging graduated here when FF-014 landed tested thread and
 # escalation code; E10 owns the entry, E15/coordinator ack requested.
+# packages/context graduated here when FF-011 landed tested ingestion and
+# manifest code; E11 owns the entry, E18/coordinator ack requested.
 FUTURE_MODULES = [
     "packages/policy",
-    "packages/context",
     "packages/telemetry",
 ]
 

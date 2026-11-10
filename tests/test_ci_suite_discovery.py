@@ -215,6 +215,18 @@ class TestMixedRunnerRoots(unittest.TestCase):
         self.assertEqual(rows[0][1], "PASS")
 
 
+class TestContextWired(unittest.TestCase):
+    """FF-011 must stay wired: packages/context ships tested code, so it
+    belongs in NODE_ROOTS (executed) and not in FUTURE_MODULES (unwired).
+    Either side drifting reintroduces present-but-unwired green CI."""
+
+    def test_context_in_node_roots(self):
+        self.assertIn("packages/context", inventory.NODE_ROOTS)
+
+    def test_context_not_in_future_modules(self):
+        self.assertNotIn("packages/context", inventory.FUTURE_MODULES)
+
+
 class TestVitestFailClosed(unittest.TestCase):
     def test_npm_missing_fails_not_uncovered(self):
         base = make_tree({

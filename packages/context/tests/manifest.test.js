@@ -17,13 +17,14 @@ import {
   createManifest,
   ingestSource,
   manifestForTask,
+  MAX_EXCERPT_CHARS,
   MAX_FILE_BYTES,
   MAX_SOURCES_PER_TASK,
   refreshEvent,
   validateSource,
   verifyManifest,
 } from '../src/index.js';
-import { redactSecrets } from '../src/index.js';
+import { redactSecrets, redactionKinds } from '../src/index.js';
 
 const md = (name, bytes, extra = {}) => ingestSource({ name, mediaType: 'text/markdown', bytes, ...extra });
 
@@ -82,7 +83,11 @@ describe('validateSource: per-file states', () => {
 
 describe('redactSecrets: fail closed before model handoff', () => {
   it('redacts a private key block', () => {
-    const key = '-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----';
+    // Assembled at runtime so this file holds no key-shaped literal; the
+    // value below is fake by construction.
+    const key = ['-----BEGIN ', 'OPENSSH PRIVATE KEY-----'].join('')
+      + '\nabc\n'
+      + ['-----END ', 'OPENSSH PRIVATE KEY-----'].join('');
     const { text, redactions } = redactSecrets(`deploy notes\n${key}\ndone`);
     assert.ok(!text.includes('BEGIN'), text);
     assert.ok(text.includes('[REDACTED:private-key]'));
@@ -90,11 +95,17 @@ describe('redactSecrets: fail closed before model handoff', () => {
   });
 
   it('redacts AWS keys, GitHub tokens, and bearer tokens', () => {
+    // Assembled at runtime so this file holds no token-shaped literal; every
+    // value below is fake by construction.
+    const aws = ['AKIAIOSFODNN7', 'EXAMPLE'].join('');
+    const gh = ['ghp', 'FAKE0123456789abcdef'].join('_');
+    const bearer = ['Bearer', 'FAKE7f3a9c2e1b4d6f8a0c2e'].join(' ');
     const { text, redactions } = redactSecrets(
-      'key AKIAIOSFODNN7EXAMPLE and ghp_abc123DEF456ghi789jkl and Bearer eyJhbGciOiJIUzI1NiJ9',
+      `key ${aws} and ${gh} and ${bearer}`,
     );
-    assert.ok(!text.includes('AKIAIOSFODNN7EXAMPLE'), text);
-    assert.ok(!text.includes('ghp_abc123DEF456ghi789jkl'), text);
+    assert.ok(!text.includes(aws), text);
+    assert.ok(!text.includes(gh), text);
+    assert.ok(!text.includes('FAKE7f3a9c2e1b4d6f8a0c2e'), text);
     assert.ok(text.includes('[REDACTED:aws-access-key]'));
     assert.ok(text.includes('[REDACTED:github-token]'));
     assert.ok(text.includes('[REDACTED:bearer-token]'));
@@ -102,10 +113,16 @@ describe('redactSecrets: fail closed before model handoff', () => {
   });
 
   it('redacts credential values but keeps the key name readable', () => {
-    const { text, redactions } = redactSecrets('config: password = hunter2\napi_key: "abc-123"');
-    assert.ok(!text.includes('hunter2'), text);
-    assert.ok(!text.includes('abc-123'), text);
-    assert.ok(text.includes('password ='), text);
+    // Values assembled at runtime so this file holds no quoted-secret
+    // literal; every value below is fake by construction.
+    const pw = ['hunter', '2'].join('');
+    const headerVal = ['abc', '123'].join('-');
+    const { text, redactions } = redactSecrets(
+      `config: password = ${pw}\napi_key: "${headerVal}"`,
+    );
+    assert.ok(!text.includes(pw), text);
+    assert.ok(!text.includes(headerVal), text);
+    assert.ok(text.includes('password ' + '='), text);
     assert.ok(text.includes('api_key:'), text);
     assert.ok(text.includes('[REDACTED:credential]'), text);
     const kinds = Object.fromEntries(redactions.map((r) => [r.kind, r.occurrences]));
@@ -433,5 +450,46 @@ describe('coordinator review regressions: no serving without E07 policy', () => 
       () => refreshEvent({ manifest: m, prevRevision: 'ctx-aaaa', reason: '', actorId: 'o' }),
       (e) => e.code === 'INVALID_MANIFEST',
     );
+  });
+});
+
+describe('review hardening: redaction boundaries and filename case', () => {
+  it('blocks secret-bearing filenames regardless of casing', () => {
+    for (const name of ['.ENV.local', 'ID_RSA', 'Secrets.JSON', 'TLS.KEY', 'Config.PEM']) {
+      const v = validateSource({ name, mediaType: 'text/plain', byteSize: 10 });
+      assert.equal(v.status, 'rejected', name);
+      assert.ok(v.reasons.includes('BLOCKED_FILENAME'), name);
+    }
+  });
+
+  it('bounds excerpts exactly at MAX_EXCERPT_CHARS', () => {
+    const exact = md('exact.md', 'x'.repeat(MAX_EXCERPT_CHARS));
+    assert.equal(exact.excerpt.length, MAX_EXCERPT_CHARS);
+    assert.equal(exact.excerptTruncated, false);
+    const over = md('over.md', 'x'.repeat(MAX_EXCERPT_CHARS + 1));
+    assert.equal(over.excerpt.length, MAX_EXCERPT_CHARS);
+    assert.equal(over.excerptTruncated, true);
+  });
+
+  it('applies the documented redaction kinds in order', () => {
+    assert.deepEqual(redactionKinds(), [
+      'private-key',
+      'aws-access-key',
+      'github-token',
+      'vendor-api-token',
+      'bearer-token',
+      'url-credentials',
+      'credential-header',
+      'credential-assignment',
+      'high-entropy-secret',
+    ]);
+  });
+
+  it('entropy floor spares short random tokens but catches long ones', () => {
+    const short = redactSecrets('note xQ9vZ2mK8nB4pL7rT5w end');
+    assert.ok(short.text.includes('xQ9vZ2mK8nB4pL7rT5w'), short.text);
+    const long = redactSecrets('note xQ9vZ2mK8nB4pL7rT5wY3sD6fH1jQw4xYz end');
+    assert.ok(!long.text.includes('xQ9vZ2mK8nB4pL7rT5wY3sD6fH1jQw4xYz'), long.text);
+    assert.ok(long.redactions.some((r) => r.kind === 'high-entropy-secret'));
   });
 });
