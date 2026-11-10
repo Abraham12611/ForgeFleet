@@ -57,29 +57,42 @@ describe('pinned Paperclip plugin surface', () => {
     assert.ok(res.sessionDisplayId.includes('orca-session'));
   });
 
-  it('stale and undecodable sessions answer clearSession:true', async () => {
+  it('stale and undecodable sessions quarantine, never clearSession', async () => {
+    // A live worker exists for this task: clearing would duplicate it.
+    const { ctx } = makeCtx({ cwd });
+    const first = await adapter.execute(ctx);
+    fake.advanceAttempt(first.sessionParams.attemptId, 'running');
+
     const { ctx: staleCtx } = makeCtx({
       cwd,
       sessionId: 'x',
       sessionParams: { version: 2, stale: true },
     });
-    // stale marker bypasses the codec version gate by design
     const stale = await adapter.execute(staleCtx);
-    assert.equal(stale.clearSession, true);
+    assert.ok(!('clearSession' in stale), 'stale must quarantine, not clear');
+    assert.equal(stale.quarantined, true);
 
     const { ctx: garbageCtx } = makeCtx({ cwd, sessionId: 'x', sessionParams: { nope: 1 } });
     const garbage = await adapter.execute(garbageCtx);
-    assert.equal(garbage.clearSession, true);
+    assert.ok(!('clearSession' in garbage), 'garbage must quarantine, not clear');
+    assert.equal(garbage.quarantined, true);
+    assert.equal(fake.dispatchCount, 1, 'no duplicate dispatch from session loss');
   });
 
-  it('cross-task and cross-run replay answers clearSession:true', async () => {
+  it('cross-task and cross-run replay echoes the cursor, never clears', async () => {
     const { ctx } = makeCtx({ cwd });
     const first = await adapter.execute(ctx);
     const sp = first.sessionParams;
     const { ctx: other } = makeCtx({ cwd, taskId: 'OTHER', sessionId: sp.sessionId, sessionParams: sp });
-    assert.equal((await adapter.execute(other)).clearSession, true);
+    const otherRes = await adapter.execute(other);
+    assert.ok(!('clearSession' in otherRes), 'foreign cursor must be preserved, not cleared');
+    assert.equal(otherRes.bindingMismatch, true);
+    assert.deepEqual(otherRes.sessionParams, sp);
     const { ctx: otherRun } = makeCtx({ cwd, runId: 'run-2', sessionId: sp.sessionId, sessionParams: sp });
-    assert.equal((await adapter.execute(otherRun)).clearSession, true);
+    const runRes = await adapter.execute(otherRun);
+    assert.ok(!('clearSession' in runRes));
+    assert.equal(runRes.bindingMismatch, true);
+    assert.equal(fake.dispatchCount, 1);
   });
 
   it('testEnvironment is read-only and reports structured diagnostics', async () => {

@@ -125,6 +125,25 @@ export function createFakeBridge({ providers = null, requireToken = '' } = {}) {
       }
       const path = String(url).replace(/^https?:\/\/[^/]+/, '');
 
+      if (method === 'GET' && path.split('?')[0] === '/v1/runtime/sessions') {
+        const query = new URLSearchParams(path.includes('?') ? path.slice(path.indexOf('?') + 1) : '');
+        const onlyProject = query.get('projectId');
+        const toSessionState = (s) =>
+          ({ accepted: 'waiting', dispatching: 'waiting', running: 'running', waiting: 'waiting', unknown: 'unknown', finished: 'stopped', failed: 'failed', cancelled: 'stopped' })[s] ?? 'unknown';
+        const sessions = [...attempts.values()]
+          .filter((r) => !onlyProject || r.projectId === onlyProject)
+          .map((r) => ({
+            externalId: r.orcaDispatchId,
+            provider: 'muse',
+            state: toSessionState(r.state),
+            managed: true,
+            taskId: r.paperclipTaskId,
+            worktreeId: r.worktreeId,
+            lastObservedAt: r.observedAt,
+          }));
+        return jsonResponse(200, { sessions });
+      }
+
       if (method === 'GET' && path === '/v1/runtime/capabilities') {
         return jsonResponse(200, {
           reachable: true,

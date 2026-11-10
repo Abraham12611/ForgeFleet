@@ -14,6 +14,13 @@
 // free-form status field. exitCode null = still running (wake again);
 // 0 = worker output submitted for review; 1 = terminal failure.
 //
+// clearSession is RETIRED on this adapter: emitting it for a stale,
+// corrupt, or mismatched cursor would let the next wake dispatch a second
+// worker beside a possibly-live original. Ambiguous sessions quarantine
+// (durable journal record + inventory reconcile) instead; binding mismatches
+// echo the foreign cursor back verbatim. The result shape still carries the
+// pinned clearSession field for compatibility, but execute() never sets it.
+//
 // Round-trip per wake (execute never blocks on worker completion):
 //   first wake  -> capability gate -> journal intent -> stage cwd ->
 //                  POST /v1/attempts (identical re-POST reconciles a crash)
@@ -349,6 +356,63 @@ export function createServerAdapter(options = {}) {
     };
   }
 
+  // Session-loss reconcile (coordinator re-review: clearSession on an
+  // ambiguous active session permits a duplicate launch, so it is never
+  // emitted). When the incoming cursor exists but is unusable (Paperclip
+  // marked it stale, or it fails validation), reconcile against the
+  // read-only bridge inventory for THIS task and quarantine durably:
+  // a possibly-live worker means holding with its IDs recorded; anything
+  // else means holding with fate explicitly unproven. No dispatch, no
+  // clearSession, no cursor minted — resumption belongs to the provider
+  // adopt path (GET-verified) or a new owner-authorized run.
+  async function handleSessionLoss(t, kind, key) {
+    let sessions = null;
+    let inventoryError = null;
+    try {
+      sessions = await bridge.listSessions(t.projectId);
+    } catch (err) {
+      inventoryError = err?.message ?? String(err);
+    }
+    const matches = (sessions ?? []).filter((s) => s && s.taskId === t.taskId);
+    const live = matches.filter((s) => s.state === 'running' || s.state === 'waiting' || s.state === 'unknown');
+    const discovered = matches.map((s) => s.externalId ?? s.worktreeId ?? '?');
+    const base = {
+      fencingEpoch: t.lease.fencingEpoch,
+      attemptId: null,
+      discovered,
+      createdAt: new Date().toISOString(),
+    };
+    if (inventoryError !== null) {
+      journal.writeQuarantine(key, {
+        ...base,
+        reason: 'session-lost-reconcile-failed',
+        detail: `session ${kind}; inventory unreachable (${inventoryError}); fate unknown`,
+      });
+      await log(t, `session ${kind}: inventory unreachable; quarantined without dispatch or clear`);
+      return holdWithoutSession(t, journal.readQuarantine(key));
+    }
+    if (live.length > 0) {
+      journal.writeQuarantine(key, {
+        ...base,
+        reason: 'session-lost-live-worker',
+        detail: `session ${kind}; ${live.length} possibly-live worker(s) for this task — duplicate launch forbidden`,
+      });
+      await log(
+        t,
+        `session ${kind}: worker may still run (${discovered.join(', ')}); ` +
+          `quarantined without dispatch or clear; status observable via bridge inventory`,
+      );
+      return holdWithoutSession(t, journal.readQuarantine(key));
+    }
+    journal.writeQuarantine(key, {
+      ...base,
+      reason: 'session-lost-fate-unknown',
+      detail: `session ${kind}; no live worker found but absence unproven — holding`,
+    });
+    await log(t, `session ${kind}: no live worker found; fate unproven so quarantined, not cleared`);
+    return holdWithoutSession(t, journal.readQuarantine(key));
+  }
+
   // Synthesize a session cursor from a quarantine record so the provider
   // path can resolve a session-less wake against durable state.
   function recordSessionFromQuarantine(t, qrec) {
@@ -502,12 +566,33 @@ export function createServerAdapter(options = {}) {
       const incoming = ctx.runtime?.sessionParams ?? null;
       const key = journalKeyFor(t.projectId, t.taskId, t.runId);
 
-      // Unknown/stale session: force a fresh session on next wake.
+      // Paperclip-marked stale session: the cursor is dead but the worker
+      // may be alive. Reconcile + quarantine — never clearSession (the next
+      // wake would dispatch a duplicate beside the original).
       if (incoming && incoming.stale === true) {
-        return { exitCode: null, signal: null, timedOut: false, sessionParams: null, clearSession: true };
+        return handleSessionLoss(t, 'stale', key);
       }
       if (incoming === null || incoming === undefined) {
         const qrec = journal.readQuarantine(key);
+        if (qrec && String(qrec.reason).startsWith('session-lost')) {
+          // Refresh the read-only reconcile on every wake: the worker's
+          // fate may have changed since the record was written (including
+          // across process restarts). Still never clears or dispatches.
+          const refreshed = await handleSessionLoss(t, 'recheck', key);
+          if (recoveryProvider) {
+            try {
+              return await resolveRecovery(
+                t,
+                recordSessionFromQuarantine(t, journal.readQuarantine(key)),
+                journal.readQuarantine(key),
+                key,
+              );
+            } catch (err) {
+              return toOperationalError(t, err, null);
+            }
+          }
+          return refreshed;
+        }
         if (qrec && qrec.reason !== 'intent-changed') {
           // A live ambiguity (unknown attempt, corrupt journal) blocks ALL
           // fresh wakes. resolveRecovery consults ONLY the out-of-band
@@ -603,16 +688,34 @@ export function createServerAdapter(options = {}) {
       }
       const session = sessionCodec.deserialize(incoming);
       if (!session) {
-        return { exitCode: null, signal: null, timedOut: false, sessionParams: null, clearSession: true };
+        // Undecodable cursor: same treatment as stale — reconcile the
+        // presented task via inventory and quarantine. Never clear.
+        return handleSessionLoss(t, 'undecodable', key);
       }
       // Task binding guard: a session cursor must not be replayed against a
       // different task or Paperclip run (cross-task mutation is forbidden).
+      // The foreign cursor is echoed back VERBATIM — preserved for its
+      // rightful owner, never cleared, never acted on. Nothing is written
+      // to any journal: our own task state is not ambiguous, so there is
+      // nothing to quarantine on our side.
       if (
         session.taskId !== t.taskId ||
         session.projectId !== t.projectId ||
         session.paperclipRunId !== t.runId
       ) {
-        return { exitCode: null, signal: null, timedOut: false, sessionParams: null, clearSession: true };
+        await log(
+          t,
+          `binding mismatch: cursor belongs to ${session.projectId}/${session.taskId}/` +
+            `${session.paperclipRunId}; refusing without mutation or clear`,
+        );
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          sessionParams: incoming,
+          bindingMismatch: true,
+          provider: 'muse',
+        };
       }
       if (session.quarantined) {
         // Only the out-of-band provider path may proceed; task input — any

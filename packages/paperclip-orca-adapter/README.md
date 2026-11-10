@@ -73,7 +73,16 @@ heartbeat.
    stay gated; pre-existing local files are never deleted. `finished` maps to
    `submitted` with `exitCode: 0`: runtime completion is review input, not
    verification.
-5. **Ambiguous fate** (bridge 404 on reconcile, corrupt journal, changed
+5. **Session loss never duplicates.** `clearSession` is retired and never
+   emitted: a stale, undecodable, or mismatched cursor cannot trigger a fresh
+   dispatch. Stale/corrupt cursors reconcile via the read-only
+   `GET /v1/runtime/sessions` inventory for the presented task — a
+   possibly-live worker means durable quarantine with its IDs recorded,
+   anything else means quarantine with fate explicitly unproven — refreshed
+   on every wake, surviving restarts. Binding mismatches echo the foreign
+   cursor back verbatim with zero state change (no journal writes, foreign
+   attempt untouched).
+6. **Ambiguous fate** (bridge 404 on reconcile, corrupt journal, changed
    input after a crash): the key is QUARANTINED (`status: unknown`,
    `exitCode: null`), never silently cleared — a fresh session could
    duplicate a still-live worker. NOTHING in the Paperclip task context can
@@ -114,14 +123,15 @@ Engine: `node >= 24.11.0`. Zero runtime dependencies (stdlib only).
 
 ## Evidence status (fixture vs live)
 
-- **Fixture (this PR):** 44 `node:test` assertions pass against the
+- **Fixture (this PR):** 56 `node:test` assertions pass against the
   in-process fake bridge — pinned-shape conformance, round trip, crash-after-
   accept reconcile (one dispatch, staging intact), 409 conflict, dedupe/
-  fencing, quarantine + verified recovery decisions (malicious-string hold,
-  old-worker-running refusal, stale-epoch/proof/token holds, verified
-  relaunch + adopt, intent-change and tamper refusal), finalize gate with cwd
-  intact, fail-closed capability, cancel/message auth, E05 schema validation,
-  and the no-push static check.
+  fencing, terminal quarantine by default (all forgery shapes hold), provider
+  seam still gated on bridge-verified fate with 404 never relaunching,
+  session-loss reconcile with restart-durable quarantine and verbatim cursor
+  echo on mismatch (clearSession retired), intent-change and tamper refusal,
+  finalize gate with cwd intact, fail-closed capability, cancel/message auth,
+  E05 schema validation, and the no-push static check.
 - **Live (explicitly NOT claimed):** no Vultr host, Orca service, or
   Paperclip instance was touched. Live spikes S-04 (resume against real
   Paperclip) and S-05 (Orca worktree sync-back on a disposable repo) remain

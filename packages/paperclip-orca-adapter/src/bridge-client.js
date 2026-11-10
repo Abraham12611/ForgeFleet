@@ -102,8 +102,22 @@ export function createBridgeClient({ baseUrl = DEFAULT_BRIDGE_URL, token = '', f
       await throwForStatus(res, 'createAttempt');
     },
 
+    // GET /v1/runtime/sessions?projectId=. Read-only inventory used ONLY
+    // for session-loss reconciliation (finding a possibly-live worker for a
+    // task whose cursor is gone). Never used to mutate anything.
+    async listSessions(projectId) {
+      const q = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+      const res = await fetchImpl(joinUrl(baseUrl, `/v1/runtime/sessions${q}`), {
+        method: 'GET',
+        headers: headers(),
+      });
+      if (!res.ok) await throwForStatus(res, 'sessions');
+      const body = await res.json();
+      return Array.isArray(body?.sessions) ? body.sessions : [];
+    },
+
     // GET /v1/attempts/{attemptId}. 200 -> AttemptReceipt, 404 -> null
-    // (caller maps null to clearSession:true).
+    // (caller quarantines; null is never proof of absence).
     async getAttempt(attemptId) {
       const res = await fetchImpl(
         joinUrl(baseUrl, `/v1/attempts/${encodeURIComponent(attemptId)}`),
