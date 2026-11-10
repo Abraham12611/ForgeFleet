@@ -63,6 +63,10 @@ NODE_ROOTS = [
     # suite must be mandatory in CI; the gate cannot protect itself if its
     # tests are optional. Coordinate root-list changes with E18 (#67).
     "integrations/github",
+    # E04/FF-008 external adapter (PR #34, coordinator direction): its
+    # node:test suite must be mandatory in CI; present-but-unwired must
+    # never read as green. Coordinate root-list changes with E18 (#67).
+    "packages/paperclip-orca-adapter",
 ]
 NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
 
