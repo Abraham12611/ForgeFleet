@@ -465,6 +465,26 @@ export class BridgeServer {
 
   // -- dispatch plumbing --
 
+  /**
+   * Sibling-launch grace wait. When a same-key racer replays an attempt row
+   * whose claim is held by a concurrent winner, the winner records its
+   * dispatch ids within milliseconds of finishing its launcher. Poll for
+   * those ids briefly; when they appear, return the fresh receipt so the
+   * caller replays instead of launching a duplicate. When none appear
+   * (dead claim holder / crash recovery), return null and let the caller
+   * perform the single recovery launch. Bounded and poll-only: never
+   * invents state, never extends the claim.
+   */
+  private async waitForSiblingDispatch(attemptId: string): Promise<AttemptReceipt | null> {
+    const deadline = Date.now() + 2000;
+    for (;;) {
+      const current = this.store.getAttempt(attemptId);
+      if (current.orcaDispatchId) return current;
+      if (Date.now() >= deadline) return null;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  }
+
   /** Launcher given to the canonical store (single-launch claim inside). */
   private async launchDispatch(input: {
     attemptId: string;
@@ -520,7 +540,14 @@ export class BridgeServer {
         this.extras.noteState(receipt.attemptId, adopted.state);
         return adopted;
       }
-      // Inventory is complete and no live dispatch exists: the single launch.
+      // Inventory is complete and no live dispatch exists. That absence is
+      // only trustworthy when no sibling process is mid-launch: a losing
+      // same-key racer replays the winner's attempt row here while the
+      // winner is still inside its launcher, and per-process inventories
+      // (fake backend) cannot see the sibling's worker. Launching now
+      // would duplicate the winner's in-flight launch for one attempt.
+      // Grace wait: give the claim holder time to record its dispatch ids;
+      // only launch when none appear (dead holder / crash recovery).
       const key = taskKeyOf(receipt.projectId, taskId);
       const staged = this.pendingExtras.get(key);
       if (!staged) {
@@ -528,6 +555,8 @@ export class BridgeServer {
         this.extras.noteState(receipt.attemptId, "unknown");
         return marked;
       }
+      const raced = await this.waitForSiblingDispatch(receipt.attemptId);
+      if (raced) return raced;
       const launched = await this.launchDispatch({
         attemptId: receipt.attemptId,
         projectId: receipt.projectId,

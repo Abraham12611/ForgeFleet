@@ -25,6 +25,14 @@ import { mkdirSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error as NodeJS.ErrnoException).code === "ERR_SQLITE_ERROR" &&
+    /UNIQUE constraint failed/i.test(error.message)
+  );
+}
+
 export interface ExtraMessageRecord {
   messageId: string;
   attemptId: string;
@@ -103,6 +111,10 @@ export class BridgeExtras {
     }
     db.exec("PRAGMA journal_mode = WAL;");
     db.exec("PRAGMA synchronous = FULL;");
+    // Cross-process writers (two bridge processes, one extras file) must
+    // wait out a sibling's brief write lock instead of failing with
+    // SQLITE_BUSY. Mirrors the canonical ledger's own busy_timeout.
+    db.exec("PRAGMA busy_timeout = 5000;");
     if (dbPath !== null) {
       const row = db.prepare("PRAGMA journal_mode;").get() as { journal_mode?: string } | undefined;
       if (row?.journal_mode !== "wal") {
@@ -320,28 +332,42 @@ export class BridgeExtras {
     data: Record<string, unknown>,
     ids: { attemptId?: string; projectId?: string; taskId?: string; fencingEpoch?: number },
   ): ExtraEventFrame {
-    this.eventSeq += 1;
-    const eventId = `e${String(this.eventSeq).padStart(6, "0")}`;
-    const now = new Date().toISOString();
-    const event: Record<string, unknown> = {
-      schemaVersion: "0.1",
-      eventId,
-      eventType,
-      occurredAt: now,
-      receivedAt: now,
-      source: "orca-bridge",
-      projectId: ids.projectId ?? "",
-      taskId: ids.taskId ?? "",
-      attemptId: ids.attemptId ?? "",
-      correlationId: eventId,
-      fencingEpoch: ids.fencingEpoch ?? 1,
-      actor: { type: "service", id: "orca-bridge" },
-      data: { ...data },
-    };
-    this.db
-      .prepare(`INSERT INTO event_log (event_id, event_json) VALUES (?, ?)`)
-      .run(eventId, JSON.stringify(event));
-    return { eventId, event };
+    // Two bridge processes share one extras file but mint ids from
+    // per-process counters, so concurrent appends can collide on
+    // event_log.event_id. Re-sync the counter from the table and retry a
+    // bounded number of times; each retry observes the winner's row, so
+    // two writers always converge instead of 500ing the second POST.
+    for (let attempt = 0; ; attempt++) {
+      const maxRow = this.db.prepare(`SELECT MAX(seq) AS m FROM event_log;`).get() as
+        | { m: number | null }
+        | undefined;
+      this.eventSeq = Math.max(this.eventSeq, maxRow?.m ?? 0) + 1;
+      const eventId = `e${String(this.eventSeq).padStart(6, "0")}`;
+      const now = new Date().toISOString();
+      const event: Record<string, unknown> = {
+        schemaVersion: "0.1",
+        eventId,
+        eventType,
+        occurredAt: now,
+        receivedAt: now,
+        source: "orca-bridge",
+        projectId: ids.projectId ?? "",
+        taskId: ids.taskId ?? "",
+        attemptId: ids.attemptId ?? "",
+        correlationId: eventId,
+        fencingEpoch: ids.fencingEpoch ?? 1,
+        actor: { type: "service", id: "orca-bridge" },
+        data: { ...data },
+      };
+      try {
+        this.db
+          .prepare(`INSERT INTO event_log (event_id, event_json) VALUES (?, ?)`)
+          .run(eventId, JSON.stringify(event));
+        return { eventId, event };
+      } catch (error) {
+        if (!isUniqueViolation(error) || attempt >= 9) throw error;
+      }
+    }
   }
 
   eventsSince(cursor: string | null): ExtraEventFrame[] {

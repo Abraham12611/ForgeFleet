@@ -12,6 +12,8 @@
  *   then polls for `release` before running (kill-after-accept test hook).
  * - `FORGEFLEET_TEST_COUNT_LAUNCHES=<file>`: append one line per launcher
  *   invocation (cross-process single-launch proof).
+ * - `FORGEFLEET_FAKE_ORCA_SEQ_START=<n>`: start the fake dispatch counter
+ *   at `n` so sibling bridge processes mint non-colliding fake dispatch ids.
  * - `FORGEFLEET_ALLOW_TEST_INGEST=1`: enable the test event-ingest route.
  *
  * Required env: `FORGEFLEET_BRIDGE_TOKEN`.
@@ -91,7 +93,8 @@ async function main(): Promise<void> {
 
   let backend: RuntimeBackend;
   if (process.env.FORGEFLEET_FAKE_ORCA === "1") {
-    const fake = new FakeOrca();
+    const seqStart = Number(process.env.FORGEFLEET_FAKE_ORCA_SEQ_START ?? "0");
+    const fake = new FakeOrca(Number.isInteger(seqStart) && seqStart >= 0 ? seqStart : 0);
     const countFile = process.env.FORGEFLEET_TEST_COUNT_LAUNCHES;
     const blockDir = process.env.FORGEFLEET_TEST_BLOCK_LAUNCH;
     const innerRun = fake.run.bind(fake);

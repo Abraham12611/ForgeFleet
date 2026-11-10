@@ -121,26 +121,35 @@ test("concurrent same-key dispatch across two processes launches exactly once", 
   const portB = 4532;
   const countFile = join(root, "launches.txt");
   writeFileSync(countFile, "");
-  spawnServer(portA, { FORGEFLEET_TEST_COUNT_LAUNCHES: countFile });
-  spawnServer(portB, { FORGEFLEET_TEST_COUNT_LAUNCHES: countFile });
+  // Distinct fake id spaces per process: each bridge owns a private
+  // FakeOrca counter, so bare counters would mint colliding
+  // `fake-dispatch-NNNN` ids across processes and trip the store's UNIQUE
+  // dispatch-id backstop (a test artifact, not a product race).
+  spawnServer(portA, { FORGEFLEET_TEST_COUNT_LAUNCHES: countFile, FORGEFLEET_FAKE_ORCA_SEQ_START: "0" });
+  spawnServer(portB, { FORGEFLEET_TEST_COUNT_LAUNCHES: countFile, FORGEFLEET_FAKE_ORCA_SEQ_START: "100000" });
   await waitHealthy(portA);
   await waitHealthy(portB);
 
-  const post = (port) =>
-    fetch(`http://127.0.0.1:${port}/v1/attempts`, {
-      method: "POST",
-      headers: authed(port, "key-xproc-concurrent"),
-      body: JSON.stringify(BODY),
-    });
-  const [resA, resB] = await Promise.all([post(portA), post(portB)]);
-  assert.equal(resA.status, 202);
-  assert.equal(resB.status, 202);
-  const a = await resA.json();
-  const b = await resB.json();
-  assert.equal(a.attemptId, b.attemptId);
+  // Repeat the race: a single paired POST can miss the sibling-mid-launch
+  // window on a fast machine (the bug this guards failed only in CI).
+  for (let round = 0; round < 3; round++) {
+    const key = `key-xproc-concurrent-${round}`;
+    const post = (port) =>
+      fetch(`http://127.0.0.1:${port}/v1/attempts`, {
+        method: "POST",
+        headers: authed(port, key),
+        body: JSON.stringify({ ...BODY, paperclipTaskId: `task-x-${round}` }),
+      });
+    const [resA, resB] = await Promise.all([post(portA), post(portB)]);
+    assert.equal(resA.status, 202);
+    assert.equal(resB.status, 202);
+    const a = await resA.json();
+    const b = await resB.json();
+    assert.equal(a.attemptId, b.attemptId);
+  }
 
   const launches = readFileSync(countFile, "utf-8").trim().split("\n").filter(Boolean);
-  assert.equal(launches.length, 1);
+  assert.equal(launches.length, 3);
 });
 
 test("kill -9 after accept, then restart and retry: one eventual dispatch, no duplicate", async () => {

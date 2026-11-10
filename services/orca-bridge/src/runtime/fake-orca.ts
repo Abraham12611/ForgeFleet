@@ -57,7 +57,18 @@ function parseComment(comment: string | null): {
 }
 
 export class FakeOrca {
-  private seq = 0;
+  private seq: number;
+
+  /**
+   * Test-only id offset: cross-process tests run one FakeOrca per bridge
+   * process, so bare per-process counters would mint colliding
+   * `fake-dispatch-NNNN` ids and trip the store's UNIQUE dispatch-id
+   * backstop. Pass a distinct start per process there. Default 0 keeps
+   * every existing in-process expectation byte-identical.
+   */
+  constructor(startSeq = 0) {
+    this.seq = startSeq;
+  }
   private readonly sessions = new Map<string, FakeSession>();
   private readonly byRequest = new Map<string, string>();
   /** How many worker-start commands actually ran (no-duplicate invariant). */
