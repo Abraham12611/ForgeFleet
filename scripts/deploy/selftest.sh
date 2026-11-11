@@ -246,6 +246,29 @@ else
   bad "state-dir fixture failed"
 fi
 
+# 16. Preflight safety (head-coordinator directive, PR #45 review).
+# (a) No operator script may query live unit ExecStart values: the prior
+# `systemctl show -p ExecStart` pipe printed raw metadata because its sed
+# could not match (and no sed can scrub secrets reliably). Presence of the
+# query flag in live code fails this guard; the User= owner check the
+# preflight keeps is not a secret and stays allowed.
+# NOTE: no `grep -q` here — under `pipefail`, grep -q's early pipe close
+# makes a present violation flake green via SIGPIPE. grep without -q drains
+# the pipe, so the result is deterministic.
+execstart_refs="$(no_comments $OPS | grep -F -- '-p ExecStart' || true)"
+if [ -n "$execstart_refs" ]; then
+  bad "operator script queries unit ExecStart values (metadata/secret leak)"
+else
+  ok "no operator script queries unit ExecStart values"
+fi
+# (b) The Node >=24 server floor is a hard preflight failure, proved by the
+# disposable fake-PATH fixture (Node 22 refused, Node 24 accepted).
+if bash "$D/tests/test-preflight-node-floor.sh" >/dev/null 2>&1; then
+  ok "preflight fixture passed (Node <24 fails closed)"
+else
+  bad "preflight fixture failed (Node floor is not a hard failure)"
+fi
+
 echo "---"
 echo "selftest: $pass passed, $failed failed (fixture-only, not integration evidence)"
 [ "$failed" -eq 0 ]

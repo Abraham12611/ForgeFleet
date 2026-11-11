@@ -17,8 +17,11 @@ if need_cmd systemctl; then
   else
     warn "orca-serve.service not observable via systemctl --user"
   fi
-  # Redact values: print key presence, never environment contents.
-  systemctl --user show orca-serve.service -p ExecStart -p User 2>/dev/null | sed 's/=.*ExecStart.*/ExecStart=[redacted-check-manually]/' || true
+  # Owner identity only: User= is not a secret and feeds the same-UID
+  # proof below. Never query unit ExecStart values here — they can carry
+  # metadata/secrets and no output filter scrubs them reliably, so the
+  # raw show output must never reach the log.
+  systemctl --user show orca-serve.service -p User 2>/dev/null || true
   # Same-UID proof: the bridge user unit runs as this login user, so it must
   # match the user that owns orca-serve.service (else the bridge cannot see that CLI session).
   orca_user="$(systemctl --user show orca-serve.service -p User 2>/dev/null | sed 's/^User=//')"
@@ -56,9 +59,12 @@ fi
 # Server entrypoint is `node src/main.ts` (PR #63, Node >=24 type-stripping).
 if need_cmd node; then
   node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-  [ "${node_major:-0}" -ge 24 ] 2>/dev/null \
-    && log "node $(node --version) meets the >=24 server floor" \
-    || warn "node floor unmet (server needs >=24; found ${node_major:-unknown})"
+  if [ "${node_major:-0}" -ge 24 ] 2>/dev/null; then
+    log "node $(node --version) meets the >=24 server floor"
+  else
+    warn "node floor unmet (server needs >=24; found ${node_major:-unknown}); refusing"
+    fail=1
+  fi
 else
   warn "node unavailable; bridge entrypoint cannot run here"
   fail=1
