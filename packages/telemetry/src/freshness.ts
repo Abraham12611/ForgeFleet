@@ -13,7 +13,7 @@
  *   downstream; freshness classification gives the UI the banner for that.
  */
 
-import type { FreshnessClass, IsoDateTimeString } from "./types.js";
+import type { FreshnessClass, IsoDateTimeString } from "./types.ts";
 
 export const DEFAULT_FRESH_MS = 5000;
 

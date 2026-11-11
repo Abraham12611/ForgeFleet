@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AuditTrail, MAX_SUMMARY_CHARS, redactValue } from "../src/audit.js";
+import { AuditTrail, MAX_SUMMARY_CHARS, redactValue } from "../src/audit.ts";
 
 const AT = "2026-11-09T00:00:00Z";
 

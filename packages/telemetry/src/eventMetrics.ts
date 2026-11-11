@@ -12,7 +12,7 @@
  * (totals are always exact).
  */
 
-import type { IsoDateTimeString } from "./types.js";
+import type { IsoDateTimeString } from "./types.ts";
 
 export type IngestOutcome = "accepted" | "duplicate" | "stale-epoch" | "dead-letter";
 

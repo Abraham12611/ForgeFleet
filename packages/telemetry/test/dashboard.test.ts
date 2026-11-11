@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildDashboardSnapshot, rollupWorkers } from "../src/dashboard.js";
-import type { WorkerInfo } from "../src/dashboard.js";
+import { buildDashboardSnapshot, rollupWorkers } from "../src/dashboard.ts";
+import type { WorkerInfo } from "../src/dashboard.ts";
 
 const AT = "2026-11-09T00:00:00Z";
 

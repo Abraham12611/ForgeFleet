@@ -7,10 +7,27 @@ bounded dashboard rollups.
 - Contracts: `docs/03-architecture/observability-and-cost.md`,
   `docs/05-contracts/events.md`, `docs/05-contracts/bridge.openapi.yaml`
   (`RuntimeCapabilities`), `docs/05-contracts/state-machines.md`.
-- Zero runtime dependencies. Pure functions plus two in-memory stores
-  (`CostLedger`, `AuditTrail`, `EventMetrics`, `SourceSyncTracker`).
-  Durable persistence belongs to E06; this package owns labeling,
-  aggregation and gating semantics only.
+- Zero npm dependencies (node builtins only). Pure functions plus
+  in-memory stores (`CostLedger`, `AuditTrail`, `EventMetrics`,
+  `SourceSyncTracker`) and a JSONL reservation journal for
+  cross-process admission. Canonical durable persistence belongs to E06;
+  this package owns labeling, aggregation, reservations and gating only.
+- Budget admission is fail-closed: unknown spend denies new billable
+  dispatches unless an explicit owner quota (`OwnerQuotaPolicy`,
+  `unknownPolicy: "reserve"`) covers the request; the gate decides on
+  known + reserved + requested atomically — use `checkAndReserve()` so a
+  passed check holds its reservation. Provider quotas, per-project caps
+  and the global cap are hard ceilings alongside the per-dispatch budget;
+  every money input must be finite and non-negative (`NaN`/`Infinity` deny).
+- Reservation lifecycle: `settle()` consumes a hold into recorded spend on
+  success, `release()` frees it on failure, `reconcile()` drops holds with
+  no live owner after a failure or restart, and `importReservations()`
+  reloads holds. Identical `reserve()`/`checkAndReserve()` retries are
+  idempotent (no double-count); reusing an id for different terms is denied.
+- Multi-process durability (`src/reservationJournal.ts`): holds/releases
+  append to a JSONL journal and every read-modify-write runs under an
+  exclusive file lock — use `durableCheckAndReserve()` when two processes
+  may admit concurrently. Corrupt journal rows are skipped, never admitted.
 - E05/E06 are not implemented yet in this repo, so this package defines its
   own minimal types and ships fixture-friendly constructors. When
   `packages/bridge-contracts` and `packages/events` land, align the
@@ -36,7 +53,6 @@ bounded dashboard rollups.
 ## Commands
 
 ```sh
-npm run build      # tsc -> dist/
 npm run typecheck  # tsc --noEmit
-npm test           # build + node --test dist/test/
+npm test           # node --test test/*.test.ts (sources run directly, no build)
 ```

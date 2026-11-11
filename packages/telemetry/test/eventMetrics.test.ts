@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { EventMetrics } from "../src/eventMetrics.js";
-import type { EventRef } from "../src/eventMetrics.js";
+import { EventMetrics } from "../src/eventMetrics.ts";
+import type { EventRef } from "../src/eventMetrics.ts";
 
 const T0 = "2026-11-09T00:00:00.000Z";
 const T1 = "2026-11-09T00:00:01.500Z";

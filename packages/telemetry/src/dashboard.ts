@@ -14,7 +14,7 @@
  *   never $0 and never a fabricated estimate.
  */
 
-import type { CostLabel, FreshnessClass, HealthStatus, IsoDateTimeString } from "./types.js";
+import type { CostLabel, FreshnessClass, HealthStatus, IsoDateTimeString } from "./types.ts";
 
 export type WorkerState =
   | "available"

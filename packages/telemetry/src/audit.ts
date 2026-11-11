@@ -11,7 +11,7 @@
  * summaries are length-bounded so logs stay bounded.
  */
 
-import type { ActorIdentity, AuditStatus, IsoDateTimeString } from "./types.js";
+import type { ActorIdentity, AuditStatus, IsoDateTimeString } from "./types.ts";
 
 export const MAX_SUMMARY_CHARS = 500;
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SourceSyncTracker, classifyFreshness } from "../src/freshness.js";
+import { SourceSyncTracker, classifyFreshness } from "../src/freshness.ts";
 
 const T0 = Date.parse("2026-11-09T00:00:00Z");
 const iso = (ms: number) => new Date(ms).toISOString();

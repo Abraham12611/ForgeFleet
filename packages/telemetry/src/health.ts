@@ -9,7 +9,7 @@
  * read-only transports.
  */
 
-import type { HealthStatus, IsoDateTimeString } from "./types.js";
+import type { HealthStatus, IsoDateTimeString } from "./types.ts";
 
 export type ProviderStatus = "verified" | "unsupported" | "unknown" | "unavailable";
 
