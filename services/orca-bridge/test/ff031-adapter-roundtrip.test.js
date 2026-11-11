@@ -91,6 +91,12 @@ beforeEach(async () => {
     executable: "fake-orca-ide",
     backend: { run: asRunner(fake), listSessions: () => fake.listSessions() },
     port: 0,
+    // Trust bindings under test (server boundary, never request JSON).
+    trustedProjects: [PROJECT],
+    providers: [
+      { name: "muse", status: "verified" },
+      { name: "devin", status: "unknown" },
+    ],
   });
   baseUrl = await server.listen();
 });
@@ -160,6 +166,11 @@ test("bridge restart preserves the finished attempt; retried first wake replays 
     executable: "fake-orca-ide",
     backend: { run: asRunner(liveRunner), listSessions: () => liveRunner.listSessions() },
     port: 0,
+    trustedProjects: [PROJECT],
+    providers: [
+      { name: "muse", status: "verified" },
+      { name: "devin", status: "unknown" },
+    ],
   });
   baseUrl = await server.listen();
   fake = liveRunner;

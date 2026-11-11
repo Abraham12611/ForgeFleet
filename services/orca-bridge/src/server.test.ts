@@ -25,6 +25,7 @@ import { join } from "node:path";
 import { BridgeServer } from "./server.ts";
 import { FakeOrca, asRunner } from "./runtime/fake-orca.ts";
 import type { CommandRunner } from "./runtime/dispatch.ts";
+import type { BackendAuthPort } from "../../../packages/messaging/src/mcp.ts";
 
 const TOKEN = "test-bridge-token-ff031";
 const BASE_BODY = {
@@ -52,13 +53,52 @@ function headers(key?: string): Record<string, string> {
   return h;
 }
 
+/**
+ * Test sender auth: attests the coordinator for the test project, exactly
+ * like a backend would after verifying the service credential. Production
+ * wires the real BackendAuthPort; the server default denies everything.
+ */
+function testMessageAuth(): BackendAuthPort {
+  return {
+    verify: () => ({
+      actor: { type: "agent", id: "coordinator", role: "coordinator", projects: ["proj-ff031"] },
+      via: "service-token",
+    }),
+  };
+}
+
+function denyMessageAuth(): BackendAuthPort {
+  return {
+    verify: (): never => {
+      throw new Error("no backend auth configured; credential rejected");
+    },
+  };
+}
+
+const TEST_PROVIDERS = [
+  { name: "muse", status: "verified" as const },
+  { name: "devin", status: "unknown" as const },
+];
+
 async function startServer(opts: {
   runner?: FakeOrca | CommandRunner;
   dir?: string;
   noTestIngest?: boolean;
+  /** Trust bindings under test. Empty array = unconfigured (fail closed). */
+  trustedProjects?: string[];
+  /** Omit (with failClosedProviders) to exercise the server fail-closed default. */
+  providers?: typeof TEST_PROVIDERS;
+  failClosedProviders?: boolean;
+  messageAuth?: BackendAuthPort;
+  denyMessages?: boolean;
 } = {}): Promise<void> {
   if (opts.noTestIngest) delete process.env.FORGEFLEET_ALLOW_TEST_INGEST;
   else process.env.FORGEFLEET_ALLOW_TEST_INGEST = "1";
+  const extra = {
+    trustedProjects: opts.trustedProjects ?? ["proj-ff031"],
+    ...(opts.failClosedProviders ? {} : { providers: opts.providers ?? TEST_PROVIDERS }),
+    messageAuth: opts.denyMessages ? denyMessageAuth() : (opts.messageAuth ?? testMessageAuth()),
+  };
   // Keep the FakeOrca instance itself as the backend so the server sees the
   // full runtime inventory (reconcile/adopt, sessions); bare functions model
   // backends without inventory (ambiguity gate).
@@ -70,6 +110,7 @@ async function startServer(opts: {
       executable: "fake-orca-ide",
       backend: { run: asRunner(fake), listSessions: () => fake.listSessions() },
       port: 0,
+      ...extra,
     });
   } else {
     fake = new FakeOrca();
@@ -79,6 +120,7 @@ async function startServer(opts: {
       executable: "fake-orca-ide",
       run: opts.runner,
       port: 0,
+      ...extra,
     });
   }
   baseUrl = await server.listen();
@@ -145,6 +187,42 @@ test("unsupported workerKind fails closed without dispatch", async () => {
   const res = await createAttempt("key-cap-1", { workerKind: "devin" });
   assert.equal(res.status, 422);
   assert.equal(fake.dispatchCount, 0);
+});
+
+test("no provider is verified by default: muse dispatch refuses without operator verification", async () => {
+  await startServer({ failClosedProviders: true });
+  const caps = (await (
+    await fetch(`${baseUrl}/v1/runtime/capabilities`, { headers: headers() })
+  ).json()) as { providers: { name: string; status: string }[] };
+  assert.equal(caps.providers.find((p) => p.name === "muse")?.status, "unknown");
+  assert.equal(caps.providers.find((p) => p.name === "devin")?.status, "unknown");
+  const res = await createAttempt("key-cap-default-1");
+  assert.equal(res.status, 422);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "capability_unavailable");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("dispatch without any trusted project binding is refused fail-closed", async () => {
+  await startServer({ trustedProjects: [] });
+  const res = await createAttempt("key-bind-1");
+  assert.equal(res.status, 403);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "project_not_bound");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("dispatch for a forged projectId outside the trusted bindings is refused", async () => {
+  await startServer();
+  const res = await createAttempt("key-bind-2", { projectId: "proj-evil" });
+  assert.equal(res.status, 403);
+  const body = (await res.json()) as { error: string };
+  assert.equal(body.error, "project_not_bound");
+  assert.equal(fake.dispatchCount, 0);
+  // The bound project still dispatches on the same server.
+  const ok = await createAttempt("key-bind-3");
+  assert.equal(ok.status, 202);
+  assert.equal(fake.dispatchCount, 1);
 });
 
 test("full round trip: dispatching -> running -> finished via event receipts", async () => {
@@ -341,6 +419,122 @@ test("messages queue while running and replay idempotently; terminal attempts re
   await getAttempt(created.attemptId);
   const refused = await post("key-msg-op-2");
   assert.equal(refused.status, 409);
+});
+
+test("messages with a forged projectId are refused and never queued", async () => {
+  await startServer();
+  const created = (await (await createAttempt("key-msgf-1")).json()) as {
+    attemptId: string;
+    orcaDispatchId: string;
+  };
+  fake.setStatus(created.orcaDispatchId, "running");
+  await getAttempt(created.attemptId);
+
+  const forged = await fetch(`${baseUrl}/v1/attempts/${created.attemptId}/messages`, {
+    method: "POST",
+    headers: headers("key-msgf-op-1"),
+    body: JSON.stringify({
+      projectId: "proj-evil",
+      threadId: "thread-1",
+      actorId: "coordinator",
+      body: "proceed",
+    }),
+  });
+  assert.equal(forged.status, 403);
+  assert.equal(((await forged.json()) as { error: string }).error, "forged_project");
+});
+
+test("messages with a forged actorId are refused; the verified sender is recorded", async () => {
+  await startServer();
+  const created = (await (await createAttempt("key-msga-1")).json()) as {
+    attemptId: string;
+    orcaDispatchId: string;
+  };
+  fake.setStatus(created.orcaDispatchId, "running");
+  await getAttempt(created.attemptId);
+
+  const forged = await fetch(`${baseUrl}/v1/attempts/${created.attemptId}/messages`, {
+    method: "POST",
+    headers: headers("key-msga-op-1"),
+    body: JSON.stringify({
+      projectId: "proj-ff031",
+      threadId: "thread-1",
+      actorId: "intruder",
+      body: "proceed",
+    }),
+  });
+  assert.equal(forged.status, 403);
+  assert.equal(((await forged.json()) as { error: string }).error, "forged_actor");
+
+  // The verified sender is accepted under its own id.
+  const ok = await fetch(`${baseUrl}/v1/attempts/${created.attemptId}/messages`, {
+    method: "POST",
+    headers: headers("key-msga-op-2"),
+    body: JSON.stringify({
+      projectId: "proj-ff031",
+      threadId: "thread-1",
+      actorId: "coordinator",
+      body: "proceed",
+    }),
+  });
+  assert.equal(ok.status, 202);
+  assert.equal(((await ok.json()) as { state: string }).state, "queued");
+});
+
+test("messages are refused when no sender auth is configured (fail closed)", async () => {
+  await startServer({ denyMessages: true });
+  const created = (await (await createAttempt("key-msgd-1")).json()) as {
+    attemptId: string;
+    orcaDispatchId: string;
+  };
+  fake.setStatus(created.orcaDispatchId, "running");
+  await getAttempt(created.attemptId);
+
+  const refused = await fetch(`${baseUrl}/v1/attempts/${created.attemptId}/messages`, {
+    method: "POST",
+    headers: headers("key-msgd-op-1"),
+    body: JSON.stringify({
+      projectId: "proj-ff031",
+      threadId: "thread-1",
+      actorId: "coordinator",
+      body: "proceed",
+    }),
+  });
+  assert.equal(refused.status, 403);
+});
+
+test("a message idempotency key is bound to its attempt; cross-attempt replay conflicts", async () => {
+  await startServer();
+  const first = (await (await createAttempt("key-msgk-1")).json()) as {
+    attemptId: string;
+    orcaDispatchId: string;
+  };
+  fake.setStatus(first.orcaDispatchId, "running");
+  await getAttempt(first.attemptId);
+
+  const post = (attemptId: string, k: string): Promise<Response> =>
+    fetch(`${baseUrl}/v1/attempts/${attemptId}/messages`, {
+      method: "POST",
+      headers: headers(k),
+      body: JSON.stringify({
+        projectId: "proj-ff031",
+        threadId: "thread-1",
+        actorId: "coordinator",
+        body: "proceed",
+      }),
+    });
+  const queued = await post(first.attemptId, "key-msgk-op-1");
+  assert.equal(queued.status, 202);
+
+  const second = (await (
+    await createAttempt("key-msgk-2", { paperclipTaskId: "task-2" })
+  ).json()) as { attemptId: string; orcaDispatchId: string };
+  fake.setStatus(second.orcaDispatchId, "running");
+  await getAttempt(second.attemptId);
+
+  const conflict = await post(second.attemptId, "key-msgk-op-1");
+  assert.equal(conflict.status, 409);
+  assert.equal(((await conflict.json()) as { error: string }).error, "idempotency_conflict");
 });
 
 test("sessions inventory reports managed attempts and unknown strangers", async () => {

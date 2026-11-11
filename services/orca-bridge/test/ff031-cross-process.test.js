@@ -39,6 +39,10 @@ function childEnv(extra) {
     FORGEFLEET_BRIDGE_HOST: "127.0.0.1",
     FORGEFLEET_FAKE_ORCA: "1",
     FORGEFLEET_ALLOW_TEST_INGEST: "1",
+    // Test-process trust bindings (server boundary, never request JSON).
+    FORGEFLEET_BRIDGE_TEST_MODE: "1",
+    FORGEFLEET_BRIDGE_PROJECTS: "proj-xproc",
+    FORGEFLEET_VERIFIED_PROVIDERS: "muse",
     ...extra,
   };
 }
@@ -203,4 +207,74 @@ test("kill -9 after accept, then restart and retry: one eventual dispatch, no du
   assert.equal(thirdBody.attemptId, retryBody.attemptId);
   const launchesAfter = readFileSync(countFile, "utf-8").trim().split("\n").filter(Boolean);
   assert.equal(launchesAfter.length, 1);
+});
+
+test("production daemon denies test ingest and unbound projects even with test env leaked", async () => {
+  const port = 4539;
+  // Production process config: test mode OFF, but the ingest variable
+  // leaked into the environment — the daemon must still deny ingest
+  // explicitly, while honoring the configured trusted project binding.
+  const child = spawn("node", [MAIN], {
+    env: {
+      ...childEnv({
+        FORGEFLEET_BRIDGE_TEST_MODE: "0",
+        FORGEFLEET_ALLOW_TEST_INGEST: "1",
+      }),
+      PORT: String(port),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(child);
+  await waitHealthy(port);
+
+  const ingest = await fetch(`http://127.0.0.1:${port}/v1/test/events/ingest`, {
+    method: "POST",
+    headers: authed(port),
+    body: JSON.stringify({ attemptId: "x", eventType: "attempt.heartbeat", fencingEpoch: 1 }),
+  });
+  assert.equal(ingest.status, 403);
+
+  // Trusted project binding still enforced at the server boundary.
+  const forged = await fetch(`http://127.0.0.1:${port}/v1/attempts`, {
+    method: "POST",
+    headers: authed(port, "key-xproc-prod-1"),
+    body: JSON.stringify({ ...BODY, projectId: "proj-evil" }),
+  });
+  assert.equal(forged.status, 403);
+
+  // And the bound project dispatches (fake backend, verified muse).
+  const ok = await fetch(`http://127.0.0.1:${port}/v1/attempts`, {
+    method: "POST",
+    headers: authed(port, "key-xproc-prod-2"),
+    body: JSON.stringify(BODY),
+  });
+  assert.equal(ok.status, 202);
+});
+
+test("daemon without fake backend refuses to start: real worker launch disabled by default", async () => {
+  const port = 4540;
+  const child = spawn("node", [MAIN], {
+    env: {
+      ...process.env,
+      FORGEFLEET_BRIDGE_TOKEN: TOKEN,
+      FORGEFLEET_BRIDGE_DATA_DIR: dataDir,
+      FORGEFLEET_BRIDGE_HOST: "127.0.0.1",
+      FORGEFLEET_BRIDGE_TEST_MODE: "0",
+      PORT: String(port),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exit = await new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch { /* already gone */ }
+      resolve("still-running");
+    }, 8000);
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+  // Fail-closed: non-zero exit, never a listening live backend.
+  assert.notEqual(exit, 0);
+  assert.notEqual(exit, "still-running");
 });

@@ -102,6 +102,14 @@ it only speaks HTTP to the bridge, never to Orca directly.
 - E17: deployment units are `services/orca-bridge` (`node src/main.js`,
   env `FORGEFLEET_BRIDGE_TOKEN`, `FORGEFLEET_BRIDGE_DATA_DIR`, loopback
   bind). Never place the bridge or its token on Vercel/serverless.
+  Trust bindings are server-side only: `FORGEFLEET_BRIDGE_PROJECTS`
+  (dispatch refused for unlisted projects, all refused when unset),
+  `FORGEFLEET_VERIFIED_PROVIDERS` (every other provider stays `unknown`
+  and refuses dispatch — `muse` is NOT verified by default), real worker
+  launch disabled unless `FORGEFLEET_ENABLE_LIVE_DISPATCH=1`, and test
+  hooks honored only with `FORGEFLEET_BRIDGE_TEST_MODE=1` (test ingest
+  denied otherwise, even if its env var leaks). Message senders are minted
+  by the verified `BackendAuthPort`, never from request JSON.
 - FF-027 (UI split) stays independent (see
   `paperclip-pin-reconciliation.md`).
 - FF-030 (CI): this branch only appends the `bridge-integration` job;

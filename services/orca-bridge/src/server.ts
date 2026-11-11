@@ -12,6 +12,15 @@
  *   idempotency, SSE replay buffer. Never the attempt ledger.
  * - E07 policy gate (`dispatch.execute`, service role, project-scoped).
  *   Worker-supplied `approvedBy` is audit evidence, never authority.
+ * - Trust bindings from the server boundary (never request JSON):
+ *   dispatch requires a server-configured `trustedProjects` binding for
+ *   the request project (fail closed when unconfigured) plus the
+ *   canonical per-task lease (active_lease / stale_epoch); messages
+ *   require `body.projectId` to equal the stored attempt project and a
+ *   sender minted by the verified `BackendAuthPort` (forged actor/project
+ *   refused, recorded sender is always the verified identity).
+ * - Fail-closed capabilities: no provider is `verified` by default, so
+ *   nothing can reach a real launch until the operator verifies it.
  * - Unseen runtime sessions reported as `managed:false, state:unknown`.
  * - No new live dispatch when history is ambiguous (real backend only).
  * - Launcher fate unknown (502 `dispatch_unknown`): the durable `accepted`
@@ -55,6 +64,11 @@ import {
   type StartAttemptInput,
 } from "./runtime/dispatch.ts";
 import { authorize } from "../../../packages/policy/src/policy.js";
+import type {
+  BackendAuthPort,
+  BackendCredential,
+  VerifiedCaller,
+} from "../../../packages/messaging/src/mcp.ts";
 import { BridgeExtras } from "./persistence/bridge-extras.ts";
 
 export const CONTRACT_VERSION = "0.1.0";
@@ -101,7 +115,26 @@ export interface BridgeServerOptions {
   /** Bare runner (no inventory: unseen sessions stay unknown, ambiguity gates). */
   run?: CommandRunner;
   platform?: string;
+  /**
+   * Provider capability report. Fail-closed default: every known provider
+   * is `unknown` until the operator explicitly verifies it (daemon reads
+   * `FORGEFLEET_VERIFIED_PROVIDERS`). Nothing dispatches on an unverified
+   * provider — the capability gate refuses with 422.
+   */
   providers?: ProviderCapability[];
+  /**
+   * Trusted project bindings resolved from server-side config (daemon env
+   * `FORGEFLEET_BRIDGE_PROJECTS`), never from request JSON. Dispatch for a
+   * project outside this list is refused with 403; an empty/unset list
+   * refuses ALL dispatch (fail closed — no trusted scheduler binding).
+   */
+  trustedProjects?: string[];
+  /**
+   * Sender authentication for `POST /v1/attempts/{id}/messages`: the port
+   * mints the sender identity from the backend-verified credential (never
+   * from `body.actorId`). Fail-closed default denies every sender.
+   */
+  messageAuth?: BackendAuthPort;
   host?: string;
   port?: number;
   /** Test-only: allow the fake-event ingest endpoint. */
@@ -299,6 +332,8 @@ export class BridgeServer {
   private readonly runner: CommandRunner;
   private readonly deps: DispatchDeps;
   private readonly providers: ProviderCapability[];
+  private readonly trustedProjects: string[];
+  private readonly messageAuth: BackendAuthPort;
   private readonly host: string;
   private readonly port: number;
   private readonly allowTestIngest: boolean;
@@ -316,6 +351,8 @@ export class BridgeServer {
       backend: RuntimeBackend;
       pendingExtras: Map<string, PendingExtras>;
       providers: ProviderCapability[];
+      trustedProjects: string[];
+      messageAuth: BackendAuthPort;
       host: string;
       port: number;
       allowTestIngest: boolean;
@@ -329,6 +366,8 @@ export class BridgeServer {
     this.runner = opts.backend.run;
     this.pendingExtras = opts.pendingExtras;
     this.providers = opts.providers;
+    this.trustedProjects = opts.trustedProjects;
+    this.messageAuth = opts.messageAuth;
     this.host = opts.host;
     this.port = opts.port;
     this.allowTestIngest = opts.allowTestIngest;
@@ -403,17 +442,30 @@ export class BridgeServer {
       assertSafeDbFile(statSync(join(opts.dataDir, "attempts.db")), process.geteuid());
       extras.assertOwnership();
     }
+    // Fail-closed sender auth: no credential verifies until the operator
+    // wires a backend auth port (tests inject a fake). Never accept a
+    // sender/actor id from request JSON.
+    const messageAuth: BackendAuthPort = opts.messageAuth ?? {
+      verify: (): never => {
+        throw new Error("no message sender auth configured on this bridge; refusing");
+      },
+    };
     const server = new BridgeServer(store, extras, {
       token,
       executable: resolved,
       backend,
       pendingExtras,
+      // Fail-closed capabilities: no provider is verified by default. An
+      // unverified provider refuses dispatch (422) and can never reach a
+      // real `spawn` — operator verification is explicit and separate.
       providers:
         opts.providers ??
         [
-          { name: "muse", status: "verified" },
+          { name: "muse", status: "unknown" },
           { name: "devin", status: "unknown" },
         ],
+      trustedProjects: opts.trustedProjects ?? [],
+      messageAuth,
       host: opts.host ?? "127.0.0.1",
       port: opts.port ?? 4387,
       allowTestIngest:
@@ -753,6 +805,22 @@ export class BridgeServer {
       sendJson(res, 422, err(422, "validation", problems.join("; ")).body);
       return;
     }
+    // Trusted project binding (server boundary, never request JSON): the
+    // caller only holds the shared service Bearer token, so the request's
+    // projectId is untrusted until it matches a server-configured binding.
+    // The canonical store additionally enforces the per-task lease
+    // (active_lease / stale_epoch) below; both must pass before dispatch.
+    const projectId = String(body.projectId);
+    if (!this.trustedProjects.includes(projectId)) {
+      sendJson(res, 403, err(
+        403,
+        "project_not_bound",
+        this.trustedProjects.length === 0
+          ? "this bridge has no trusted project bindings configured; refusing dispatch"
+          : `project '${projectId}' is not bound to a trusted scheduler lease on this bridge; refusing dispatch`,
+      ).body);
+      return;
+    }
     const workerKind = String(body.workerKind);
     const provider = this.providerStatus(workerKind);
     if (!provider || provider.status !== "verified") {
@@ -763,7 +831,6 @@ export class BridgeServer {
       ).body);
       return;
     }
-    const projectId = String(body.projectId);
     const decision = authorize({
       actor: { type: "service", id: "orca-bridge", role: "service", projects: [projectId] },
       action: "dispatch.execute",
@@ -1014,15 +1081,80 @@ export class BridgeServer {
       sendJson(res, 409, err(409, "attempt_not_messageable", `attempt is ${receipt.state}; messages require running or waiting`).body);
       return;
     }
-    const { record, deduplicated } = this.extras.logMessage({
+    // Project binding (server boundary): the request's projectId is
+    // untrusted — it must equal the stored attempt's project, or the
+    // caller is impersonating another project.
+    if (String(body.projectId) !== receipt.projectId) {
+      sendJson(res, 403, err(
+        403,
+        "forged_project",
+        "message projectId does not match the stored attempt project; refusing",
+      ).body);
+      return;
+    }
+    // Sender binding (server boundary): identity is minted by the verified
+    // BackendAuthPort from the backend credential — never from
+    // `body.actorId`. A forged actorId is refused; the recorded sender is
+    // always the verified identity.
+    let sender: string;
+    try {
+      const credential: BackendCredential = { transport: "service-token", token: this.token };
+      const verified: VerifiedCaller = this.messageAuth.verify(credential);
+      const boundActor = verified.onBehalfOf?.workerId ?? verified.actor.id;
+      const boundProject = verified.onBehalfOf?.projectId;
+      if (boundProject !== undefined) {
+        if (boundProject !== receipt.projectId) {
+          sendJson(res, 403, err(
+            403,
+            "forged_project",
+            "verified sender is not bound to the stored attempt project; refusing",
+          ).body);
+          return;
+        }
+      } else if (verified.actor.role !== "owner") {
+        const projects = verified.actor.projects ?? [];
+        if (!projects.includes(receipt.projectId)) {
+          sendJson(res, 403, err(
+            403,
+            "forged_project",
+            "verified sender is not scoped to the stored attempt project; refusing",
+          ).body);
+          return;
+        }
+      }
+      if (String(body.actorId) !== boundActor) {
+        sendJson(res, 403, err(
+          403,
+          "forged_actor",
+          "message actorId does not match the verified sender; refusing",
+        ).body);
+        return;
+      }
+      sender = boundActor;
+    } catch {
+      // Every in-try refusal above already sent its response and returned;
+      // reaching here means the auth port itself rejected the credential.
+      sendJson(res, 403, err(403, "forbidden", "message sender authentication failed; refusing").body);
+      return;
+    }
+    const logged = this.extras.logMessage({
       idempotencyKey: key,
       attemptId,
-      projectId: String(body.projectId),
+      projectId: receipt.projectId,
       threadId: String(body.threadId),
-      actorId: String(body.actorId),
+      actorId: sender,
       body: String(body.body),
       kind: typeof body.kind === "string" ? body.kind : "update",
     });
+    if (logged.conflict) {
+      sendJson(res, 409, err(
+        409,
+        "idempotency_conflict",
+        "Idempotency-Key was already used for a different attempt",
+      ).body);
+      return;
+    }
+    const { record, deduplicated } = logged;
     if (!deduplicated) {
       this.extras.appendEvent(
         "message.posted",

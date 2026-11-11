@@ -242,7 +242,7 @@ export class BridgeExtras {
     actorId: string;
     body: string;
     kind: string;
-  }): { record: ExtraMessageRecord; deduplicated: boolean } {
+  }): { record: ExtraMessageRecord; deduplicated: boolean; conflict?: false } | { conflict: true } {
     const existing = this.db
       .prepare(`SELECT * FROM messages WHERE idempotency_key = ?`)
       .get(input.idempotencyKey) as
@@ -259,6 +259,12 @@ export class BridgeExtras {
         }
       | undefined;
     if (existing) {
+      // An Idempotency-Key is bound to the attempt that first used it: a
+      // replay for another attempt is a conflict, never a cross-attempt
+      // alias (fail closed on forged replays).
+      if (existing.attempt_id !== input.attemptId) {
+        return { conflict: true as const };
+      }
       return {
         record: {
           messageId: existing.message_id,

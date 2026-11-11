@@ -19,6 +19,22 @@
  * Required env: `FORGEFLEET_BRIDGE_TOKEN`.
  * Optional: `FORGEFLEET_BRIDGE_DATA_DIR` (default `./bridge-data`),
  * `FORGEFLEET_BRIDGE_HOST` (default `127.0.0.1`), `PORT` (default 4387).
+ *
+ * Trust bindings (all server-side, never request JSON):
+ * - `FORGEFLEET_BRIDGE_PROJECTS`: comma-separated trusted project ids.
+ *   Dispatch for any other project is refused; unset refuses ALL dispatch.
+ * - `FORGEFLEET_VERIFIED_PROVIDERS`: comma-separated provider names whose
+ *   readiness the operator has actually verified. Every other provider
+ *   stays `unknown` and refuses dispatch — `muse` is NOT verified by
+ *   default (a CLI flag listing is not readiness proof).
+ * - Real worker launch is DISABLED by default: without
+ *   `FORGEFLEET_FAKE_ORCA=1` the daemon exits unless
+ *   `FORGEFLEET_ENABLE_LIVE_DISPATCH=1` is set with owner approval.
+ * - Test-only hooks (`FORGEFLEET_ALLOW_TEST_INGEST`,
+ *   `FORGEFLEET_TEST_BLOCK_LAUNCH`, `FORGEFLEET_TEST_COUNT_LAUNCHES`,
+ *   `FORGEFLEET_FAKE_ORCA_SEQ_START`) are honored ONLY when
+ *   `FORGEFLEET_BRIDGE_TEST_MODE=1`. Production daemons deny test ingest
+ *   explicitly even if the env var is set.
  */
 
 import { spawn } from "node:child_process";
@@ -90,13 +106,22 @@ async function main(): Promise<void> {
   const dataDir = process.env.FORGEFLEET_BRIDGE_DATA_DIR ?? "./bridge-data";
   const host = process.env.FORGEFLEET_BRIDGE_HOST ?? "127.0.0.1";
   const port = Number(process.env.PORT ?? "4387");
+  const testMode = process.env.FORGEFLEET_BRIDGE_TEST_MODE === "1";
+  const csv = (v: string | undefined): string[] =>
+    (v ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const trustedProjects = csv(process.env.FORGEFLEET_BRIDGE_PROJECTS);
+  const verifiedProviders = new Set(csv(process.env.FORGEFLEET_VERIFIED_PROVIDERS));
+  const providers = ["muse", "devin"].map((name) => ({
+    name,
+    status: (verifiedProviders.has(name) ? "verified" : "unknown") as "verified" | "unknown",
+  }));
 
   let backend: RuntimeBackend;
   if (process.env.FORGEFLEET_FAKE_ORCA === "1") {
-    const seqStart = Number(process.env.FORGEFLEET_FAKE_ORCA_SEQ_START ?? "0");
+    const seqStart = testMode ? Number(process.env.FORGEFLEET_FAKE_ORCA_SEQ_START ?? "0") : 0;
     const fake = new FakeOrca(Number.isInteger(seqStart) && seqStart >= 0 ? seqStart : 0);
-    const countFile = process.env.FORGEFLEET_TEST_COUNT_LAUNCHES;
-    const blockDir = process.env.FORGEFLEET_TEST_BLOCK_LAUNCH;
+    const countFile = testMode ? process.env.FORGEFLEET_TEST_COUNT_LAUNCHES : undefined;
+    const blockDir = testMode ? process.env.FORGEFLEET_TEST_BLOCK_LAUNCH : undefined;
     const innerRun = fake.run.bind(fake);
     backend = {
       run: async (executable, argv, opts) => {
@@ -118,6 +143,16 @@ async function main(): Promise<void> {
     // cross-process tests observe via HTTP only. The instance lives here.
     void fake;
   } else {
+    // Real worker launch is DISABLED by default: fail closed unless the
+    // operator explicitly enables live dispatch (owner approval).
+    if (process.env.FORGEFLEET_ENABLE_LIVE_DISPATCH !== "1") {
+      console.error(
+        "refusing to start with a live Orca backend: real worker launch is disabled by default; " +
+          "set FORGEFLEET_ENABLE_LIVE_DISPATCH=1 with owner approval, or FORGEFLEET_FAKE_ORCA=1 for tests",
+      );
+      process.exitCode = 1;
+      return;
+    }
     backend = { run: runReal };
   }
 
@@ -127,6 +162,12 @@ async function main(): Promise<void> {
     backend,
     host,
     port,
+    trustedProjects,
+    providers,
+    // Test ingest is a test-process surface only: the daemon honors the
+    // env var solely in test mode, so a production process denies ingest
+    // explicitly even when the variable leaks into its environment.
+    allowTestIngest: testMode && process.env.FORGEFLEET_ALLOW_TEST_INGEST === "1",
   });
   const url = await server.listen();
   console.log(`orca-bridge listening on ${url}`);
