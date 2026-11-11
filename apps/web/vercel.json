@@ -1,0 +1,16 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "//": "PLACEHOLDER — non-routable .example domain. E17 (FF-028) substitutes the real staging ingress. Any preview deploy renders the unreachable-backend panel by design; this is not a functioning preview.",
+      "source": "/api/:path*",
+      "destination": "https://api.forgefleet.example/api/:path*"
+    },
+    {
+      "source": "/((?!api/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}

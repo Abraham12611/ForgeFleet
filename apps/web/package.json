@@ -1,0 +1,32 @@
+{
+  "name": "@forgefleet/web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "ForgeFleet standalone web UI foundation (FF-027 feasibility spike). Vercel-deployable Vite build; Vultr Paperclip API stays the system of record.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "verify:vercel": "node scripts/verify-vercel-config.mjs",
+    "preview": "vite preview",
+    "test": "vitest run --no-color src/lib && node --test src/features/inbox/inbox-policy.test.mjs",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-router-dom": "^7.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.0",
+    "typescript": "^5.9.0",
+    "vite": "^8.0.0",
+    "vitest": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  }
+}
