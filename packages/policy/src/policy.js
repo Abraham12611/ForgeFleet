@@ -250,11 +250,12 @@ export function authorize(input) {
   const { actor, action } = input;
   const resource = input.resource ?? {};
   const context = input.context ?? {};
-  // Trusted clock: only a finite caller-supplied `now` is usable as time.
-  // NaN/Infinity/non-numbers fall back to Date.now(), never to
-  // attacker-controlled time (`now >= expiresAt` is false for NaN now,
-  // which would otherwise resurrect expired approvals).
-  const now = Number.isFinite(context.now) ? context.now : Date.now();
+  // Trusted clock: only a finite POSITIVE caller-supplied `now` is usable
+  // as time. NaN/Infinity/non-numbers/non-positive values fall back to
+  // Date.now(), never to attacker-controlled time (`now >= expiresAt` is
+  // false for NaN now, and any non-positive now predates every real
+  // expiry, both of which would otherwise resurrect expired approvals).
+  const now = Number.isFinite(context.now) && context.now > 0 ? context.now : Date.now();
 
   // 0. Message content is never authority.
   if (context.claimedViaMessage === true) {

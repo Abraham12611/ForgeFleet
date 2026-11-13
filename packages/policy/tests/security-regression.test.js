@@ -10,10 +10,10 @@
  *  - `authorize()` accepted `context.now = NaN` via the typeof-only
  *    default, so even an EXPIRED approval passed the `now >= expiresAt`
  *    check (trusted-clock bypass -> allow).
- * Fail-closed rule pinned here: only finite epoch-ms values are time.
- * Non-finite `expiresAt` denies as OWNER_APPROVAL_EXPIRED; non-finite
- * `context.now` falls back to the trusted clock (`Date.now()`), never to
- * attacker-controlled time.
+ * Fail-closed rule pinned here: only finite positive epoch-ms values are
+ * time. Non-finite `expiresAt` denies as OWNER_APPROVAL_EXPIRED;
+ * non-finite or non-positive `context.now` falls back to the trusted
+ * clock (`Date.now()`), never to attacker-controlled time.
  *
  * Also pinned: an empty-string merge reviewer is NOT an independent
  * reviewer, roles outside the catalog entry cannot execute, and a truthy
@@ -110,6 +110,23 @@ describe('FF-023: non-finite context.now falls back to the trusted clock', () =>
     assert.equal(d.verdict, 'deny');
     assert.equal(d.reasonCode, 'OWNER_APPROVAL_EXPIRED');
   });
+
+  // A finite but non-positive `now` predates every real expiry, so it
+  // would resurrect expired approvals the same way NaN does. Only a
+  // finite positive caller clock is trusted; otherwise Date.now() applies
+  // and the expired approval still denies.
+  for (const now of [-1, 0]) {
+    it(`context.now=${now} cannot resurrect an expired approval`, () => {
+      const d = authorize({
+        actor: ownerActor,
+        action: 'merge.main',
+        resource: prResource(),
+        context: { now, approval: FRESH_APPROVAL({ expiresAt: NOW - 1 }) },
+      });
+      assert.equal(d.verdict, 'deny');
+      assert.equal(d.reasonCode, 'OWNER_APPROVAL_EXPIRED');
+    });
+  }
 });
 
 describe('FF-023: empty merge reviewer is not independent review', () => {
