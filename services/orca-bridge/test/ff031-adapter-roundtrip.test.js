@@ -21,13 +21,28 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeServer } from "../src/server.ts";
 import { FakeOrca, asRunner } from "../src/runtime/fake-orca.ts";
+import { createHmacLeaseVerifier, issueSchedulerLease } from "../src/runtime/scheduler-lease.ts";
 import { createServerAdapter } from "../../../packages/paperclip-orca-adapter/server/index.js";
 
 const TOKEN = "test-adapter-token-ff031";
 const PROJECT = "proj-ff031";
 const TASK = "paperclip-task-7";
 const RUN = "r1";
-const LEASE = { fencingEpoch: 1, leaseToken: "task-7:r1:1" };
+// Test-only scheduler lease authority (stands in for the Paperclip
+// scheduler). The grant is minted once so every wake — including the
+// retried first wake after restart — presents the identical signed token.
+const LEASE_SECRET = "test-adapter-lease-secret-ff031";
+const { leaseToken: LEASE_TOKEN } = issueSchedulerLease({
+  secret: LEASE_SECRET,
+  projectId: PROJECT,
+  taskId: TASK,
+  runId: RUN,
+  fencingEpoch: 1,
+  ttlMs: 3_600_000,
+  nonce: `${PROJECT}:${TASK}:${RUN}:1`,
+});
+const LEASE = { fencingEpoch: 1, leaseToken: LEASE_TOKEN };
+const leaseVerifier = () => createHmacLeaseVerifier({ secret: LEASE_SECRET });
 
 let root;
 let localCwd;
@@ -93,6 +108,7 @@ beforeEach(async () => {
     port: 0,
     // Trust bindings under test (server boundary, never request JSON).
     trustedProjects: [PROJECT],
+    leaseVerifier: leaseVerifier(),
     providers: [
       { name: "muse", status: "verified" },
       { name: "devin", status: "unknown" },
@@ -167,6 +183,7 @@ test("bridge restart preserves the finished attempt; retried first wake replays 
     backend: { run: asRunner(liveRunner), listSessions: () => liveRunner.listSessions() },
     port: 0,
     trustedProjects: [PROJECT],
+    leaseVerifier: leaseVerifier(),
     providers: [
       { name: "muse", status: "verified" },
       { name: "devin", status: "unknown" },

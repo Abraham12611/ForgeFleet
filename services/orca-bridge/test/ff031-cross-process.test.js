@@ -22,9 +22,15 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { issueSchedulerLease } from "../src/runtime/scheduler-lease.ts";
 
 const TOKEN = "test-xproc-token-ff031";
 const MAIN = new URL("../src/main.ts", import.meta.url).pathname;
+// Test-only scheduler lease authority (stands in for the Paperclip
+// scheduler). The secret travels to the daemons as server-side env —
+// never in a request body — and every POST below carries a grant minted
+// with it, so the daemons verify the exact (project, task, run, epoch).
+const LEASE_SECRET = "test-xproc-lease-secret-ff031";
 
 let root;
 let dataDir;
@@ -42,6 +48,7 @@ function childEnv(extra) {
     // Test-process trust bindings (server boundary, never request JSON).
     FORGEFLEET_BRIDGE_TEST_MODE: "1",
     FORGEFLEET_BRIDGE_PROJECTS: "proj-xproc",
+    FORGEFLEET_BRIDGE_LEASE_SECRET: LEASE_SECRET,
     FORGEFLEET_VERIFIED_PROVIDERS: "muse",
     ...extra,
   };
@@ -96,16 +103,44 @@ function authed(port, key) {
   return h;
 }
 
-const BODY = {
-  projectId: "proj-xproc",
-  paperclipTaskId: "task-x",
-  paperclipRunId: "r1",
-  workerKind: "muse",
-  taskTitle: "cross-process probe",
-  instruction: "do the thing",
-  contextManifestId: "ctx-1",
-  lease: { fencingEpoch: 1, leaseToken: "task-x:r1:1" },
-};
+/**
+ * Scheduler-signed grant per (task, run, epoch), cached so concurrent and
+ * retried POSTs for one tuple carry byte-identical payloads and exercise
+ * the idempotent replay path rather than looking like fresh grants.
+ */
+const leaseGrants = new Map();
+function grantFor(taskId, runId = "r1", fencingEpoch = 1) {
+  const key = `${taskId}:${runId}:${fencingEpoch}`;
+  const cached = leaseGrants.get(key);
+  if (cached) return cached;
+  const { leaseToken } = issueSchedulerLease({
+    secret: LEASE_SECRET,
+    projectId: "proj-xproc",
+    taskId,
+    runId,
+    fencingEpoch,
+    ttlMs: 600_000,
+    nonce: `proj-xproc:${taskId}:${runId}:${fencingEpoch}`,
+  });
+  const grant = { fencingEpoch, leaseToken };
+  leaseGrants.set(key, grant);
+  return grant;
+}
+
+function bodyFor(taskId, runId = "r1") {
+  return {
+    projectId: "proj-xproc",
+    paperclipTaskId: taskId,
+    paperclipRunId: runId,
+    workerKind: "muse",
+    taskTitle: "cross-process probe",
+    instruction: "do the thing",
+    contextManifestId: "ctx-1",
+    lease: grantFor(taskId, runId),
+  };
+}
+
+const BODY = bodyFor("task-x");
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "ff031-xproc-"));
@@ -138,11 +173,12 @@ test("concurrent same-key dispatch across two processes launches exactly once", 
   // window on a fast machine (the bug this guards failed only in CI).
   for (let round = 0; round < 3; round++) {
     const key = `key-xproc-concurrent-${round}`;
+    const body = bodyFor(`task-x-${round}`);
     const post = (port) =>
       fetch(`http://127.0.0.1:${port}/v1/attempts`, {
         method: "POST",
         headers: authed(port, key),
-        body: JSON.stringify({ ...BODY, paperclipTaskId: `task-x-${round}` }),
+        body: JSON.stringify(body),
       });
     const [resA, resB] = await Promise.all([post(portA), post(portB)]);
     assert.equal(resA.status, 202);

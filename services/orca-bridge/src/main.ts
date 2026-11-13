@@ -23,6 +23,10 @@
  * Trust bindings (all server-side, never request JSON):
  * - `FORGEFLEET_BRIDGE_PROJECTS`: comma-separated trusted project ids.
  *   Dispatch for any other project is refused; unset refuses ALL dispatch.
+ * - `FORGEFLEET_BRIDGE_LEASE_SECRET`: shared secret for the authenticated
+ *   Paperclip scheduler lease verifier (HMAC-SHA256 grants bound to the
+ *   exact project/task/run/epoch). Unset denies ALL dispatch fail-closed;
+ *   the secret is server-side operator config, never request input.
  * - `FORGEFLEET_VERIFIED_PROVIDERS`: comma-separated provider names whose
  *   readiness the operator has actually verified. Every other provider
  *   stays `unknown` and refuses dispatch — `muse` is NOT verified by
@@ -43,6 +47,7 @@ import { join } from "node:path";
 import { BridgeServer, type RuntimeBackend } from "./server.ts";
 import type { CommandResult } from "./runtime/dispatch.ts";
 import { FakeOrca } from "./runtime/fake-orca.ts";
+import { createHmacLeaseVerifier } from "./runtime/scheduler-lease.ts";
 
 const OUTPUT_CAP_BYTES = 256 * 1024;
 
@@ -156,6 +161,15 @@ async function main(): Promise<void> {
     backend = { run: runReal };
   }
 
+  // Authenticated scheduler lease authority (server-side only): the HMAC
+  // secret is operator config, never request input. Without it the server
+  // keeps its fail-closed deny-all verifier and refuses every dispatch.
+  const leaseSecret = process.env.FORGEFLEET_BRIDGE_LEASE_SECRET ?? "";
+  if (!leaseSecret) {
+    console.error(
+      "no FORGEFLEET_BRIDGE_LEASE_SECRET configured: scheduler lease verification denies ALL dispatch (fail closed)",
+    );
+  }
   const server = await BridgeServer.create({
     dataDir,
     token,
@@ -163,6 +177,7 @@ async function main(): Promise<void> {
     host,
     port,
     trustedProjects,
+    ...(leaseSecret ? { leaseVerifier: createHmacLeaseVerifier({ secret: leaseSecret }) } : {}),
     providers,
     // Test ingest is a test-process surface only: the daemon honors the
     // env var solely in test mode, so a production process denies ingest

@@ -19,9 +19,11 @@ is made or needed by this assembly.
 | `services/orca-bridge/src/main.ts` — env daemon entry (real spawn; fake + test hooks only via explicit env) | E01 integration | server |
 | `services/orca-bridge/src/runtime/fake-orca.ts` — deterministic fake backend | E01 integration | #35 argv shapes (type-only import; no runtime dep) |
 | `services/orca-bridge/src/persistence/bridge-extras.ts` — SQLite WAL extras DB (attempt index, message/cancel idempotency, SSE replay buffer) | E01 integration | node:sqlite stdlib |
-| `services/orca-bridge/src/server.test.ts` — 16 HTTP round-trip tests | E01 integration | server |
+| `services/orca-bridge/src/server.test.ts` — 32 HTTP round-trip tests (incl. 9 scheduler-lease negatives) | E01 integration | server |
+| `services/orca-bridge/src/runtime/scheduler-lease.ts` (+ 11 unit tests) — HMAC-signed scheduler grant verifier | E01 integration | node:crypto stdlib |
 | `services/orca-bridge/test/ff031-adapter-roundtrip.test.js` — 4 finalization tests vs canonical adapter ctx | E01 integration | #34 adapter, server |
 | `services/orca-bridge/test/ff031-cross-process.test.js` — concurrent same-key + kill-after-accept proof | E01 integration | main entry, canonical store |
+| `services/orca-bridge/test/ff031-pinned-registration.test.js` — 3 pinned plugin-registration tests | E01 integration | #34 adapter entry path, server |
 | `services/orca-bridge/package.json` | E01 integration | — |
 | `.github/workflows/ci.yml` — additive `bridge-integration` job only | E01 integration (+FF-030 baseline untouched) | — |
 | `docs/06-delivery/ff031-integration-matrix.md`, `ff031-live-smoke-plan.md`, `docs/07-research/paperclip-pin-reconciliation.md` | E01 integration | — |
@@ -104,6 +106,8 @@ it only speaks HTTP to the bridge, never to Orca directly.
   bind). Never place the bridge or its token on Vercel/serverless.
   Trust bindings are server-side only: `FORGEFLEET_BRIDGE_PROJECTS`
   (dispatch refused for unlisted projects, all refused when unset),
+  `FORGEFLEET_BRIDGE_LEASE_SECRET` (HMAC scheduler-lease authority for
+  the exact project/task/run/epoch; unset denies ALL dispatch),
   `FORGEFLEET_VERIFIED_PROVIDERS` (every other provider stays `unknown`
   and refuses dispatch — `muse` is NOT verified by default), real worker
   launch disabled unless `FORGEFLEET_ENABLE_LIVE_DISPATCH=1`, and test

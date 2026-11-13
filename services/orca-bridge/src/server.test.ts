@@ -26,8 +26,13 @@ import { BridgeServer } from "./server.ts";
 import { FakeOrca, asRunner } from "./runtime/fake-orca.ts";
 import type { CommandRunner } from "./runtime/dispatch.ts";
 import type { BackendAuthPort } from "../../../packages/messaging/src/mcp.ts";
+import { createHmacLeaseVerifier, issueSchedulerLease } from "./runtime/scheduler-lease.ts";
 
 const TOKEN = "test-bridge-token-ff031";
+// Test-only scheduler lease authority: stands in for the Paperclip
+// scheduler that signs dispatch grants in production. The secret is
+// test-process config; the server only ever receives the verifier.
+const LEASE_SECRET = "test-scheduler-lease-secret-ff031";
 const BASE_BODY = {
   projectId: "proj-ff031",
   paperclipTaskId: "task-1",
@@ -36,8 +41,44 @@ const BASE_BODY = {
   taskTitle: "probe task",
   instruction: "do the thing",
   contextManifestId: "ctx-1",
-  lease: { fencingEpoch: 1, leaseToken: "task-1:r1:1" },
 };
+
+/**
+ * Mint a scheduler-signed grant for the exact (project, task, run, epoch)
+ * tuple. Grants are cached per tuple so same-key retries (restart, 502
+ * reconcile, concurrent duplicate POSTs) carry byte-identical payloads and
+ * hit the store's idempotent replay path instead of looking like new
+ * grants: the wall-clock expiry would otherwise make every mint unique. A
+ * different tuple — or a different secret/TTL — mints a different token,
+ * which is exactly what the negative tests present.
+ */
+const leaseCache = new Map<string, { fencingEpoch: number; leaseToken: string }>();
+function leaseFor(
+  taskId: string,
+  runId: string,
+  fencingEpoch = 1,
+  opts: { projectId?: string; ttlMs?: number; secret?: string; nowMs?: number } = {},
+): { fencingEpoch: number; leaseToken: string } {
+  const projectId = opts.projectId ?? "proj-ff031";
+  const secret = opts.secret ?? LEASE_SECRET;
+  const ttlMs = opts.ttlMs ?? 600_000;
+  const cacheKey = JSON.stringify([secret, projectId, taskId, runId, fencingEpoch, ttlMs, opts.nowMs ?? null]);
+  const cached = leaseCache.get(cacheKey);
+  if (cached) return cached;
+  const { leaseToken } = issueSchedulerLease({
+    secret,
+    projectId,
+    taskId,
+    runId,
+    fencingEpoch,
+    ttlMs,
+    nonce: `${projectId}:${taskId}:${runId}:${fencingEpoch}`,
+    ...(opts.nowMs !== undefined ? { nowMs: opts.nowMs } : {}),
+  });
+  const grant = { fencingEpoch, leaseToken };
+  leaseCache.set(cacheKey, grant);
+  return grant;
+}
 
 let dataDir: string;
 let server: BridgeServer | null = null;
@@ -91,6 +132,8 @@ async function startServer(opts: {
   failClosedProviders?: boolean;
   messageAuth?: BackendAuthPort;
   denyMessages?: boolean;
+  /** Pass true to exercise the fail-closed deny-all lease default. */
+  denyLeases?: boolean;
 } = {}): Promise<void> {
   if (opts.noTestIngest) delete process.env.FORGEFLEET_ALLOW_TEST_INGEST;
   else process.env.FORGEFLEET_ALLOW_TEST_INGEST = "1";
@@ -98,6 +141,7 @@ async function startServer(opts: {
     trustedProjects: opts.trustedProjects ?? ["proj-ff031"],
     ...(opts.failClosedProviders ? {} : { providers: opts.providers ?? TEST_PROVIDERS }),
     messageAuth: opts.denyMessages ? denyMessageAuth() : (opts.messageAuth ?? testMessageAuth()),
+    ...(opts.denyLeases ? {} : { leaseVerifier: createHmacLeaseVerifier({ secret: LEASE_SECRET }) }),
   };
   // Keep the FakeOrca instance itself as the backend so the server sees the
   // full runtime inventory (reconcile/adopt, sessions); bare functions model
@@ -140,10 +184,16 @@ afterEach(async () => {
 });
 
 async function createAttempt(key: string, body: Record<string, unknown> = {}): Promise<Response> {
+  const merged = { ...BASE_BODY, ...body };
+  // Scheduler-signed grant, minted by the test authority unless the test
+  // passes an explicit (possibly forged) lease. Mirrors production, where
+  // only the Paperclip scheduler can mint a grant the bridge accepts.
+  const lease =
+    body.lease ?? leaseFor(String(merged.paperclipTaskId), String(merged.paperclipRunId));
   return fetch(`${baseUrl}/v1/attempts`, {
     method: "POST",
     headers: headers(key),
-    body: JSON.stringify({ ...BASE_BODY, ...body }),
+    body: JSON.stringify({ ...merged, lease }),
   });
 }
 
@@ -222,6 +272,122 @@ test("dispatch for a forged projectId outside the trusted bindings is refused", 
   // The bound project still dispatches on the same server.
   const ok = await createAttempt("key-bind-3");
   assert.equal(ok.status, 202);
+  assert.equal(fake.dispatchCount, 1);
+});
+
+test("dispatch without a scheduler lease verifier is refused fail-closed", async () => {
+  await startServer({ denyLeases: true });
+  const res = await createAttempt("key-lease-deny-1");
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "lease_unverified");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("a forged task in an allowed project is refused: token bound to another task", async () => {
+  await startServer();
+  // Valid scheduler grant for task-1, presented for a new task-evil.
+  const stolen = leaseFor("task-1", "r1");
+  const res = await createAttempt("key-lease-forge-1", {
+    paperclipTaskId: "task-evil",
+    lease: stolen,
+  });
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "lease_unverified");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("an unsigned lease token is refused", async () => {
+  await startServer();
+  const res = await createAttempt("key-lease-forge-2", {
+    lease: { fencingEpoch: 1, leaseToken: "task-1:r1:1" },
+  });
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "lease_unverified");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("a lease signed under a different secret is refused", async () => {
+  await startServer();
+  const res = await createAttempt("key-lease-forge-3", {
+    lease: leaseFor("task-1", "r1", 1, { secret: "attacker-secret" }),
+  });
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "lease_unverified");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("a grant presented for the wrong run is refused", async () => {
+  await startServer();
+  // Grant authorizes r1; the request claims r2.
+  const res = await createAttempt("key-lease-run-1", {
+    paperclipRunId: "r2",
+    lease: leaseFor("task-1", "r1"),
+  });
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "lease_run_mismatch");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("an expired scheduler grant is refused", async () => {
+  await startServer();
+  const res = await createAttempt("key-lease-exp-1", {
+    paperclipTaskId: "task-exp",
+    lease: leaseFor("task-exp", "r1", 1, { ttlMs: -1 }),
+  });
+  assert.equal(res.status, 403);
+  assert.equal(((await res.json()) as { error: string }).error, "lease_expired");
+  assert.equal(fake.dispatchCount, 0);
+});
+
+test("a lease token reused under a different idempotency key is a replay and refused", async () => {
+  await startServer();
+  const lease = leaseFor("task-replay", "r1");
+  const first = await createAttempt("key-lease-replay-1", {
+    paperclipTaskId: "task-replay",
+    lease,
+  });
+  assert.equal(first.status, 202);
+  assert.equal(fake.dispatchCount, 1);
+  // Same token, new key, same task/run: the store would see a new key, so
+  // the lease replay backstop must refuse before the store ever decides.
+  const replay = await createAttempt("key-lease-replay-2", {
+    paperclipTaskId: "task-replay",
+    lease,
+  });
+  assert.equal(replay.status, 409);
+  assert.equal(((await replay.json()) as { error: string }).error, "lease_replay");
+  assert.equal(fake.dispatchCount, 1);
+});
+
+test("a superseded epoch is refused as stale", async () => {
+  await startServer();
+  // Scheduler advances the task to epoch 3 first (fresh task, valid grant).
+  const advanced = await createAttempt("key-lease-epoch-3", {
+    paperclipTaskId: "task-stale",
+    lease: leaseFor("task-stale", "r1", 3),
+  });
+  assert.equal(advanced.status, 202);
+  // The old epoch-1 grant is genuine but superseded: stale, not unverified.
+  const stale = await createAttempt("key-lease-epoch-1", {
+    paperclipTaskId: "task-stale",
+    lease: leaseFor("task-stale", "r1", 1),
+  });
+  assert.equal(stale.status, 409);
+  assert.equal(((await stale.json()) as { error: string }).error, "lease_stale_epoch");
+  assert.equal(fake.dispatchCount, 1);
+});
+
+test("a token minted for one task reused for another task in the same project is refused", async () => {
+  await startServer();
+  const lease = leaseFor("task-1", "r1");
+  const first = await createAttempt("key-lease-xtask-1", { lease });
+  assert.equal(first.status, 202);
+  const crossTask = await createAttempt("key-lease-xtask-2", {
+    paperclipTaskId: "task-2",
+    lease,
+  });
+  assert.equal(crossTask.status, 403);
+  assert.equal(((await crossTask.json()) as { error: string }).error, "lease_unverified");
   assert.equal(fake.dispatchCount, 1);
 });
 

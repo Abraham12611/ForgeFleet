@@ -12,6 +12,11 @@
  *   idempotency, SSE replay buffer. Never the attempt ledger.
  * - E07 policy gate (`dispatch.execute`, service role, project-scoped).
  *   Worker-supplied `approvedBy` is audit evidence, never authority.
+ * - Authenticated scheduler lease (`runtime/scheduler-lease.ts`): dispatch
+ *   requires an HMAC-signed Paperclip scheduler grant for the exact
+ *   (projectId, taskId, runId, fencingEpoch) tuple. Forged, expired,
+ *   wrong-run, stale-epoch and replayed grants refuse fail-closed; the
+ *   allowlist below only scopes which projects MAY dispatch.
  * - Trust bindings from the server boundary (never request JSON):
  *   dispatch requires a server-configured `trustedProjects` binding for
  *   the request project (fail closed when unconfigured) plus the
@@ -69,6 +74,10 @@ import type {
   BackendCredential,
   VerifiedCaller,
 } from "../../../packages/messaging/src/mcp.ts";
+import {
+  denyAllLeaseVerifier,
+  type SchedulerLeaseVerifier,
+} from "./runtime/scheduler-lease.ts";
 import { BridgeExtras } from "./persistence/bridge-extras.ts";
 
 export const CONTRACT_VERSION = "0.1.0";
@@ -129,6 +138,15 @@ export interface BridgeServerOptions {
    * refuses ALL dispatch (fail closed — no trusted scheduler binding).
    */
   trustedProjects?: string[];
+  /**
+   * Authenticated Paperclip scheduler lease verifier, bound to the exact
+   * (projectId, taskId, runId, fencingEpoch) tuple carried by the signed
+   * `lease.leaseToken`. Injected from server-side config (daemon env
+   * `FORGEFLEET_BRIDGE_LEASE_SECRET`); the fail-closed default denies
+   * every dispatch. The allowlist above only scopes which projects MAY
+   * dispatch — only a verified scheduler grant authorizes a task/run.
+   */
+  leaseVerifier?: SchedulerLeaseVerifier;
   /**
    * Sender authentication for `POST /v1/attempts/{id}/messages`: the port
    * mints the sender identity from the backend-verified credential (never
@@ -333,6 +351,7 @@ export class BridgeServer {
   private readonly deps: DispatchDeps;
   private readonly providers: ProviderCapability[];
   private readonly trustedProjects: string[];
+  private readonly leaseVerifier: SchedulerLeaseVerifier;
   private readonly messageAuth: BackendAuthPort;
   private readonly host: string;
   private readonly port: number;
@@ -352,6 +371,7 @@ export class BridgeServer {
       pendingExtras: Map<string, PendingExtras>;
       providers: ProviderCapability[];
       trustedProjects: string[];
+      leaseVerifier: SchedulerLeaseVerifier;
       messageAuth: BackendAuthPort;
       host: string;
       port: number;
@@ -367,6 +387,7 @@ export class BridgeServer {
     this.pendingExtras = opts.pendingExtras;
     this.providers = opts.providers;
     this.trustedProjects = opts.trustedProjects;
+    this.leaseVerifier = opts.leaseVerifier;
     this.messageAuth = opts.messageAuth;
     this.host = opts.host;
     this.port = opts.port;
@@ -442,6 +463,10 @@ export class BridgeServer {
       assertSafeDbFile(statSync(join(opts.dataDir, "attempts.db")), process.geteuid());
       extras.assertOwnership();
     }
+    // Fail-closed scheduler lease authority: no grant verifies until the
+    // operator injects a verifier (daemon env secret). Never accept a
+    // task/run/epoch/token binding from request JSON alone.
+    const leaseVerifier: SchedulerLeaseVerifier = opts.leaseVerifier ?? denyAllLeaseVerifier();
     // Fail-closed sender auth: no credential verifies until the operator
     // wires a backend auth port (tests inject a fake). Never accept a
     // sender/actor id from request JSON.
@@ -465,6 +490,7 @@ export class BridgeServer {
           { name: "devin", status: "unknown" },
         ],
       trustedProjects: opts.trustedProjects ?? [],
+      leaseVerifier,
       messageAuth,
       host: opts.host ?? "127.0.0.1",
       port: opts.port ?? 4387,
@@ -821,6 +847,28 @@ export class BridgeServer {
       ).body);
       return;
     }
+    // Authenticated scheduler lease (server boundary): the bearer token
+    // only proves the caller may talk to the bridge. Dispatch additionally
+    // requires a scheduler-signed grant for the EXACT
+    // (projectId, taskId, runId, fencingEpoch) tuple — a token holder on an
+    // allowed project cannot mint arbitrary tasks/runs. The canonical store
+    // still enforces idempotency and per-task lease below; both must pass.
+    const lease = body.lease as Record<string, unknown>;
+    const leaseCheck = this.leaseVerifier.verify(
+      {
+        projectId,
+        taskId: String(body.paperclipTaskId),
+        runId: String(body.paperclipRunId),
+        fencingEpoch: Number(lease.fencingEpoch),
+        leaseToken: String(lease.leaseToken),
+      },
+      { idempotencyKey: key },
+    );
+    if (!leaseCheck.ok) {
+      const status = leaseCheck.code === "lease_stale_epoch" || leaseCheck.code === "lease_replay" ? 409 : 403;
+      sendJson(res, status, err(status, leaseCheck.code, leaseCheck.message).body);
+      return;
+    }
     const workerKind = String(body.workerKind);
     const provider = this.providerStatus(workerKind);
     if (!provider || provider.status !== "verified") {
@@ -851,7 +899,6 @@ export class BridgeServer {
       ).body);
       return;
     }
-    const lease = body.lease as Record<string, unknown>;
     const storeRequest: CreateAttemptRequest = {
       projectId,
       paperclipTaskId: String(body.paperclipTaskId),

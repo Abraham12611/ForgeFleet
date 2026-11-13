@@ -142,7 +142,7 @@ jobs:
         with:
           node-version: "24.x"
       - name: Bridge HTTP round trip + restart/no-duplicate (SQLite ledger)
-        run: node --test services/orca-bridge/src/server.test.ts
+        run: node --test services/orca-bridge/src/server.test.ts services/orca-bridge/src/runtime/scheduler-lease.test.ts
         env:
           FORGEFLEET_ALLOW_TEST_INGEST: "1"
       - name: Adapter finalization + cross-process proof
