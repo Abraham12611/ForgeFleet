@@ -1,11 +1,11 @@
 {
   "name": "@forgefleet/scheduler",
   "version": "0.2.0",
-  "description": "Deterministic task readiness, DAG validation, lease/fencing, admission control, retry and recovery semantics for ForgeFleet (FF-013).",
+  "description": "Deterministic scheduler policy: FF-013 readiness/leases/admission core plus FF-026 host registry and distributed admission.",
   "type": "module",
   "main": "./src/index.js",
   "scripts": {
-    "test": "node --test test/leases.test.js test/dag-readiness.test.js test/admission-retry-scheduler-recovery.test.js"
+    "test": "node --test test/leases.test.js test/dag-readiness.test.js test/admission-retry-scheduler-recovery.test.js test/host-registry-distributed.test.js test/distributed-leases.test.js"
   },
   "engines": {
     "node": ">=20"
