@@ -1,0 +1,200 @@
+/**
+ * FF-031 integration: bridge daemon entrypoint (env-configured).
+ *
+ * Production path: resolves the Orca executable per E02, runs real
+ * subprocesses via `spawn` (argv vectors only, never a shell), and serves
+ * the authenticated HTTP API on loopback. No test surface is enabled
+ * unless explicitly requested:
+ *
+ * - `FORGEFLEET_FAKE_ORCA=1`: use the deterministic in-process fake backend
+ *   (integration tests, Vultr smoke without touching real Orca).
+ * - `FORGEFLEET_TEST_BLOCK_LAUNCH=<dir>`: launcher writes a `sentinel` file
+ *   then polls for `release` before running (kill-after-accept test hook).
+ * - `FORGEFLEET_TEST_COUNT_LAUNCHES=<file>`: append one line per launcher
+ *   invocation (cross-process single-launch proof).
+ * - `FORGEFLEET_FAKE_ORCA_SEQ_START=<n>`: start the fake dispatch counter
+ *   at `n` so sibling bridge processes mint non-colliding fake dispatch ids.
+ * - `FORGEFLEET_ALLOW_TEST_INGEST=1`: enable the test event-ingest route.
+ *
+ * Required env: `FORGEFLEET_BRIDGE_TOKEN`.
+ * Optional: `FORGEFLEET_BRIDGE_DATA_DIR` (default `./bridge-data`),
+ * `FORGEFLEET_BRIDGE_HOST` (default `127.0.0.1`), `PORT` (default 4387).
+ *
+ * Trust bindings (all server-side, never request JSON):
+ * - `FORGEFLEET_BRIDGE_PROJECTS`: comma-separated trusted project ids.
+ *   Dispatch for any other project is refused; unset refuses ALL dispatch.
+ * - `FORGEFLEET_BRIDGE_LEASE_SECRET`: shared secret for the authenticated
+ *   Paperclip scheduler lease verifier (HMAC-SHA256 grants bound to the
+ *   exact project/task/run/epoch). Unset denies ALL dispatch fail-closed;
+ *   the secret is server-side operator config, never request input.
+ * - `FORGEFLEET_VERIFIED_PROVIDERS`: comma-separated provider names whose
+ *   readiness the operator has actually verified. Every other provider
+ *   stays `unknown` and refuses dispatch — `muse` is NOT verified by
+ *   default (a CLI flag listing is not readiness proof).
+ * - Real worker launch is DISABLED by default: without
+ *   `FORGEFLEET_FAKE_ORCA=1` the daemon exits unless
+ *   `FORGEFLEET_ENABLE_LIVE_DISPATCH=1` is set with owner approval.
+ * - Test-only hooks (`FORGEFLEET_ALLOW_TEST_INGEST`,
+ *   `FORGEFLEET_TEST_BLOCK_LAUNCH`, `FORGEFLEET_TEST_COUNT_LAUNCHES`,
+ *   `FORGEFLEET_FAKE_ORCA_SEQ_START`) are honored ONLY when
+ *   `FORGEFLEET_BRIDGE_TEST_MODE=1`. Production daemons deny test ingest
+ *   explicitly even if the env var is set.
+ */
+
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { BridgeServer, type RuntimeBackend } from "./server.ts";
+import type { CommandResult } from "./runtime/dispatch.ts";
+import { FakeOrca } from "./runtime/fake-orca.ts";
+import { createHmacLeaseVerifier } from "./runtime/scheduler-lease.ts";
+
+const OUTPUT_CAP_BYTES = 256 * 1024;
+
+function runReal(executable: string, argv: readonly string[], opts: { timeoutMs?: number }): Promise<CommandResult> {
+  return new Promise((resolve) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (exitCode: number, errText: string): void => {
+      if (settled) return;
+      settled = true;
+      resolve({ exitCode, stdout, stderr: errText ? `${stderr}\n${errText}` : stderr });
+    };
+    let child;
+    try {
+      child = spawn(executable, [...argv], {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: opts.timeoutMs ?? 60_000,
+      });
+    } catch (err) {
+      finish(127, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    child.stdout.on("data", (d: Buffer) => {
+      if (stdout.length < OUTPUT_CAP_BYTES) stdout += d.toString("utf-8").slice(0, OUTPUT_CAP_BYTES - stdout.length);
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      if (stderr.length < OUTPUT_CAP_BYTES) stderr += d.toString("utf-8").slice(0, OUTPUT_CAP_BYTES - stderr.length);
+    });
+    child.on("error", (err) => finish(127, err.message));
+    child.on("close", (code) => finish(code ?? 1, ""));
+  });
+}
+
+function waitForRelease(dir: string, timeoutMs: number): Promise<void> {
+  const release = join(dir, "release");
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = (): void => {
+      if (existsSync(release)) {
+        resolve();
+        return;
+      }
+      if (Date.now() - start > timeoutMs) {
+        reject(new Error("launch blocked: release file never arrived; failing closed"));
+        return;
+      }
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+}
+
+async function main(): Promise<void> {
+  const token = process.env.FORGEFLEET_BRIDGE_TOKEN ?? "";
+  if (!token) {
+    console.error("FORGEFLEET_BRIDGE_TOKEN is required");
+    process.exitCode = 1;
+    return;
+  }
+  const dataDir = process.env.FORGEFLEET_BRIDGE_DATA_DIR ?? "./bridge-data";
+  const host = process.env.FORGEFLEET_BRIDGE_HOST ?? "127.0.0.1";
+  const port = Number(process.env.PORT ?? "4387");
+  const testMode = process.env.FORGEFLEET_BRIDGE_TEST_MODE === "1";
+  const csv = (v: string | undefined): string[] =>
+    (v ?? "").split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  const trustedProjects = csv(process.env.FORGEFLEET_BRIDGE_PROJECTS);
+  const verifiedProviders = new Set(csv(process.env.FORGEFLEET_VERIFIED_PROVIDERS));
+  const providers = ["muse", "devin"].map((name) => ({
+    name,
+    status: (verifiedProviders.has(name) ? "verified" : "unknown") as "verified" | "unknown",
+  }));
+
+  let backend: RuntimeBackend;
+  if (process.env.FORGEFLEET_FAKE_ORCA === "1") {
+    const seqStart = testMode ? Number(process.env.FORGEFLEET_FAKE_ORCA_SEQ_START ?? "0") : 0;
+    const fake = new FakeOrca(Number.isInteger(seqStart) && seqStart >= 0 ? seqStart : 0);
+    const countFile = testMode ? process.env.FORGEFLEET_TEST_COUNT_LAUNCHES : undefined;
+    const blockDir = testMode ? process.env.FORGEFLEET_TEST_BLOCK_LAUNCH : undefined;
+    const innerRun = fake.run.bind(fake);
+    backend = {
+      run: async (executable, argv, opts) => {
+        // Test hook: block only real dispatches, never boot probes.
+        if (blockDir && argv[0] === "orchestration" && argv[1] === "worker-start") {
+          writeFileSync(join(blockDir, "sentinel"), "launcher-entered\n");
+          await waitForRelease(blockDir, 10_000);
+        }
+        // Count actual worker-start commands, not launcher entries: a
+        // launcher killed mid-flight must not count as a launch.
+        if (countFile && argv[0] === "orchestration" && argv[1] === "worker-start") {
+          appendFileSync(countFile, `launch ${Date.now()}\n`);
+        }
+        return innerRun(executable, argv, opts);
+      },
+      listSessions: () => fake.listSessions(),
+    };
+    // Keep the fake reachable for in-process tests that import main? No:
+    // cross-process tests observe via HTTP only. The instance lives here.
+    void fake;
+  } else {
+    // Real worker launch is DISABLED by default: fail closed unless the
+    // operator explicitly enables live dispatch (owner approval).
+    if (process.env.FORGEFLEET_ENABLE_LIVE_DISPATCH !== "1") {
+      console.error(
+        "refusing to start with a live Orca backend: real worker launch is disabled by default; " +
+          "set FORGEFLEET_ENABLE_LIVE_DISPATCH=1 with owner approval, or FORGEFLEET_FAKE_ORCA=1 for tests",
+      );
+      process.exitCode = 1;
+      return;
+    }
+    backend = { run: runReal };
+  }
+
+  // Authenticated scheduler lease authority (server-side only): the HMAC
+  // secret is operator config, never request input. Without it the server
+  // keeps its fail-closed deny-all verifier and refuses every dispatch.
+  const leaseSecret = process.env.FORGEFLEET_BRIDGE_LEASE_SECRET ?? "";
+  if (!leaseSecret) {
+    console.error(
+      "no FORGEFLEET_BRIDGE_LEASE_SECRET configured: scheduler lease verification denies ALL dispatch (fail closed)",
+    );
+  }
+  const server = await BridgeServer.create({
+    dataDir,
+    token,
+    backend,
+    host,
+    port,
+    trustedProjects,
+    ...(leaseSecret ? { leaseVerifier: createHmacLeaseVerifier({ secret: leaseSecret }) } : {}),
+    providers,
+    // Test ingest is a test-process surface only: the daemon honors the
+    // env var solely in test mode, so a production process denies ingest
+    // explicitly even when the variable leaks into its environment.
+    allowTestIngest: testMode && process.env.FORGEFLEET_ALLOW_TEST_INGEST === "1",
+  });
+  const url = await server.listen();
+  console.log(`orca-bridge listening on ${url}`);
+
+  const shutdown = (): void => {
+    void server.close().finally(() => process.exit(0));
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
+
+void main().catch((err) => {
+  console.error(err instanceof Error ? err.message : err);
+  process.exitCode = 1;
+});
