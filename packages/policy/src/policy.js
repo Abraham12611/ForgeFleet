@@ -107,7 +107,8 @@ export const ACTION_CATALOG = Object.freeze({
  * @property {string} resourceId - immutable ID of the exact approved target
  * @property {string} [targetSha] - exact state hash the owner approved
  *   (required for SHA-pinned actions: merge.main, deploy.production)
- * @property {number} expiresAt - epoch ms; expired approval grants nothing
+ * @property {number} expiresAt - finite epoch ms; expired (or non-finite)
+ *   approval grants nothing
  * @property {string} [origin] - approvals originating from 'message' or
  *   'sleep-expiry' are invalid
  *
@@ -119,7 +120,8 @@ export const ACTION_CATALOG = Object.freeze({
  * @property {boolean} [ownerReauth] - owner re-authenticated this session
  *   (required for secrets.rotate / permissions.grant)
  * @property {OwnerApproval} [approval]
- * @property {number} [now] - epoch ms clock; defaults to Date.now()
+ * @property {number} [now] - finite epoch ms clock; non-finite values
+ *   fall back to the trusted clock (Date.now())
  *
  * @typedef {object} Decision
  * @property {'allow'|'deny'|'require_owner'} verdict
@@ -177,7 +179,10 @@ function ownerApprovalError(approval, action, resource, now) {
   if (approval.origin === 'message' || approval.origin === 'sleep-expiry') {
     return 'OWNER_APPROVAL_BAD_ORIGIN';
   }
-  if (typeof approval.expiresAt !== 'number' || now >= approval.expiresAt) {
+  // Only finite epoch-ms values are time. NaN/Infinity are not timestamps:
+  // `now >= NaN` is always false, so a typeof-only check lets NaN expiry
+  // bypass and Infinity live forever. Fail closed as expired.
+  if (!Number.isFinite(approval.expiresAt) || now >= approval.expiresAt) {
     return 'OWNER_APPROVAL_EXPIRED';
   }
   // Resource binding: both sides must carry a nonempty immutable ID.
@@ -245,7 +250,12 @@ export function authorize(input) {
   const { actor, action } = input;
   const resource = input.resource ?? {};
   const context = input.context ?? {};
-  const now = typeof context.now === 'number' ? context.now : Date.now();
+  // Trusted clock: only a finite POSITIVE caller-supplied `now` is usable
+  // as time. NaN/Infinity/non-numbers/non-positive values fall back to
+  // Date.now(), never to attacker-controlled time (`now >= expiresAt` is
+  // false for NaN now, and any non-positive now predates every real
+  // expiry, both of which would otherwise resurrect expired approvals).
+  const now = Number.isFinite(context.now) && context.now > 0 ? context.now : Date.now();
 
   // 0. Message content is never authority.
   if (context.claimedViaMessage === true) {
@@ -331,7 +341,10 @@ export function authorize(input) {
         return deny(action, actor, spec.approvalClass, 'CHECKS_NOT_PASSING',
           'Required checks are not green at the current head SHA.');
       }
-      if (resource.reviewerId === undefined || resource.reviewerId === resource.authorId) {
+      // An independent reviewer is a non-empty identity distinct from the
+      // author. An empty reviewerId is no review at all and must not pass.
+      if (typeof resource.reviewerId !== 'string' || resource.reviewerId.length === 0 ||
+          resource.reviewerId === resource.authorId) {
         return deny(action, actor, spec.approvalClass, 'REVIEW_NOT_INDEPENDENT',
           'Merge into develop requires an independent reviewer (not the author).');
       }
