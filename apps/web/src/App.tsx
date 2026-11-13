@@ -2,6 +2,10 @@ import { useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { apiUrl, fetchHealth, type HealthStatus } from "./lib/api";
 import { buildLiveSocketUrl, connectLive } from "./lib/live";
+// E12 dashboard routes (FF-015). Additive mount only; `/` probe and `/fleet`
+// placeholder below are untouched (E01/E13). Coordinator sign-off requested
+// on this shared-entry touchpoint in PR #38.
+import { dashboardRoutes } from "./features/dashboard/routes";
 
 const API_ENV = import.meta.env.VITE_PUBLIC_API_URL as string | undefined;
 
@@ -75,10 +79,12 @@ export default function App() {
     <main>
       <h1>ForgeFleet web (FF-027 spike)</h1>
       <nav>
-        <Link to="/">Status</Link> | <Link to="/fleet">Fleet</Link>
+        <Link to="/">Status</Link> | <Link to="/projects">Projects</Link> |{" "}
+        <Link to="/fleet">Fleet</Link>
       </nav>
       <Routes>
         <Route path="/" element={<ConnectionPanel />} />
+        {dashboardRoutes}
         <Route
           path="/fleet"
           element={<p>Fleet board mounts here after the E12 build.</p>}
