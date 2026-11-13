@@ -2,10 +2,16 @@ import { useEffect, useState } from "react";
 import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { apiUrl, fetchHealth, type HealthStatus } from "./lib/api";
 import { buildLiveSocketUrl, connectLive } from "./lib/live";
-// E12 dashboard routes (FF-015). Additive mount only; `/` probe and `/fleet`
-// placeholder below are untouched (E01/E13). Coordinator sign-off requested
-// on this shared-entry touchpoint in PR #38.
+// E12 dashboard routes (FF-015). Additive mount only; `/` probe untouched.
+// E13 (FF-016) screens mount here; screen internals stay in
+// features/tasks/** and features/fleet/** (E13-owned paths).
 import { dashboardRoutes } from "./features/dashboard/routes";
+import { TaskDetailRoute } from "./features/tasks/TaskDetailRoute";
+import {
+  AgentDetailRoute,
+  FleetRoute,
+  ProjectFleetRoute,
+} from "./features/fleet/FleetRoutes";
 
 const API_ENV = import.meta.env.VITE_PUBLIC_API_URL as string | undefined;
 
@@ -85,9 +91,15 @@ export default function App() {
       <Routes>
         <Route path="/" element={<ConnectionPanel />} />
         {dashboardRoutes}
+        <Route path="/fleet" element={<FleetRoute />} />
+        <Route path="/fleet/:agentId" element={<AgentDetailRoute />} />
         <Route
-          path="/fleet"
-          element={<p>Fleet board mounts here after the E12 build.</p>}
+          path="/projects/:projectId/agents"
+          element={<ProjectFleetRoute />}
+        />
+        <Route
+          path="/projects/:projectId/tasks/:taskId"
+          element={<TaskDetailRoute />}
         />
         <Route path="*" element={<NotFound />} />
       </Routes>

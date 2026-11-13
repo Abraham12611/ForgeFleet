@@ -9,7 +9,7 @@
     "build": "tsc -b && vite build",
     "verify:vercel": "node scripts/verify-vercel-config.mjs",
     "preview": "vite preview",
-    "test": "vitest run --no-color src/lib && node --test src/features/inbox/inbox-policy.test.mjs",
+    "test": "vitest run --no-color src/lib src/features/tasks src/features/fleet && node --test src/features/inbox/inbox-policy.test.mjs src/features/tasks/liveness.test.ts src/features/tasks/task-detail.test.ts src/features/tasks/bridge-adapter.test.ts src/features/fleet/fleet.test.ts",
     "typecheck": "tsc -b"
   },
   "dependencies": {

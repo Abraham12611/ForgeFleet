@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // Standalone build: the UI never bundles the Paperclip server.
@@ -15,5 +15,18 @@ export default defineConfig({
         ws: true,
       },
     },
+  },
+  test: {
+    environment: "node",
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      // Node:test stdlib suites (E13 *.test.ts, E14 *.test.mjs) run via
+      // `node --test` with zero deps. Vitest owns the SSR route suites
+      // (*.test.tsx) only.
+      "src/features/**/*.test.ts",
+      "src/features/**/*.test.mjs",
+      "src/features/**/*.test.js",
+    ],
   },
 });
