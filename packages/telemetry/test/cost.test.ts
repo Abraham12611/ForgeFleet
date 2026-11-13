@@ -375,6 +375,65 @@ test("holds in another project count toward the global cap", () => {
   assert.match(second.decision.reason, /global hard cap/);
 });
 
+test("global cap counts holds on OTHER providers: $8 on A + $5 on B under $10 denies", () => {
+  const ledger = new CostLedger();
+  ledger.record(entry({ entryId: "a", projectId: "p1", billedUsd: 0, source: "provider-api" }));
+  ledger.record(entry({ entryId: "b", projectId: "p2", billedUsd: 0, source: "provider-api" }));
+  assert.equal(ledger.setGlobalCap(10, "owner").accepted, true);
+
+  const first = ledger.checkAndReserve({
+    summary: ledger.summarize("p1"), budgetUsd: 100, authorized: true,
+    requestedUsd: 8, provider: "provider-a", reservationId: "r-p1-a",
+  });
+  assert.equal(first.decision.allowed, true);
+
+  // True global exposure is 0 known + 8 held (provider A) + 5 requested
+  // (provider B) = 13 > 10: must DENY even though provider B holds nothing.
+  const second = ledger.checkAndReserve({
+    summary: ledger.summarize("p2"), budgetUsd: 100, authorized: true,
+    requestedUsd: 5, provider: "provider-b", reservationId: "r-p2-b",
+  });
+  assert.equal(second.decision.allowed, false);
+  assert.match(second.decision.reason, /global hard cap/);
+});
+
+test("project budget counts holds on other providers; provider quota stays provider-specific", () => {
+  const ledger = new CostLedger();
+  ledger.record(entry({ entryId: "a", projectId: "p1", billedUsd: 0, source: "provider-api" }));
+  ledger.record(entry({ entryId: "b", projectId: "p2", billedUsd: 0, source: "provider-api" }));
+
+  const held = ledger.checkAndReserve({
+    summary: ledger.summarize("p1"), budgetUsd: 100, authorized: true,
+    requestedUsd: 8, provider: "provider-a", reservationId: "r-p1-a",
+  });
+  assert.equal(held.decision.allowed, true);
+
+  // Same project, other provider: project exposure is 0 + 8 + 5 = 13 > 10.
+  const overProject = ledger.checkBudget({
+    summary: ledger.summarize("p1"), budgetUsd: 10, authorized: true,
+    requestedUsd: 5, provider: "provider-b",
+  });
+  assert.equal(overProject.allowed, false);
+  assert.match(overProject.reason, /exceeds budget/);
+
+  // Provider quota for B sees only B's holds: 0 + 5 fits a quota of 10.
+  assert.equal(ledger.setProviderQuota("provider-b", 10).accepted, true);
+  const bFits = ledger.checkBudget({
+    summary: ledger.summarize("p2"), budgetUsd: 100, authorized: true,
+    requestedUsd: 5, provider: "provider-b",
+  });
+  assert.equal(bFits.allowed, true);
+
+  // Provider quota for A still counts A's hold across projects: 8 + 5 > 10.
+  assert.equal(ledger.setProviderQuota("provider-a", 10).accepted, true);
+  const aOver = ledger.checkBudget({
+    summary: ledger.summarize("p2"), budgetUsd: 100, authorized: true,
+    requestedUsd: 5, provider: "provider-a",
+  });
+  assert.equal(aOver.allowed, false);
+  assert.match(aOver.reason, /quota exhausted/);
+});
+
 test("importReservations: loads journal holds, skips invalid and duplicate rows", () => {
   const ledger = new CostLedger();
   const { imported, skipped } = ledger.importReservations([

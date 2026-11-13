@@ -14,24 +14,37 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import {
   JournalStoreError,
+  initializeLedger,
+  readLedgerIdentity,
+  storeProof,
+  verifyOwnerSession,
   RESERVATIONS_SCHEMA,
   durableCheckAndReserve,
   durableReconcile,
   durableRelease,
   readActiveReservations,
 } from "../src/reservationJournal.ts";
-import type { DurableGateArgs } from "../src/reservationJournal.ts";
+import type { DurableGateArgs, OwnerSessionProvenance } from "../src/reservationJournal.ts";
 import type { CostEntry, OwnerQuotaPolicy } from "../src/cost.ts";
 
 const HELPER = fileURLToPath(new URL("./helpers/gate-child.ts", import.meta.url));
 const OWNER = "owner-test";
+
+function session(overrides: Partial<OwnerSessionProvenance> = {}): OwnerSessionProvenance {
+  return {
+    ownerId: OWNER,
+    sessionId: "sess-test-0123456789abcdef",
+    issuedAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
 
 function seedEntry(overrides: Partial<CostEntry> = {}): CostEntry {
   return {
@@ -60,7 +73,7 @@ type AdmitArgs = Omit<DurableGateArgs, "dbPath">;
 function admitArgs(overrides: Partial<AdmitArgs> = {}): AdmitArgs {
   return {
     seedEntries: [seedEntry()],
-    ownerIdentity: OWNER,
+    ownerSession: session(),
     budgetUsd: 10,
     authorized: true,
     projectId: "p1",
@@ -357,14 +370,48 @@ test("missing store is genuinely new state; a directory is not", () => {
   assert.match(denied.decision.reason, /cannot be opened|corrupt/i);
 });
 
-test("durable admission requires owner provenance; mismatched signer denied", () => {
+test("durable admission requires a verified owner session, not a bare string", () => {
   const dir = mkdtempSync(join(tmpdir(), "ff020-owner-"));
   const dbPath = join(dir, "reservations.db");
 
-  const noOwner = durableCheckAndReserve(gate(dbPath, { ownerIdentity: "" }));
-  assert.equal(noOwner.decision.allowed, false);
-  assert.match(noOwner.decision.reason, /explicit owner identity/);
-  assert.equal(noOwner.reservationId, null);
+  // A bare identity string is not provenance.
+  const asString = durableCheckAndReserve(
+    gate(dbPath, { ownerSession: "owner-test" as unknown as OwnerSessionProvenance }),
+  );
+  assert.equal(asString.decision.allowed, false);
+  assert.match(asString.decision.reason, /verified owner session/);
+
+  // Missing session, anonymous owner, short token, bad/future timestamps.
+  for (const bad of [
+    gate(dbPath, { ownerSession: undefined as unknown as OwnerSessionProvenance }),
+    gate(dbPath, { ownerSession: session({ ownerId: "" }) }),
+    gate(dbPath, { ownerSession: session({ sessionId: "short" }) }),
+    gate(dbPath, { ownerSession: session({ issuedAt: "not-a-time" }) }),
+    gate(dbPath, { ownerSession: session({ issuedAt: new Date(Date.now() + 3_600_000).toISOString() }) }),
+    gate(dbPath, {
+      ownerSession: session({
+        issuedAt: new Date(Date.now() - 7_200_000).toISOString(),
+        expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
+      }),
+    }),
+  ]) {
+    const denied = durableCheckAndReserve(bad);
+    assert.equal(denied.decision.allowed, false);
+    assert.match(denied.decision.reason, /denied: /);
+    assert.equal(denied.reservationId, null);
+  }
+
+  // verifyOwnerSession unit surface: valid session verifies, expired does not.
+  assert.equal(verifyOwnerSession(session()).ok, true);
+  assert.equal(
+    verifyOwnerSession(session({ expiresAt: new Date(Date.now() - 1_000).toISOString() })).ok,
+    false,
+  );
+});
+
+test("unknown-spend quota must be signed by the session owner; mismatched signer denied", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-sign-"));
+  const dbPath = join(dir, "reservations.db");
 
   const forged: DurableGateArgs = {
     ...gate(dbPath, { reservationId: "r-forged", requestedUsd: 1 }),
@@ -488,4 +535,181 @@ test("durable release frees headroom; reconcile drops only orphaned holds", () =
 
   const again = durableReconcile(dbPath, ["r-new"]);
   assert.deepEqual(again.released, []);
+});
+
+test("durable global cap counts holds on OTHER providers: $8 on A + $5 on B under $10 denies", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-twoprovider-"));
+  const dbPath = join(dir, "reservations.db");
+  const seeds: CostEntry[] = [
+    seedEntry({ entryId: "known-p1", projectId: "p1", billedUsd: 0 }),
+    seedEntry({ entryId: "known-p2", projectId: "p2", billedUsd: 0 }),
+  ];
+
+  const first = durableCheckAndReserve(
+    gate(dbPath, {
+      seedEntries: seeds,
+      projectId: "p1",
+      provider: "provider-a",
+      requestedUsd: 8,
+      reservationId: "r-p1-a",
+      globalCapUsd: 10,
+      budgetUsd: 100,
+    }),
+  );
+  assert.equal(first.decision.allowed, true);
+
+  // True global exposure is 0 known + 8 held (provider A) + 5 requested
+  // (provider B) = 13 > 10: must DENY even though provider B holds nothing.
+  const second = durableCheckAndReserve(
+    gate(dbPath, {
+      seedEntries: seeds,
+      projectId: "p2",
+      provider: "provider-b",
+      requestedUsd: 5,
+      reservationId: "r-p2-b",
+      globalCapUsd: 10,
+      budgetUsd: 100,
+    }),
+  );
+  assert.equal(second.decision.allowed, false);
+  assert.match(second.decision.reason, /global hard cap/);
+});
+
+test("two processes racing different providers under one global cap: exactly one wins", { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-2prace-"));
+  const dbPath = join(dir, "reservations.db");
+  const seeds: CostEntry[] = [
+    seedEntry({ entryId: "known-p1", projectId: "p1", billedUsd: 0 }),
+    seedEntry({ entryId: "known-p2", projectId: "p2", billedUsd: 0 }),
+  ];
+
+  const base = admitArgs({ seedEntries: seeds, budgetUsd: 100, globalCapUsd: 10 });
+  const [a, b] = await Promise.all([
+    raceOnce(dbPath, { ...base, projectId: "p1", provider: "provider-a", requestedUsd: 8, reservationId: "r-mp-a" }),
+    raceOnce(dbPath, { ...base, projectId: "p2", provider: "provider-b", requestedUsd: 5, reservationId: "r-mp-b" }),
+  ]);
+  const winners = [a, b].filter((v) => v.allowed);
+  const losers = [a, b].filter((v) => !v.allowed);
+  assert.equal(winners.length, 1);
+  assert.equal(losers.length, 1);
+  assert.match(losers[0].reason, /global hard cap/);
+  assert.equal(readActiveReservations(dbPath).active.length, 1);
+});
+
+test("cross-process idempotent retry: same id+terms admitted once, conflicting reuse denied", { timeout: 60_000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-xretry-"));
+  const dbPath = join(dir, "reservations.db");
+
+  const first = await raceOnce(dbPath, admitArgs({ requestedUsd: 4, reservationId: "r-dup" }));
+  assert.equal(first.allowed, true);
+
+  // Identical retry from a second process: allowed, same hold, no double-count.
+  const replay = await raceOnce(dbPath, admitArgs({ requestedUsd: 4, reservationId: "r-dup" }));
+  assert.equal(replay.allowed, true);
+  assert.equal(replay.reservationId, "r-dup");
+  const held = readActiveReservations(dbPath);
+  assert.equal(held.active.length, 1);
+  assert.equal(held.active[0].amountUsd, 4);
+
+  // Conflicting reuse from a third process: denied.
+  const conflict = await raceOnce(dbPath, admitArgs({ requestedUsd: 9, reservationId: "r-dup" }));
+  assert.equal(conflict.allowed, false);
+  assert.match(conflict.reason, /different terms/);
+  assert.equal(readActiveReservations(dbPath).active.length, 1);
+});
+
+test("ledger identity: first run initializes, recreation under an expected id denies", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-ledger-"));
+  const dbPath = join(dir, "reservations.db");
+  const sess = session();
+
+  assert.deepEqual(readLedgerIdentity(dbPath), { status: "missing" });
+
+  const init = initializeLedger(dbPath, sess);
+  assert.equal(typeof init.ledgerId, "string");
+  assert.ok(init.ledgerId.length > 0);
+  assert.equal(init.fresh, true);
+  const identity = readLedgerIdentity(dbPath);
+  assert.equal(identity.status, "initialized");
+  assert.equal((identity as { ledgerId: string }).ledgerId, init.ledgerId);
+
+  // Re-initializing adopts the existing ledger, never re-stamps it.
+  const again = initializeLedger(dbPath, sess);
+  assert.equal(again.ledgerId, init.ledgerId);
+  assert.equal(again.fresh, false);
+
+  // First admission without an expectation proceeds against the ledger.
+  const first = durableCheckAndReserve(gate(dbPath, { reservationId: "r-ledger-1", requestedUsd: 4 }));
+  assert.equal(first.decision.allowed, true);
+  assert.equal(first.ledgerId, init.ledgerId);
+  assert.equal(first.ledgerFresh, false);
+
+  // The same store under the matching expectation admits.
+  const matched = durableCheckAndReserve(
+    gate(dbPath, { reservationId: "r-ledger-2", requestedUsd: 4, expectedLedgerId: init.ledgerId }),
+  );
+  assert.equal(matched.decision.allowed, true);
+  assert.equal(matched.ledgerId, init.ledgerId);
+
+  // A mismatched expectation denies: the store may have been replaced.
+  const mismatch = durableCheckAndReserve(
+    gate(dbPath, { reservationId: "r-ledger-3", requestedUsd: 1, expectedLedgerId: "ledger-that-is-not-this-one" }),
+  );
+  assert.equal(mismatch.decision.allowed, false);
+  assert.match(mismatch.decision.reason, /identity mismatch/);
+
+  // Simulate a deleted/recreated DB after active spending: the supervisor's
+  // expected id no longer resolves, so admission denies instead of
+  // silently starting from empty headroom.
+  rmSync(dbPath);
+  assert.deepEqual(readLedgerIdentity(dbPath), { status: "missing" });
+  const recreated = durableCheckAndReserve(
+    gate(dbPath, { reservationId: "r-ledger-4", requestedUsd: 1, expectedLedgerId: init.ledgerId }),
+  );
+  assert.equal(recreated.decision.allowed, false);
+  assert.match(recreated.decision.reason, /missing/);
+  // No implicit replacement was minted by the denied call.
+  assert.deepEqual(readLedgerIdentity(dbPath), { status: "missing" });
+});
+
+test("ledger identity: zero-length or legacy store under an expected id denies", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-legacydb-"));
+
+  // Zero-length file that previously held a ledger: valid SQLite shell,
+  // but no identity marker — must not be adopted blindly.
+  const zeroed = join(dir, "zeroed.db");
+  writeFileSync(zeroed, "");
+  const zeroedDenied = durableCheckAndReserve(
+    { ...admitArgs({ requestedUsd: 1 }), dbPath: zeroed, expectedLedgerId: "some-ledger-id" },
+  );
+  assert.equal(zeroedDenied.decision.allowed, false);
+  assert.match(zeroedDenied.decision.reason, /no ledger identity marker|missing/);
+
+  // Legacy store (reservations table, no ledger_meta): same denial.
+  const legacy = join(dir, "legacy.db");
+  {
+    const db = new DatabaseSync(legacy);
+    db.exec(RESERVATIONS_SCHEMA);
+    db.close();
+  }
+  assert.deepEqual(readLedgerIdentity(legacy), { status: "legacy" });
+  const legacyDenied = durableCheckAndReserve(
+    { ...admitArgs({ requestedUsd: 1 }), dbPath: legacy, expectedLedgerId: "some-ledger-id" },
+  );
+  assert.equal(legacyDenied.decision.allowed, false);
+  assert.match(legacyDenied.decision.reason, /no ledger identity marker/);
+});
+
+test("store proof: pinned synchronous FULL, delete journal mode, integrity ok", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ff020-proof-"));
+  const dbPath = join(dir, "reservations.db");
+
+  const admitted = durableCheckAndReserve(gate(dbPath, { reservationId: "r-proof", requestedUsd: 2 }));
+  assert.equal(admitted.decision.allowed, true);
+
+  const proof = storeProof(dbPath);
+  assert.equal(proof.journalMode.toLowerCase(), "delete");
+  assert.equal(proof.synchronous, 2);
+  assert.equal(proof.integrity, "ok");
+  assert.equal(proof.ledgerId, admitted.ledgerId);
 });

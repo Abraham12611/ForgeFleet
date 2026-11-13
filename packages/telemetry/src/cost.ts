@@ -462,9 +462,12 @@ export class CostLedger {
   }
 
   /**
-   * Reserved totals per scope. Project ceilings use the project scope;
-   * global and provider ceilings MUST count every project, otherwise two
-   * projects could each exhaust an account-wide cap.
+   * Reserved totals per scope. The project scope counts every hold for the
+   * project on ANY provider (a project budget binds the project, not one
+   * provider). The GLOBAL scope is strictly unfiltered: it counts every
+   * hold on every project and every provider, otherwise two providers
+   * could each exhaust an account-wide cap. Only the provider scope is
+   * filtered to the admission's provider.
    */
   private scopesFor(
     projectId: string | null,
@@ -472,8 +475,8 @@ export class CostLedger {
     excludeSelfUsd = 0,
   ): ReservedScopes {
     return {
-      project: this.reservedFor(projectId, provider) - excludeSelfUsd,
-      allProjects: this.reservedFor(null, provider) - excludeSelfUsd,
+      project: this.reservedFor(projectId) - excludeSelfUsd,
+      allProjects: this.reservedFor(null) - excludeSelfUsd,
       provider: provider === undefined ? 0 : this.reservedFor(null, provider) - excludeSelfUsd,
     };
   }
