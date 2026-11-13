@@ -1,0 +1,40 @@
+{
+  "version": "v1.0",
+  "goal_id": "GOAL-private-release-signoff",
+  "commit": "TBD-built-from-commit",
+  "tasks": [
+    {"id": "FF-022", "status": "done", "evidence_ref": "rollback rehearsal log"},
+    {"id": "FF-023", "status": "done", "evidence_ref": "security regression report"},
+    {"id": "FF-024", "status": "done", "evidence_ref": "this digest"}
+  ],
+  "prs": [
+    {
+      "number": 100,
+      "base": "develop",
+      "head_sha": "deadbeef",
+      "merged": true,
+      "checks_green": true,
+      "author": "agent-e01",
+      "reviewer": "coordinator",
+      "owner_approval": null
+    }
+  ],
+  "gates": {
+    "functional.goal_observed": {"status": "pass", "evidence": "REPLACE with live observation ref", "observation": "fixture"},
+    "functional.dependency_trace": {"status": "pass", "evidence": "REPLACE with task evidence refs", "observation": "fixture"},
+    "functional.test_suite": {"status": "pass", "evidence": "REPLACE with test command output", "observation": "fixture"},
+    "functional.pr_sha_policy": {"status": "pass", "evidence": "REPLACE with head SHA + check run", "observation": "fixture"},
+    "functional.known_gaps": {"status": "pass", "evidence": "REPLACE or set conditional with issue link", "observation": "fixture"},
+    "safety.no_secrets": {"status": "pass", "evidence": "REPLACE with scan command output", "observation": "fixture"},
+    "safety.lease_idempotency": {"status": "pass", "evidence": "REPLACE with retry/lease test ref", "observation": "fixture"},
+    "safety.owner_only_ops": {"status": "pass", "evidence": "REPLACE with policy deny-test ref", "observation": "fixture"},
+    "safety.sessions_rollback": {"status": "pass", "evidence": "REPLACE with restore rehearsal ref", "observation": "fixture"},
+    "safety.resource_limits": {"status": "pass", "evidence": "REPLACE with budget/admission ref", "observation": "fixture"},
+    "acceptance.mobile_progress": {"status": "pass", "evidence": "REPLACE with phone walkthrough ref", "observation": "fixture"},
+    "acceptance.sleep_mode": {"status": "pass", "evidence": "REPLACE with sleep behavior ref", "observation": "fixture"},
+    "acceptance.explicit_approval": {"status": "pass", "evidence": "REPLACE with owner approval ref", "observation": "fixture"},
+    "signoff.g8_live_verified": {"status": "conditional", "evidence": "G8 open: live checks/SHA/artifacts not yet independently verified", "observation": "fixture", "issue": "#24"}
+  },
+  "known_gaps": [],
+  "secrets_scan_clean": true
+}
