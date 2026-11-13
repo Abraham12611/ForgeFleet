@@ -102,3 +102,18 @@ jobs:
         with:
           name: ci-report
           path: ci-report.md
+
+  # FF-005 (PR #45, head-coordinator direction): the private-deploy
+  # scaffold's fixture-only selftest must stay green. Non-deploying by
+  # design: no secrets, no services, no VPS — disposable temp dirs only.
+  # Additive: no existing job touched.
+  deploy-selftest:
+    name: deploy selftest (FF-005 scaffold, fixture-only)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Deploy scaffold selftest (non-deploying)
+        run: bash scripts/deploy/selftest.sh

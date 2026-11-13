@@ -1,0 +1,64 @@
+# ForgeFleet orca-bridge daemon (private phase) — systemd USER unit.
+# Reference minimal example: ../example-orca-bridge.service (kept unchanged).
+#
+# CANONICAL SINGLE-SUPERVISOR MODEL (FF-005): the bridge runs ONLY here, as a
+# user service under the operator login UID — the same UID that owns
+# orca-serve.service — and NEVER as a compose service (compose owns db and
+# paperclip only). Rationale: the bridge execs the Orca user-session CLI
+# (ORCA_CLI_COMMAND / orca-ide). Same-UID native execution inherits the login
+# session context with ZERO credential mounts; containerizing it would force
+# mounting the CLI, session bus and home credentials into Docker.
+# Install (operator login user, never root):
+#   systemctl --user enable --now forgefleet-bridge.service
+[Unit]
+Description=ForgeFleet Orca Bridge (private, loopback only, user service)
+After=network-online.target
+Wants=network-online.target
+# Explicitly NOT BoundTo/PartOf orca-serve.service: bridge reads Orca via the
+# version-matched CLI only and must never restart or reconfigure it.
+# Ordering vs the system-managed compose stack (db, paperclip) cannot use
+# After= across the user/system manager boundary, so startup gating is done
+# at runtime by wait-for-paperclip.sh (polls Paperclip health, fails closed).
+
+[Service]
+Type=simple
+ExecStartPre=/opt/forgefleet/scripts/deploy/guard-loopback.sh
+ExecStartPre=/opt/forgefleet/scripts/deploy/wait-for-paperclip.sh
+# State-dir precedence guard (runs last, closest to start): refuses startup
+# unless FORGEFLEET_BRIDGE_DATA_DIR is nonempty and exactly $STATE_DIRECTORY,
+# so a stale env-file assignment (even an empty one) can never silently
+# relocate SQLite WAL state. See scripts/deploy/guard-state-dir.sh.
+ExecStartPre=/opt/forgefleet/scripts/deploy/guard-state-dir.sh
+# Entrypoint matches the actual server (PR #63: package.json start script
+# `node src/main.ts`, Node >=24 type-stripping, no dist build step).
+ExecStart=/usr/bin/env node src/main.ts
+WorkingDirectory=/opt/forgefleet/services/orca-bridge
+EnvironmentFile=%h/.config/forgefleet/bridge.env
+# Data dir target: the server defaults to a cwd-relative ./bridge-data,
+# which is wrong under a daemon, so the unit pins it to the StateDirectory.
+# This line alone does NOT win over an env-file assignment, so the
+# guard-state-dir.sh ExecStartPre below enforces nonempty exact equality
+# with $STATE_DIRECTORY and refuses startup otherwise. This must equal the
+# operator-scripts default ($HOME/.local/state/...).
+Environment=FORGEFLEET_BRIDGE_DATA_DIR=%S/forgefleet-bridge
+# Operator-owned writable state (SQLite WAL store included). For user units
+# this creates ~/.local/state/forgefleet-bridge owned by the operator UID and
+# exports it as $STATE_DIRECTORY; the directory stays writable under
+# ProtectSystem=strict. /var/lib is intentionally NOT used here.
+StateDirectory=forgefleet-bridge
+# Minimum write paths, explicitly permitted and nothing else.
+ReadWritePaths=%S/forgefleet-bridge
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# ProtectHome stays OFF on purpose: this unit runs as the operator user and
+# execs that same user's Orca CLI, which reads/writes the operator HOME
+# (sessions, logs). Same-UID execution adds no new home exposure beyond the
+# operator's own shell. Containment here is the loopback-only bind plus never
+# managing the Orca service — both enforced by guards, not by this sandbox.
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,80 @@
+# ForgeFleet private-phase stack (FF-005).
+#
+# Isolated alongside the existing Orca user service. This file never touches
+# orca-serve.service: no shared network, no shared volume, no restart hook.
+# All published ports bind 127.0.0.1 only. Public ingress stays disabled
+# until the auth/realtime gates in docs/03-architecture/infra-deployment.md pass.
+#
+# SINGLE-SUPERVISOR RULE (canonical FF-005 topology): this file owns ONLY the
+# containerized services (db, paperclip). The orca-bridge daemon NEVER runs
+# here — it runs as the systemd user unit
+# infra/systemd/forgefleet-bridge.service under the operator login UID, so it
+# can exec the Orca user-session CLI without mounting home credentials into
+# Docker. Do not re-add a bridge service: deploy scripts and selftest refuse it.
+#
+# Image tags and health paths are TBD until E01 pins the Paperclip release.
+# Required variables fail closed (${VAR:?message}) instead of guessing.
+# PAPERCLIP_HEALTH_PATH is single-sourced with scripts/deploy/healthcheck.sh.
+
+name: forge-private
+
+services:
+  db:
+    image: "${POSTGRES_IMAGE:?set POSTGRES_IMAGE to the pinned PostgreSQL major version}"
+    restart: unless-stopped
+    env_file:
+      - path: /etc/forgefleet/postgres.env
+        required: true
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - forge-internal
+    # No ports: reachable only inside forge-internal.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:?}\" -d \"$${POSTGRES_DB:?}\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  paperclip:
+    image: "${PAPERCLIP_IMAGE:?set PAPERCLIP_IMAGE to the pinned Paperclip release}"
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - path: /etc/forgefleet/paperclip.env
+        required: true
+    environment:
+      PAPERCLIP_DEPLOYMENT_MODE: private
+    ports:
+      # Loopback only. Remote/private reach via Tailscale to the host.
+      - "127.0.0.1:${PAPERCLIP_PORT:-8080}:8080"
+    volumes:
+      - context-store:/var/lib/forgefleet/context
+    networks:
+      - forge-internal
+    healthcheck:
+      # Path is a placeholder until E01 confirms the pinned build's endpoint.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080$${PAPERCLIP_HEALTH_PATH:-/healthz} | grep -q ok"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+networks:
+  forge-internal:
+    internal: true
+
+volumes:
+  pgdata:
+  context-store:

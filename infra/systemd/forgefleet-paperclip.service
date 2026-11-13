@@ -1,0 +1,25 @@
+# ForgeFleet private Paperclip stack (compose wrapper). Does NOT manage orca-serve.
+# Canonical FF-005 topology: this wrapper owns db + paperclip ONLY. The bridge
+# is the sibling user unit forgefleet-bridge.service, never a compose service.
+[Unit]
+Description=ForgeFleet Paperclip private stack (compose)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+# Explicitly NOT BoundTo/PartOf orca-serve.service: this stack must survive
+# and never trigger any action on the operator's Orca user service.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+WorkingDirectory=/opt/forgefleet/infra
+EnvironmentFile=/etc/forgefleet/paperclip.env
+ExecStart=/usr/bin/docker compose -f /opt/forgefleet/infra/docker-compose.private.yml up -d db paperclip
+ExecStop=/usr/bin/docker compose -f /opt/forgefleet/infra/docker-compose.private.yml stop paperclip
+# Rollback is scripts/deploy/rollback-private.sh, never an Orca restart.
+
+[Install]
+WantedBy=multi-user.target
