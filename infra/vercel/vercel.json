@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "//": "FF-022 preview-safe frontend. Static assets only: no functions, no secrets. Root directory is set after E01 identifies the real apps/web or upstream ui path; do not guess it here.",
+  "buildCommand": "npm run build --workspace apps/web",
+  "outputDirectory": "apps/web/dist",
+  "framework": "vite",
+  "rewrites": [{ "source": "/((?!api/|auth/|socket.io/).*)", "destination": "/index.html" }],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "X-Frame-Options", "value": "DENY" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "Content-Security-Policy", "value": "default-src 'self'; connect-src 'self' https://api.example.invalid; img-src 'self' data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'" }
+      ]
+    }
+  ],
+  "//env": "VITE_PUBLIC_API_URL (public HTTPS URL only) is the sole backend pointer. No DATABASE_URL, tokens, or GitHub App secrets in Vercel.",
+  "env": {
+    "VITE_PUBLIC_API_URL": "https://api.example.invalid"
+  }
+}

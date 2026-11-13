@@ -206,9 +206,19 @@ for pat in 'BRIDGE_AUTH_SECR'"ET" 'BRIDGE_BIN'"D" 'BRIDGE_POR'"T=" 'BRIDGE_NO_NE
   fi
 done
 [ "$stale" -eq 0 ] && ok "no stale contract names in live scope"
-# Fence specificity: a complete snapshot without RESTORE_FENCED still refuses.
+# Fence specificity: a manifest-complete snapshot without RESTORE_FENCED
+# still refuses (the manifest gate passes, so this proves the FENCE).
 fence_dir="$(mktemp -d)"
-touch "$fence_dir/pg.dump" "$fence_dir/context.tgz"
+printf 'x' > "$fence_dir/pg.dump"; printf 'x' > "$fence_dir/context.tgz"
+python3 - "$fence_dir" <<'EOF'
+import hashlib, json, sys
+d = sys.argv[1]
+arts = {}
+for name in ("pg.dump", "context.tgz"):
+    arts[name] = {"path": name,
+                  "sha256": hashlib.sha256(open(f"{d}/{name}", "rb").read()).hexdigest()}
+json.dump({"artifacts": arts}, open(f"{d}/manifest.json", "w"))
+EOF
 if BACKUP_SNAPSHOT="$fence_dir" "$D/restore.sh" >/dev/null 2>&1; then
   bad "restore runs without operator fence"
 else
@@ -267,6 +277,42 @@ if bash "$D/tests/test-preflight-node-floor.sh" >/dev/null 2>&1; then
   ok "preflight fixture passed (Node <24 fails closed)"
 else
   bad "preflight fixture failed (Node floor is not a hard failure)"
+fi
+
+# 17. E17/E21 safe-restore gate + signed live evidence (PR #51 follow-up).
+# (a) restore.sh fixture mode never deletes: no rm -rf in live code
+# (comments stripped, so prose cannot trip this guard).
+if no_comments "$D/restore.sh" | grep -q 'rm -rf'; then
+  bad "restore.sh still deletes caller-supplied paths"
+else
+  ok "restore.sh carries no deletion of caller-supplied paths"
+fi
+# (b) deploy-split --apply demands signed evidence; a bare env flag never
+# suffices (comment-stripped live code must not consult FORGEFLEET_LIVE_OK).
+if no_comments "$D/deploy-split.sh" | grep -q 'FORGEFLEET_LIVE_OK'; then
+  bad "deploy-split.sh still honors env-only live enable"
+else
+  ok "deploy-split.sh honors no env-only live enable"
+fi
+grep -q -- '--evidence' "$D/deploy-split.sh" \
+  && ok "deploy-split.sh gates --apply behind --evidence" \
+  || bad "deploy-split.sh has no --evidence gate"
+# (c) Live restore without a manifest is refused, not warned past.
+if no_comments "$D/restore.sh" | grep -q 'proceeding on file presence only'; then
+  bad "restore.sh still restores live snapshots without a manifest"
+else
+  ok "restore.sh refuses live snapshots without a manifest"
+fi
+# (d) Refusal + sentinel + evidence fixtures (disposable, no Docker/VPS).
+if bash "$D/tests/test-restore-safety.sh" >/dev/null 2>&1; then
+  ok "restore-safety fixture passed (home/repo/root/symlink/cwd refusals + sentinels)"
+else
+  bad "restore-safety fixture failed"
+fi
+if bash "$D/tests/test-deploy-evidence.sh" >/dev/null 2>&1; then
+  ok "deploy-evidence fixture passed (signed proof gate + mandatory manifest)"
+else
+  bad "deploy-evidence fixture failed"
 fi
 
 echo "---"

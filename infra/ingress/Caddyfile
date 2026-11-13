@@ -1,0 +1,83 @@
+# Authenticated public ingress. Bridge is NEVER routed here.
+#
+# STAGED FILE — starts only via deploy-split.sh --apply (split profile) after
+# the split-compatibility matrix records PASS for S-01..S-07. No owner VPS
+# action or public activation happens from this repo without explicit owner
+# approval. E07 owns the auth semantics below; the edge enforces shape only.
+#
+# Upstream names track the CANONICAL compose stack
+# (infra/docker-compose.private.yml): service `paperclip`, loopback
+# `PAPERCLIP_PORT` default 8080 (see infra/paperclip.env.example). If E01
+# changes the pinned port/health path, this file changes with it.
+# Principles (see docs/03-architecture/infra-deployment.md):
+#  - Only /healthz is unauthenticated (liveness, no data).
+#  - /api/*, /auth/*, /socket.io/* reverse-proxy to paperclip and
+#    require a valid session (forward_auth to paperclip /auth/verify —
+#    E07 must implement that endpoint; until then split stays shut).
+#    The browser never calls the bridge directly.
+#  - No route references the bridge namespace (/v1/attempts, /v1/events,
+#    /v1/health/live, /bridge/*). Any such path is 404 at the edge.
+#  - GitHub webhooks enter only via /api/webhooks/github with HMAC
+#    verification inside paperclip (E16); the edge only rate-limits.
+#  - CORS allowlist is Vercel frontend origins only; Tailscale-only
+#    hostnames must never be trusted as browser origins.
+{
+	auto_https disable_certs
+	admin off
+}
+
+# Loopback only. Public 443 reach comes from host firewall/NAT mapping after
+# owner-approved activation — never from compose publishing non-loopback ports.
+:80 {
+	# Security headers on every response.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+		-Server
+	}
+
+	# Liveness only. No auth, no data.
+	handle /healthz {
+		reverse_proxy paperclip:8080
+	}
+
+	# Explicitly close every bridge-shaped path at the edge.
+	# Defense in depth: even if a backend regressed, the edge 404s.
+	handle /v1/* {
+		respond "Not Found" 404
+	}
+	handle /bridge/* {
+		respond "Not Found" 404
+	}
+
+	# Authenticated API surface.
+	handle /api/* {
+		forward_auth paperclip:8080 {
+			uri /auth/verify
+			copy_headers Cookie Authorization
+		}
+		reverse_proxy paperclip:8080
+	}
+	handle /auth/* {
+		reverse_proxy paperclip:8080
+	}
+	handle /socket.io/* {
+		forward_auth paperclip:8080 {
+			uri /auth/verify
+			copy_headers Cookie Authorization
+		}
+		reverse_proxy paperclip:8080
+	}
+
+	# Default deny: frontend assets live on Vercel, not here.
+	handle {
+		respond "Not Found" 404
+	}
+
+	log {
+		format json
+	}
+}

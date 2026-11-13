@@ -156,3 +156,32 @@ systemctl --user enable --now forgefleet-bridge.service
 
 Run `./scripts/deploy/selftest.sh` in CI or locally to verify scaffold
 shape and isolation guards without Docker, secrets, or the VPS.
+
+## Split-phase delta (FF-022, this PR, layered on the scaffold above)
+
+The private stack stays exactly as documented above. FF-022 adds the
+**opt-in** split topology for the Vercel/Vultr release, inactive by default:
+
+- `docker-compose.private.yml` gains an `edge` service under
+  `profiles: ["split"]` (Caddy reverse proxy, loopback-only ports).
+  Default `up -d db paperclip` never starts it.
+- `ingress/Caddyfile` is the staged active ingress: public allowlist only
+  (`/healthz` unauthenticated; `/api`, `/auth`, `/socket.io` via
+  `forward_auth`); explicit `404` for `/v1/*` and `/bridge/*`; no route
+  ever dials the bridge. `ingress/Caddyfile.disabled.example` stays as the
+  historical gated reference. Activation requires
+  `deploy-split.sh --apply`, which fails closed while any S-01…S-07 row of
+  `split-compatibility-matrix.md` is OPEN.
+- `vercel/vercel.json` is preview-safe static frontend config (public API
+  URL only, no secrets). No Vercel project is created by this repo.
+- `backup.sh`/`restore.sh` additionally write/verify `manifest.json`
+  (sha256 per artifact) and support `--fixture` rehearsals with no Docker.
+- `deploy-split.sh` / `rollback-split.sh` extend the canonical
+  `--apply`-gated scripts: split ingress start, contract-compatibility
+  rollback gate (backend delegates to `rollback-private.sh`; Vercel
+  promotion stays an explicit owner action, never automated).
+- `verify-split.sh` prefers the **real** Caddy toolchain
+  (`caddy validate` + adapted-JSON assertions) when a caddy binary is
+  available, and says so; otherwise it labels its static fallback as such.
+- `FF-022-vs-FF-005-reconciliation.md` records the one-path decisions and
+  the comparison the coordinator review requested.

@@ -23,3 +23,16 @@ Hard rules (also enforced by `selftest.sh`): scripts never reference
 service (the bridge runs only as the systemd user unit), never emit a
 mutating `systemctl` verb, never invoke a bare `orca` binary on Linux, and
 never print secret values (presence is reported as `[set]`/`[missing]`).
+
+## Split-phase delta (FF-022, layered on the table above)
+
+Same conventions (`--apply` gate, dry-run default, no secret values). The
+private scripts above are untouched in behavior; FF-022 only adds:
+
+| Script | Default (no flags) | `--apply` |
+|---|---|---|
+| `deploy-split.sh` | plan + split-matrix gate check (fails closed on OPEN S-01…S-07) | starts `edge` profile only |
+| `rollback-split.sh` | compatibility plan (refuses cross-contract frontend-only) | backend delegates to `rollback-private.sh`; frontend steps are owner actions |
+| `verify-split.sh` | shape checks + real `caddy validate`/`adapt` when available | n/a |
+| `verify-restore.sh` | fixture backup→restore→diff rehearsal | n/a |
+| `tests/test_deploy_contracts.py` | stdlib contract suite (incl. canonical `selftest.sh`) | n/a |
