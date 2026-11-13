@@ -28,6 +28,11 @@ esac; done
 if want_apply --apply "$@"; then APPLY=1; else APPLY=0; fi
 
 # --- Fixture rehearsal mode (no Docker, no fence override needed) ---
+# E17/E21 safe gate (PR #51 follow-up): the target MUST be a fresh,
+# non-existing leaf inside the allowlisted fixture root
+# (${FF_FIXTURE_ROOT:-${TMPDIR:-/tmp}}). Existing directories are never
+# deleted — there is no rm -rf of caller-supplied paths. Refuses /, $HOME,
+# the repo, the cwd, symlinks, and any path escaping the fixture root.
 if [ -n "$MANIFEST" ]; then
   [ -n "$TARGET_DIR" ] || { warn "--manifest requires --target-dir DIR"; exit 2; }
   [ -f "$MANIFEST" ] || { warn "manifest not found: $MANIFEST"; exit 2; }
@@ -42,7 +47,8 @@ for label, art in manifest["artifacts"].items():
     assert got == art["sha256"], f"{label} sha256 MISMATCH (want {art['sha256']} got {got})"
 print("manifest sha256 OK")
 EOF
-  rm -rf "$TARGET_DIR"; mkdir -p "$TARGET_DIR/context"
+  TARGET_DIR="$(require_safe_fixture_dir "$TARGET_DIR")" || exit 2
+  mkdir -p "$TARGET_DIR/context"
   cp "$src"/*.dump "$TARGET_DIR/" 2>/dev/null || true
   for tgz in "$src"/*.tgz; do
     [ -f "$tgz" ] || continue
@@ -72,8 +78,20 @@ if [ "${RESTORE_FENCED:-0}" != "1" ]; then
   exit 2
 fi
 
+# E17/E21 (PR #51 follow-up): a SHA-verified manifest is MANDATORY on the
+# live path. Pre-FF-022 snapshots without one are refused — file presence
+# alone never authorizes a live restore. RESTORE_MANIFEST may point at the
+# manifest explicitly (used by rollback-split.sh when --target is a
+# manifest file); otherwise the snapshot's own manifest.json is verified.
+LIVE_MANIFEST=""
 if [ -f "$snap/manifest.json" ]; then
-  python3 - "$snap/manifest.json" "$snap" <<'EOF'
+  LIVE_MANIFEST="$snap/manifest.json"
+elif [ -n "${RESTORE_MANIFEST:-}" ]; then
+  LIVE_MANIFEST="$RESTORE_MANIFEST"
+fi
+[ -n "$LIVE_MANIFEST" ] && [ -f "$LIVE_MANIFEST" ] \
+  || die "refusing live restore: no SHA-verified manifest (snapshot manifest.json or RESTORE_MANIFEST is mandatory)"
+python3 - "$LIVE_MANIFEST" "$snap" <<'EOF'
 import hashlib, json, sys
 manifest = json.load(open(sys.argv[1]))
 src = sys.argv[2]
@@ -83,9 +101,6 @@ for label, art in manifest["artifacts"].items():
     assert got == art["sha256"], f"{label} sha256 MISMATCH"
 print("manifest sha256 OK")
 EOF
-else
-  warn "snapshot has no manifest.json (pre-FF-022 backup) — proceeding on file presence only"
-fi
 
 [ "$APPLY" = 1 ] || { log "dry-run complete: nothing restored"; exit 0; }
 

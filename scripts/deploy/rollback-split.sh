@@ -45,7 +45,10 @@ confirm_live
   || { warn "set RESTORE_FENCED=1 before --apply (operator-held dispatch first)"; exit 2; }
 if [ "$COMPONENT" != "frontend" ]; then
   if [ -f "$TARGET" ]; then
-    BACKUP_SNAPSHOT="$(dirname "$TARGET")" "$FF_ROOT/scripts/deploy/restore.sh" --apply
+    # E17/E21: live restore requires a SHA-verified manifest — hand the
+    # tested manifest through explicitly (restore.sh verifies it).
+    BACKUP_SNAPSHOT="$(dirname "$TARGET")" RESTORE_MANIFEST="$TARGET" \
+      "$FF_ROOT/scripts/deploy/restore.sh" --apply
   else
     PREV_PAPERCLIP_IMAGE="$TARGET" "$FF_ROOT/scripts/deploy/rollback-private.sh" --apply
   fi

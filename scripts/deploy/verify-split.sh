@@ -61,9 +61,35 @@ fi
 
 if [ "$STATIC_ONLY" = 0 ]; then
   [ -n "$API" ] && [ -n "$WEB" ] || die "--live needs --api URL and --web URL"
+  # E17/E21: live verification is TLS-only. Plain-http probes cannot prove
+  # transport security, so they fail closed here.
+  case "$API" in
+    https://*) ;;
+    *) die "--live --api must be an https:// URL (got host without TLS)";;
+  esac
+  case "$WEB" in
+    https://*|"") ;;
+    *) die "--live --web must be an https:// URL";;
+  esac
   check "bridge port not reachable publicly" "! curl -fsS -m 5 '$API:8787/v1/health/live' >/dev/null 2>&1"
   check "edge denies /v1/* with 404"         "curl -s -o /dev/null -w '%{http_code}' '$API/v1/health/live' | grep -q 404"
   check "api health behind auth"             "curl -fsS -m 10 '$API/healthz' >/dev/null"
+  # Real TLS: the default CA bundle must accept the chain (curl fails closed
+  # on untrusted/expired/host-mismatched certs) and HSTS must be advertised.
+  check "tls chain verifies (real CA bundle)" \
+    "curl -fsS -m 10 --proto '=https' --tlsv1.2 '$API/healthz' >/dev/null"
+  check "hsts advertised on api" \
+    "curl -sSI -m 10 '$API/healthz' | grep -qi 'strict-transport-security'"
+  # Real CSRF: an unauthenticated cross-site-shaped state change must not
+  # succeed (2xx without session/CSRF token is a fail).
+  check "unauthenticated state change refused (csrf)" \
+    "! curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST '$API/api/session' | grep -qE '^2'"
+  # Real origin policy: a hostile Origin must never be reflected back, and
+  # the API must not wildcard browser origins with credentials.
+  check "hostile origin not reflected" \
+    "! curl -sSI -m 10 -H 'Origin: https://evil.example' '$API/api/' | grep -qi 'access-control-allow-origin: https://evil.example'"
+  check "no wildcard origin with credentials" \
+    "! curl -sSI -m 10 -H 'Origin: https://evil.example' '$API/api/' | grep -qi 'access-control-allow-origin: \*'"
 fi
 
 [ "$fail" -eq 0 ] || die "verify-split FAILED"

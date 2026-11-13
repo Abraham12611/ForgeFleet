@@ -190,6 +190,95 @@ class DeployContracts(unittest.TestCase):
             self.assertIn("--apply", text, f"{s}.sh gates mutation behind --apply")
             self.assertIn("forbid_orca_target", text)
 
+    def _fixture_snapshot(self, tmp: Path) -> Path:
+        out = tmp / "snaps"
+        p = sh("bash", str(DEPLOY / "backup.sh"), "--fixture", "--out", str(out))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        manifests = list(out.glob("*/manifest.json"))
+        self.assertEqual(len(manifests), 1)
+        return manifests[0]
+
+    def test_restore_never_deletes_existing_dir(self):
+        # P0 regression: a pre-existing target is refused and its sentinel
+        # survives byte-identical (no rm -rf of caller-supplied paths).
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._fixture_snapshot(Path(tmp))
+            victim = Path(tmp) / "victim"
+            victim.mkdir()
+            sentinel = victim / "sentinel.txt"
+            sentinel.write_text("precious\n")
+            p = sh("bash", str(DEPLOY / "restore.sh"), "--manifest",
+                   str(manifest), "--target-dir", str(victim))
+            self.assertNotEqual(p.returncode, 0, "existing target must be refused")
+            self.assertEqual(sentinel.read_text(), "precious\n",
+                            "sentinel must survive a refused restore")
+            self.assertFalse((victim / "LEASES_FENCED.json").exists(),
+                             "refused restore must write nothing into the existing dir")
+
+    def test_restore_refuses_protected_symlink_cwd(self):
+        # home / repo / root / cwd / symlink / relative / existing leaf.
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._fixture_snapshot(Path(tmp))
+            # Symlink whose resolution escapes the allowlisted root. (A link
+            # that stays inside the disposable root is still confined, so
+            # the escape case is the one that must refuse.)
+            link = Path(tmp) / "link"
+            link.symlink_to(Path("/"))
+            protected = [
+                str(Path.home() / "ff022-probe-should-not-exist"),
+                str(ROOT / "ff022-probe-should-not-exist"),
+                "/ff022-probe-should-not-exist",
+                str(Path.cwd() / "ff022-probe-should-not-exist"),
+                str(link / "ff022-probe-should-not-exist"),
+                "relative/ff022-probe-should-not-exist",
+            ]
+            leaf = Path(tmp) / "leaf"
+            p = sh("bash", str(DEPLOY / "restore.sh"), "--manifest",
+                   str(manifest), "--target-dir", str(leaf))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            protected.append(str(leaf))  # re-restore into the existing leaf
+            # An intra-root symlink still resolves inside the disposable
+            # root, so it stays confined and is accepted.
+            confined_link = Path(tmp) / "confined-link"
+            confined_link.symlink_to(Path(tmp))
+            p = sh("bash", str(DEPLOY / "restore.sh"), "--manifest",
+                   str(manifest), "--target-dir", str(confined_link / "leaf2"))
+            self.assertEqual(p.returncode, 0, p.stderr)
+            for target in protected:
+                p = sh("bash", str(DEPLOY / "restore.sh"), "--manifest",
+                       str(manifest), "--target-dir", target)
+                self.assertNotEqual(p.returncode, 0,
+                                    f"forbidden target accepted: {target}")
+
+    def test_deploy_split_apply_requires_signed_evidence(self):
+        # Env-only enable no longer suffices; missing proof fails closed.
+        p = sh("bash", str(DEPLOY / "deploy-split.sh"), "--apply",
+               env_extra={"FORGEFLEET_LIVE_OK": "1"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRegex(p.stderr + p.stdout, r"[Ee]vidence")
+        p = sh("bash", str(DEPLOY / "deploy-split.sh"), "--apply",
+               "--evidence", "/nonexistent/evidence.json")
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRegex(p.stderr + p.stdout, r"[Ee]vidence")
+
+    def test_live_restore_requires_sha_verified_manifest(self):
+        # A manifest-less snapshot is refused even on dry-run; a verified
+        # fixture manifest passes the manifest gate without docker.
+        with tempfile.TemporaryDirectory() as tmp:
+            bare = Path(tmp) / "bare"
+            bare.mkdir()
+            (bare / "pg.dump").write_text("x\n")
+            (bare / "context.tgz").write_text("x\n")
+            env = {"BACKUP_SNAPSHOT": str(bare), "RESTORE_FENCED": "1"}
+            p = sh("bash", str(DEPLOY / "restore.sh"), env_extra=env)
+            self.assertNotEqual(p.returncode, 0)
+            self.assertRegex(p.stderr + p.stdout, r"[Mm]anifest")
+            manifest = self._fixture_snapshot(Path(tmp))
+            snap = str(manifest.parent)
+            env = {"BACKUP_SNAPSHOT": snap, "RESTORE_FENCED": "1"}
+            p = sh("bash", str(DEPLOY / "restore.sh"), env_extra=env)
+            self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -18,7 +18,15 @@ row is OPEN/FAIL, releases use the private single-origin stack
 | S-09 | Restore rehearsal (E17) | `verify-restore.sh` on canonical `backup.sh`/`restore.sh` fixture mode | byte-identical restore, manifest sha256 OK, leases fenced | PASS (fixture) |
 
 `deploy-split.sh --apply` additionally enforces S-01…S-07 mechanically: it
-refuses while any of those rows contains `OPEN`.
+refuses while any of those rows contains `OPEN`. A live apply further
+requires server-authenticated signed evidence (`--evidence FILE`, minted by
+`sign-evidence.sh`, verified by `verify_live_evidence`): the proof ties the
+exact paperclip SHA and API contract to the CURRENT matrix sha256 plus a
+fresh explicit owner approval. Editing this markdown or setting
+`FORGEFLEET_LIVE_OK=1` can NEVER enable a live change on its own — a
+missing, forged, stale, or expired proof fails closed. A live restore
+likewise requires a SHA-verified manifest (`restore.sh` refuses snapshots
+without one).
 
 Evidence for S-08/S-09 in this PR is **static + real-binary config
 validation + fixture rehearsal only** — see `verify-split.sh` output
