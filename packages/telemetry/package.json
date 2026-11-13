@@ -1,0 +1,19 @@
+{
+  "name": "@forgefleet/telemetry",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ForgeFleet observability primitives: cost ledger with real/estimated labels, health separation, status freshness, event metrics, audit trail, dashboard rollups (E18 / FF-020).",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=24.11"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6"
+  }
+}

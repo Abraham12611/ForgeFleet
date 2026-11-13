@@ -73,6 +73,12 @@ NODE_ROOTS = [
     # node:test suite must be mandatory in CI; present-but-unwired must
     # never read as green. Coordinate root-list changes with E18 (#67).
     "packages/paperclip-orca-adapter",
+    # E18/FF-020 cost gate (PR #49, coordinator P0 direction): the budget
+    # admission suite (atomic reservation, caps, deny-unknown, two-process
+    # concurrency, NaN/Infinity) must run in CI; present-but-unwired must
+    # never read as green. Sources run directly under node --test (no
+    # build step, zero npm dependencies).
+    "packages/telemetry",
 ]
 NODE_TEST_GLOBS = ("*.test.js", "*.test.mjs", "*.test.cjs", "*.test.ts")
 
@@ -94,9 +100,9 @@ MANDATORY_NODE_ROOTS = [
     "packages/policy",
 ]
 
-FUTURE_MODULES = [
-    "packages/telemetry",
-]
+# packages/telemetry graduated to NODE_ROOTS when FF-020 landed the tested
+# budget admission gate (PR #49); E18 owns the entry.
+FUTURE_MODULES = []
 
 # (label, argv, min_tests): argv runs with cwd=ROOT, must print unittest stats.
 PYTHON_SUITES = [
