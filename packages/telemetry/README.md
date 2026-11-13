@@ -9,9 +9,10 @@ bounded dashboard rollups.
   (`RuntimeCapabilities`), `docs/05-contracts/state-machines.md`.
 - Zero npm dependencies (node builtins only). Pure functions plus
   in-memory stores (`CostLedger`, `AuditTrail`, `EventMetrics`,
-  `SourceSyncTracker`) and a JSONL reservation journal for
-  cross-process admission. Canonical durable persistence belongs to E06;
-  this package owns labeling, aggregation, reservations and gating only.
+  `SourceSyncTracker`) and a SQLite reservation store (`node:sqlite`)
+  for cross-process admission. Canonical durable persistence belongs to
+  E06; this package owns labeling, aggregation, reservations and gating
+  only.
 - Budget admission is fail-closed: unknown spend denies new billable
   dispatches unless an explicit owner quota (`OwnerQuotaPolicy`,
   `unknownPolicy: "reserve"`) covers the request; the gate decides on
@@ -24,10 +25,15 @@ bounded dashboard rollups.
   no live owner after a failure or restart, and `importReservations()`
   reloads holds. Identical `reserve()`/`checkAndReserve()` retries are
   idempotent (no double-count); reusing an id for different terms is denied.
-- Multi-process durability (`src/reservationJournal.ts`): holds/releases
-  append to a JSONL journal and every read-modify-write runs under an
-  exclusive file lock — use `durableCheckAndReserve()` when two processes
-  may admit concurrently. Corrupt journal rows are skipped, never admitted.
+- Multi-process durability (`src/reservationJournal.ts`): every admission
+  runs in one SQLite write transaction (`BEGIN IMMEDIATE` … `COMMIT`;
+  `allowed: true` is returned only after the hold commits, so it is
+  fsync-durable) — use `durableCheckAndReserve()` when two processes may
+  admit concurrently. There is no stealable stale lock: a second process
+  waits on the live holder, never breaks in. Missing store means new
+  state; unreadable/corrupt stores deny instead of admitting. Global and
+  provider ceilings count every project; durable admission requires an
+  explicit owner identity and an owner-matching unknown-spend policy.
 - E05/E06 are not implemented yet in this repo, so this package defines its
   own minimal types and ships fixture-friendly constructors. When
   `packages/bridge-contracts` and `packages/events` land, align the

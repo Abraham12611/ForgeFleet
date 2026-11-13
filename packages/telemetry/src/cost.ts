@@ -145,6 +145,21 @@ export interface BudgetCheckArgs {
   ownerPolicy?: OwnerQuotaPolicy;
 }
 
+/**
+ * Reserved totals per scope for one admission evaluation. Project
+ * ceilings use the project scope; global and provider ceilings MUST
+ * count every project, otherwise two projects could each exhaust an
+ * account-wide cap.
+ */
+export interface ReservedScopes {
+  /** Holds scoped to the admission's project (and provider when set). */
+  project: number;
+  /** Holds across all projects (and provider when set). */
+  allProjects: number;
+  /** Holds across all projects for the admission's provider (0 when unset). */
+  provider: number;
+}
+
 export interface BudgetDecision {
   allowed: boolean;
   reason: string;
@@ -426,6 +441,16 @@ export class CostLedger {
     return total;
   }
 
+  /** Known spend across ALL projects (entries with no USD figure add nothing). */
+  private globalKnownUsd(): number {
+    let total = 0;
+    for (const e of this.entries) {
+      if (e.billedUsd === null) continue;
+      total += e.billedUsd;
+    }
+    return total;
+  }
+
   /**
    * Pre-dispatch budget gate. Evaluates known + reserved + requested
    * atomically against the budget. Fail-closed on unknown spend unless an
@@ -433,15 +458,32 @@ export class CostLedger {
    * as data so the caller can surface them; this method never dispatches.
    */
   checkBudget(args: BudgetCheckArgs): BudgetDecision {
-    return this.evaluate(args, this.reservedFor(args.summary.projectId, args.provider));
+    return this.evaluate(args, this.scopesFor(args.summary.projectId, args.provider));
   }
 
   /**
-   * Shared admission evaluation over an explicit reserved total. Keeping
+   * Reserved totals per scope. Project ceilings use the project scope;
+   * global and provider ceilings MUST count every project, otherwise two
+   * projects could each exhaust an account-wide cap.
+   */
+  private scopesFor(
+    projectId: string | null,
+    provider: string | undefined,
+    excludeSelfUsd = 0,
+  ): ReservedScopes {
+    return {
+      project: this.reservedFor(projectId, provider) - excludeSelfUsd,
+      allProjects: this.reservedFor(null, provider) - excludeSelfUsd,
+      provider: provider === undefined ? 0 : this.reservedFor(null, provider) - excludeSelfUsd,
+    };
+  }
+
+  /**
+   * Shared admission evaluation over explicit reserved totals. Keeping
    * the reserved input explicit lets checkAndReserve re-evaluate an
    * idempotent replay without double-counting its own prior hold.
    */
-  private evaluate(args: BudgetCheckArgs, reserved: number): BudgetDecision {
+  private evaluate(args: BudgetCheckArgs, reserved: ReservedScopes): BudgetDecision {
     const { summary } = args;
     const unknownPolicy: UnknownSpendPolicy = args.unknownPolicy ?? "deny";
     const base = {
@@ -463,15 +505,15 @@ export class CostLedger {
       return { ...base, allowed: false, requestedUsd: requested, reason: "denied: missing budget authorization" };
     }
     const known = summary.totalKnownUsd ?? 0;
-    const exposure = known + reserved + requested;
-    const withAmounts = { ...base, reservedUsd: reserved, exposureUsd: exposure, requestedUsd: requested };
+    const exposure = known + reserved.project + requested;
+    const withAmounts = { ...base, reservedUsd: reserved.project, exposureUsd: exposure, requestedUsd: requested };
 
     if (summary.label === "unknown") {
       if (unknownPolicy === "deny") {
         return {
           ...withAmounts,
           allowed: false,
-          reason: `denied: spend is unknown (no priced entries); fail-closed without an owner-authorized unknown-spend quota (known ${known}, reserved ${reserved}, requested ${requested})`,
+          reason: `denied: spend is unknown (no priced entries); fail-closed without an owner-authorized unknown-spend quota (known ${known}, reserved ${reserved.project}, requested ${requested})`,
         };
       }
       const cap = args.ownerPolicy?.unknownCapUsd;
@@ -482,11 +524,11 @@ export class CostLedger {
           reason: "denied: reserve policy requires an explicit owner quota (finite unknownCapUsd + authorizedBy)",
         };
       }
-      if (reserved + requested > (cap as number)) {
+      if (reserved.project + requested > (cap as number)) {
         return {
           ...withAmounts,
           allowed: false,
-          reason: `denied: reserved ${reserved} + requested ${requested} exceeds owner unknown-spend cap ${cap}`,
+          reason: `denied: reserved ${reserved.project} + requested ${requested} exceeds owner unknown-spend cap ${cap}`,
         };
       }
     }
@@ -495,16 +537,20 @@ export class CostLedger {
       return {
         ...withAmounts,
         allowed: false,
-        reason: `denied: exposure ${exposure} (known ${known} + reserved ${reserved} + requested ${requested}) exceeds budget ${args.budgetUsd}`,
+        reason: `denied: exposure ${exposure} (known ${known} + reserved ${reserved.project} + requested ${requested}) exceeds budget ${args.budgetUsd}`,
       };
     }
 
-    if (this.globalCapUsd !== null && exposure > this.globalCapUsd) {
-      return {
-        ...withAmounts,
-        allowed: false,
-        reason: `denied: exposure ${exposure} exceeds global hard cap ${this.globalCapUsd}`,
-      };
+    if (this.globalCapUsd !== null) {
+      const globalKnown = this.globalKnownUsd();
+      const globalExposure = globalKnown + reserved.allProjects + requested;
+      if (globalExposure > this.globalCapUsd) {
+        return {
+          ...withAmounts,
+          allowed: false,
+          reason: `denied: exposure ${globalExposure} (global known ${globalKnown} + all-project reserved ${reserved.allProjects} + requested ${requested}) exceeds global hard cap ${this.globalCapUsd}`,
+        };
+      }
     }
 
     if (summary.projectId !== null) {
@@ -521,13 +567,13 @@ export class CostLedger {
     if (args.provider !== undefined) {
       const quota = this.providerQuota(args.provider);
       if (quota !== null) {
-        const pKnown = this.providerKnownUsd(summary.projectId, args.provider);
-        const pReserved = this.reservedFor(summary.projectId, args.provider);
-        if (pKnown + pReserved + requested > quota) {
+        const pKnown = this.providerKnownUsd(null, args.provider);
+        const pExposure = pKnown + reserved.provider + requested;
+        if (pExposure > quota) {
           return {
             ...withAmounts,
             allowed: false,
-            reason: `denied: provider quota exhausted for ${args.provider} (known ${pKnown} + reserved ${pReserved} + requested ${requested} exceeds quota ${quota})`,
+            reason: `denied: provider quota exhausted for ${args.provider} (all-project known ${pKnown} + reserved ${reserved.provider} + requested ${requested} exceeds quota ${quota})`,
           };
         }
       }
@@ -536,7 +582,7 @@ export class CostLedger {
     return {
       ...withAmounts,
       allowed: true,
-      reason: `allowed: exposure ${exposure} (known ${known} + reserved ${reserved} + requested ${requested}, ${summary.label}) within budget ${args.budgetUsd}`,
+      reason: `allowed: exposure ${exposure} (known ${known} + reserved ${reserved.project} + requested ${requested}, ${summary.label}) within budget ${args.budgetUsd}`,
     };
   }
 
@@ -549,7 +595,7 @@ export class CostLedger {
    * same reservationId. Reusing the id for different terms is denied.
    */
   checkAndReserve(
-    args: BudgetCheckArgs & { reservationId: string; taskId?: string },
+    args: BudgetCheckArgs & { reservationId: string; taskId?: string; authorizedBy?: string },
   ): CheckAndReserveResult {
     const requested = args.requestedUsd ?? 0;
     const held = this.reservations.get(args.reservationId);
@@ -569,8 +615,10 @@ export class CostLedger {
           reservationId: null,
         };
       }
-      const reservedExSelf = this.reservedFor(args.summary.projectId, args.provider) - held.amountUsd;
-      const replay = this.evaluate(args, reservedExSelf);
+      const replay = this.evaluate(
+        args,
+        this.scopesFor(args.summary.projectId, args.provider, held.amountUsd),
+      );
       if (!replay.allowed || replay.requestedUsd <= 0) {
         return { decision: replay, reservationId: null };
       }
@@ -602,7 +650,7 @@ export class CostLedger {
       taskId: args.taskId,
       provider: args.provider,
       amountUsd: decision.requestedUsd,
-      authorizedBy: "budget-gate",
+      authorizedBy: args.authorizedBy ?? "budget-gate",
       at: new Date().toISOString(),
     });
     if (!placed.accepted) {

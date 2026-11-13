@@ -2,8 +2,8 @@
  * @forgefleet/telemetry — observability primitives (E18 / FF-020).
  * Zero npm dependencies (node builtins only). All modules are pure except
  * the ledger/trail classes, which own labeling, aggregation and gating,
- * and the reservation journal, which appends holds/releases to a JSONL
- * file (canonical durable persistence belongs to E06).
+ * and the reservation store, which persists holds in SQLite transactions
+ * (canonical durable persistence belongs to E06).
  */
 export * from "./types.ts";
 export * from "./cost.ts";

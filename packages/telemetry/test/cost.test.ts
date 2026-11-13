@@ -330,6 +330,51 @@ test("reconcile: drops orphaned holds, keeps live ones (restart recovery)", () =
   assert.deepEqual(again.released, []);
 });
 
+test("global cap counts every project: two projects cannot each exhaust it", () => {
+  const ledger = new CostLedger();
+  ledger.record(entry({ entryId: "a", projectId: "p1", billedUsd: 6, source: "provider-api" }));
+  ledger.record(entry({ entryId: "b", projectId: "p2", billedUsd: 6, source: "provider-api" }));
+  assert.equal(ledger.setGlobalCap(10, "owner").accepted, true);
+
+  // Each project's own math fits its dispatch budget, but 6 + 6 = 12
+  // already exceeds the account-wide cap of 10.
+  const p1 = ledger.checkBudget({ summary: ledger.summarize("p1"), budgetUsd: 100, authorized: true, requestedUsd: 0 });
+  const p2 = ledger.checkBudget({ summary: ledger.summarize("p2"), budgetUsd: 100, authorized: true, requestedUsd: 0 });
+  assert.equal(p1.allowed, false);
+  assert.match(p1.reason, /global hard cap/);
+  assert.equal(p2.allowed, false);
+  assert.match(p2.reason, /global hard cap/);
+});
+
+test("provider quota counts every project, not just the admitted one", () => {
+  const ledger = new CostLedger();
+  ledger.record(entry({ entryId: "a", projectId: "p1", billedUsd: 5, source: "provider-api" }));
+  ledger.record(entry({ entryId: "b", projectId: "p2", billedUsd: 5, source: "provider-api" }));
+  assert.equal(ledger.setProviderQuota("acme-models", 6).accepted, true);
+
+  // p2 alone (5 known + 1 requested <= 6) would fit; account-wide
+  // 5 + 5 + 1 > 6 must deny.
+  const d = ledger.checkBudget({
+    summary: ledger.summarize("p2"), budgetUsd: 100, authorized: true, requestedUsd: 1, provider: "acme-models",
+  });
+  assert.equal(d.allowed, false);
+  assert.match(d.reason, /quota exhausted/);
+});
+
+test("holds in another project count toward the global cap", () => {
+  const ledger = new CostLedger();
+  ledger.record(entry({ entryId: "a", projectId: "p1", billedUsd: 0, source: "provider-api" }));
+  ledger.record(entry({ entryId: "b", projectId: "p2", billedUsd: 0, source: "provider-api" }));
+  assert.equal(ledger.setGlobalCap(10, "owner").accepted, true);
+
+  const first = ledger.checkAndReserve({ summary: ledger.summarize("p1"), budgetUsd: 100, authorized: true, requestedUsd: 8, reservationId: "r-p1" });
+  assert.equal(first.decision.allowed, true);
+
+  const second = ledger.checkAndReserve({ summary: ledger.summarize("p2"), budgetUsd: 100, authorized: true, requestedUsd: 3, reservationId: "r-p2" });
+  assert.equal(second.decision.allowed, false);
+  assert.match(second.decision.reason, /global hard cap/);
+});
+
 test("importReservations: loads journal holds, skips invalid and duplicate rows", () => {
   const ledger = new CostLedger();
   const { imported, skipped } = ledger.importReservations([
